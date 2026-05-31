@@ -35,6 +35,21 @@ pub fn apply(
                     attrs,
                     session,
                 ))?;
+                // Emit a provisional session-root span immediately so the root
+                // id always exists, even if SessionEnd never fires (crash/kill).
+                // CloseSession re-emits it with the full duration; the span id is
+                // deterministic, so the idempotent ingest just overwrites this.
+                emitted.push(Span {
+                    trace_id,
+                    span_id: SpanId::derive(session, "session"),
+                    parent_span_id: None,
+                    name: "session".into(),
+                    kind: SpanKind::Internal,
+                    start_unix_nano: now_nanos,
+                    end_unix_nano: now_nanos,
+                    status: Status::Unset,
+                    attributes: attrs.clone(),
+                });
             }
             SpanOp::CloseSession { status, attrs } => {
                 emitted.push(close(
@@ -335,6 +350,38 @@ mod tests {
         assert_eq!(spans[0].end_unix_nano, 9_000);
         // still belongs to the trace
         assert_eq!(spans[0].trace_id, TraceId::from_session("s"));
+    }
+
+    #[test]
+    fn session_root_emitted_provisionally_on_start_and_finalized_on_end() {
+        let (_d, s) = store();
+        let h = ClaudeCode;
+        let root_id = SpanId::derive("s", "session");
+
+        // SessionStart emits a provisional root immediately (start == end).
+        let spans = apply(
+            &s,
+            &h.parse(&json!({"hook_event_name":"SessionStart","session_id":"s"})).unwrap(),
+            100,
+        )
+        .unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].span_id, root_id);
+        assert_eq!(spans[0].parent_span_id, None);
+        assert_eq!(spans[0].start_unix_nano, 100);
+        assert_eq!(spans[0].end_unix_nano, 100);
+
+        // SessionEnd re-emits the same id spanning the full session.
+        let spans = apply(
+            &s,
+            &h.parse(&json!({"hook_event_name":"SessionEnd","session_id":"s"})).unwrap(),
+            900,
+        )
+        .unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].span_id, root_id, "same deterministic id => idempotent replace");
+        assert_eq!(spans[0].start_unix_nano, 100);
+        assert_eq!(spans[0].end_unix_nano, 900);
     }
 
     #[test]
