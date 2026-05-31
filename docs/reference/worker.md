@@ -1,0 +1,60 @@
+# Collector & Worker
+
+The collector is `gently-collector`, a TypeScript Cloudflare Worker backed by a
+D1 database (`worker/`). It is the durable store of record and the only query
+source.
+
+## Endpoints
+
+All require `Authorization: Bearer <GENTLY_TOKEN>` → 401 otherwise.
+
+| Method · path | Purpose |
+|---|---|
+| `POST /v1/traces` | OTLP/JSON ingest. Flattens spans, upserts into D1 (`INSERT OR REPLACE` on `span_id` → idempotent). Echoes the negotiated `httpProtocol`. |
+| `GET /v1/query?op=traces` | recent traces (aggregated per session): `trace_id`, `session_id`, `harness`, start, `span_count`, `error_count`. |
+| `GET /v1/query?op=trace&trace_id=` | all spans for a trace, ordered by start. |
+| `GET /v1/query?op=spans&…` | filtered spans (`trace_id`, `tool_name`, `status`, `since`, `limit`). |
+| `GET /v1/query?op=stats` | per-tool counts, error counts, average duration. |
+| `GET /v1/whoami` | returns the negotiated protocol (e.g. `{"httpProtocol":"HTTP/3"}`) - used to confirm QUIC on the wire. |
+
+## D1 schema (`worker/schema.sql`)
+
+```sql
+CREATE TABLE spans (
+  span_id TEXT PRIMARY KEY,
+  trace_id TEXT NOT NULL,
+  parent_span_id TEXT,
+  name TEXT NOT NULL,
+  kind INTEGER NOT NULL,
+  start_unix_nano TEXT NOT NULL,   -- uint64 as string (precision-safe)
+  end_unix_nano TEXT,
+  status INTEGER NOT NULL DEFAULT 0,
+  session_id TEXT, harness TEXT,
+  tool_name TEXT, tool_use_id TEXT,
+  attrs_json TEXT, resource_json TEXT,
+  ingested_unix_nano TEXT NOT NULL
+);
+-- indexes on trace_id, session_id, start_unix_nano, tool_name
+```
+
+Trace-scoped attributes (`session_id`, `harness`) are lifted from the OTLP
+resource; `tool_name`/`tool_use_id` from the span; the rest stays in
+`attrs_json` / `resource_json`.
+
+## Deploy & operate
+
+```bash
+cd worker
+npm install
+wrangler d1 create gently                       # → database_id (into wrangler.toml)
+wrangler d1 execute gently --remote --file schema.sql
+wrangler secret put GENTLY_TOKEN
+wrangler deploy
+
+npm test                                         # vitest + Miniflare (local D1)
+wrangler tail gently-collector --format json     # live logs (shows ingest httpProtocol)
+wrangler d1 execute gently --command "SELECT count(*) FROM spans"
+```
+
+Local development: `echo 'GENTLY_TOKEN=dev' > .dev.vars`, apply the schema with
+`--local`, then `wrangler dev` serves on `http://127.0.0.1:8787`.
