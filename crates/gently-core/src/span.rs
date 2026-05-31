@@ -93,8 +93,9 @@ impl Resource {
 }
 
 fn hostname() -> String {
-    std::env::var("HOSTNAME")
+    hostname::get()
         .ok()
+        .and_then(|h| h.into_string().ok())
         .filter(|h| !h.is_empty())
         .unwrap_or_else(|| "unknown".to_string())
 }

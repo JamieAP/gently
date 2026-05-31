@@ -195,6 +195,18 @@ fn turn_key(n: u64) -> String {
     format!("turn:{n}")
 }
 
+/// Merge `base` with `overrides`, keeping keys unique. An overriding key
+/// replaces the base value in place (preserving position); new keys append.
+fn merge_attrs(mut base: Attrs, overrides: &Attrs) -> Attrs {
+    for (k, v) in overrides {
+        match base.iter_mut().find(|(ek, _)| ek == k) {
+            Some(slot) => slot.1 = v.clone(),
+            None => base.push((k.clone(), v.clone())),
+        }
+    }
+    base
+}
+
 /// Stable tool span key: prefer the harness `tool_use_id`; without one, fall
 /// back to the tool name (collides only for concurrent same-name anon tools - a
 /// logged, bounded degradation, never a correctness hazard for keyed tools).
@@ -253,11 +265,14 @@ fn close(
         (None, None) => end_nanos, // missed the open: instant span, still valid
     };
 
-    let mut attributes: Attrs = opened
+    let opened_attrs: Attrs = opened
         .as_ref()
         .and_then(|o| serde_json::from_str(&o.attrs_json).ok())
         .unwrap_or_default();
-    attributes.extend(close_attrs.iter().cloned());
+    // Merge the open-event attrs with the close-event attrs, deduping by key so
+    // a paired span (e.g. PreToolUse + PostToolUse) carries unique keys; the
+    // close (later) value wins, per the OTLP "attribute keys are unique" rule.
+    let attributes = merge_attrs(opened_attrs, close_attrs);
 
     let (span_id, parent, span_kind, span_name) = match &opened {
         Some(o) => (
@@ -382,6 +397,25 @@ mod tests {
         assert_eq!(spans[0].span_id, root_id, "same deterministic id => idempotent replace");
         assert_eq!(spans[0].start_unix_nano, 100);
         assert_eq!(spans[0].end_unix_nano, 900);
+    }
+
+    #[test]
+    fn paired_tool_span_has_unique_attribute_keys() {
+        let (_d, s) = store();
+        let h = ClaudeCode;
+        apply(&s, &h.parse(&json!({"hook_event_name":"UserPromptSubmit","session_id":"s"})).unwrap(), 1).unwrap();
+        apply(&s, &h.parse(&json!({"hook_event_name":"PreToolUse","session_id":"s",
+            "tool_name":"Bash","tool_use_id":"tu_1","tool_input":{"command":"ls"},"permission_mode":"default"})).unwrap(), 2).unwrap();
+        let spans = apply(&s, &h.parse(&json!({"hook_event_name":"PostToolUse","session_id":"s",
+            "tool_name":"Bash","tool_use_id":"tu_1","tool_response":{"ok":true},"permission_mode":"default"})).unwrap(), 3).unwrap();
+        let keys: Vec<&str> = spans[0].attributes.iter().map(|(k, _)| k.as_str()).collect();
+        let mut uniq = keys.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(keys.len(), uniq.len(), "no duplicate attribute keys: {keys:?}");
+        // close value wins
+        let event: Vec<&str> = spans[0].attributes.iter().filter(|(k, _)| k == "gently.event").map(|(_, v)| v.as_str()).collect();
+        assert_eq!(event, vec!["PostToolUse"]);
     }
 
     #[test]
