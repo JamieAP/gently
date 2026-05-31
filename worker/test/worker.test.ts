@@ -15,8 +15,11 @@ function makeOtlpFixture() {
     resourceSpans: [
       {
         resource: {
+          // session_id + harness are trace-scoped: they live on the resource,
+          // exactly as the Rust encoder emits them.
           attributes: [
             { key: "service.name", value: { stringValue: "gently" } },
+            { key: "gently.session_id", value: { stringValue: "sess-abc" } },
             { key: "gently.harness", value: { stringValue: "claude-code" } },
           ],
         },
@@ -32,8 +35,6 @@ function makeOtlpFixture() {
                 startTimeUnixNano: "1700000000000000000",
                 endTimeUnixNano: "1700000001000000000",
                 attributes: [
-                  { key: "gently.session_id", value: { stringValue: "sess-abc" } },
-                  { key: "gently.harness", value: { stringValue: "claude-code" } },
                   { key: "gently.tool_name", value: { stringValue: "Bash" } },
                   { key: "gently.tool_use_id", value: { stringValue: "tu_001" } },
                   { key: "gently.event", value: { stringValue: "PostToolUse" } },
@@ -47,10 +48,7 @@ function makeOtlpFixture() {
                 kind: 0,
                 startTimeUnixNano: "1700000000000000000",
                 endTimeUnixNano: "1700000002000000000",
-                attributes: [
-                  { key: "gently.session_id", value: { stringValue: "sess-abc" } },
-                  { key: "gently.harness", value: { stringValue: "claude-code" } },
-                ],
+                attributes: [],
                 status: { code: 2 },
               },
             ],
@@ -171,9 +169,14 @@ describe("GET /v1/query", () => {
       Array<{ trace_id: string; span_count: number; error_count: number }>
     >();
 
-    const found = rows.find((r) => r.trace_id === TRACE_ID);
+    const found = rows.find((r) => r.trace_id === TRACE_ID) as
+      | { trace_id: string; span_count: number; error_count: number; session_id?: string; harness?: string }
+      | undefined;
     expect(found).toBeDefined();
     expect(found?.span_count).toBe(2);
+    // trace-scoped attrs lifted from the resource, not the span
+    expect(found?.session_id).toBe("sess-abc");
+    expect(found?.harness).toBe("claude-code");
     // One span has status=2 (error)
     expect(found?.error_count).toBe(1);
   });

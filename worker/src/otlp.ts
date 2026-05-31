@@ -77,13 +77,19 @@ export function flatten(req: OtlpRequest): Row[] {
     const resourceAttrs = rs.resource?.attributes ?? [];
     const resource_json = JSON.stringify(resourceAttrs);
 
+    // session_id and harness are trace-scoped: they live on the OTLP resource,
+    // not per span. Lift them once and apply to every span in this group.
+    const resSessionId = attrString(resourceAttrs, "gently.session_id");
+    const resHarness = attrString(resourceAttrs, "gently.harness");
+
     for (const ss of rs.scopeSpans ?? []) {
       for (const span of ss.spans ?? []) {
         const spanAttrs = span.attributes ?? [];
 
-        // Lifted gently.* attributes
-        const session_id = attrString(spanAttrs, "gently.session_id");
-        const harness = attrString(spanAttrs, "gently.harness");
+        // Trace-scoped attrs come from the resource (with a span-level override
+        // for robustness); tool_name/tool_use_id are genuinely per-span.
+        const session_id = attrString(spanAttrs, "gently.session_id") ?? resSessionId;
+        const harness = attrString(spanAttrs, "gently.harness") ?? resHarness;
         const tool_name = attrString(spanAttrs, "gently.tool_name");
         const tool_use_id = attrString(spanAttrs, "gently.tool_use_id");
 
