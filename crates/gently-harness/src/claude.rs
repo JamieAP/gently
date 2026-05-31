@@ -27,7 +27,9 @@ impl Harness for ClaudeCode {
         let cwd = str_field(raw, "cwd").unwrap_or_default();
 
         let ops = match event {
-            "SessionStart" => vec![SpanOp::OpenSession { attrs: common_attrs(raw, event) }],
+            "SessionStart" => vec![SpanOp::OpenSession {
+                attrs: common_attrs(raw, event),
+            }],
             "SessionEnd" => vec![SpanOp::CloseSession {
                 status: Status::Ok,
                 attrs: common_attrs(raw, event),
@@ -39,7 +41,10 @@ impl Harness for ClaudeCode {
                 }
                 vec![SpanOp::OpenTurn { attrs }]
             }
-            "Stop" => vec![SpanOp::CloseTurn { status: Status::Ok, attrs: common_attrs(raw, event) }],
+            "Stop" => vec![SpanOp::CloseTurn {
+                status: Status::Ok,
+                attrs: common_attrs(raw, event),
+            }],
             "StopFailure" => vec![SpanOp::CloseTurn {
                 status: Status::Error(None),
                 attrs: common_attrs(raw, event),
@@ -79,7 +84,11 @@ impl Harness for ClaudeCode {
             }
             "SubagentStart" => {
                 let Some(agent_id) = str_field(raw, "agent_id") else {
-                    return Ok(Parsed { session_id, cwd, ops: vec![mark(raw, event)] });
+                    return Ok(Parsed {
+                        session_id,
+                        cwd,
+                        ops: vec![mark(raw, event)],
+                    });
                 };
                 vec![SpanOp::OpenAgent {
                     agent_id,
@@ -89,7 +98,11 @@ impl Harness for ClaudeCode {
             }
             "SubagentStop" => {
                 let Some(agent_id) = str_field(raw, "agent_id") else {
-                    return Ok(Parsed { session_id, cwd, ops: vec![mark(raw, event)] });
+                    return Ok(Parsed {
+                        session_id,
+                        cwd,
+                        ops: vec![mark(raw, event)],
+                    });
                 };
                 vec![SpanOp::CloseAgent {
                     agent_id,
@@ -100,12 +113,19 @@ impl Harness for ClaudeCode {
             _ => vec![mark(raw, event)],
         };
 
-        Ok(Parsed { session_id, cwd, ops })
+        Ok(Parsed {
+            session_id,
+            cwd,
+            ops,
+        })
     }
 }
 
 fn mark(raw: &serde_json::Value, event: &str) -> SpanOp {
-    SpanOp::Mark { name: event.to_string(), attrs: common_attrs(raw, event) }
+    SpanOp::Mark {
+        name: event.to_string(),
+        attrs: common_attrs(raw, event),
+    }
 }
 
 fn common_attrs(raw: &serde_json::Value, event: &str) -> Attrs {
@@ -156,7 +176,11 @@ mod tests {
         let parsed = h.parse(&pre).unwrap();
         assert_eq!(parsed.session_id, "s");
         match &parsed.ops[..] {
-            [SpanOp::OpenTool { tool_use_id, tool_name, .. }] => {
+            [SpanOp::OpenTool {
+                tool_use_id,
+                tool_name,
+                ..
+            }] => {
                 assert_eq!(tool_use_id.as_deref(), Some("tu_1"));
                 assert_eq!(tool_name, "Bash");
             }
@@ -168,7 +192,12 @@ mod tests {
             "tool_response":{"stdout":"a"},"duration_ms":42});
         let parsed = h.parse(&post).unwrap();
         match &parsed.ops[..] {
-            [SpanOp::CloseTool { tool_use_id, duration_ms, status, .. }] => {
+            [SpanOp::CloseTool {
+                tool_use_id,
+                duration_ms,
+                status,
+                ..
+            }] => {
                 assert_eq!(tool_use_id.as_deref(), Some("tu_1"));
                 assert_eq!(*duration_ms, Some(42));
                 assert_eq!(*status, Status::Ok);
@@ -180,8 +209,10 @@ mod tests {
     #[test]
     fn user_prompt_opens_turn_with_digest_not_content() {
         let parsed = ClaudeCode
-            .parse(&json!({"hook_event_name":"UserPromptSubmit","session_id":"s",
-                "prompt":"secret content here"}))
+            .parse(
+                &json!({"hook_event_name":"UserPromptSubmit","session_id":"s",
+                "prompt":"secret content here"}),
+            )
             .unwrap();
         match &parsed.ops[..] {
             [SpanOp::OpenTurn { attrs }] => {
@@ -205,8 +236,10 @@ mod tests {
     #[test]
     fn post_tool_use_failure_is_error_status() {
         let parsed = ClaudeCode
-            .parse(&json!({"hook_event_name":"PostToolUseFailure","session_id":"s",
-                "tool_name":"Bash","tool_use_id":"tu_2","error":"boom"}))
+            .parse(
+                &json!({"hook_event_name":"PostToolUseFailure","session_id":"s",
+                "tool_name":"Bash","tool_use_id":"tu_2","error":"boom"}),
+            )
             .unwrap();
         assert!(matches!(&parsed.ops[..],
             [SpanOp::CloseTool { status: Status::Error(Some(e)), .. }] if e == "boom"));

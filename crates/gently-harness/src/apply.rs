@@ -26,41 +26,135 @@ pub fn apply(
     for op in &parsed.ops {
         match op {
             SpanOp::OpenSession { attrs } => {
-                store.open_span(&open("session", None, "session", SpanKind::Internal, now_nanos, attrs, session))?;
+                store.open_span(&open(
+                    "session",
+                    None,
+                    "session",
+                    SpanKind::Internal,
+                    now_nanos,
+                    attrs,
+                    session,
+                ))?;
             }
             SpanOp::CloseSession { status, attrs } => {
-                emitted.push(close(store, session, trace_id, "session", "session", SpanKind::Internal, now_nanos, status, attrs, None)?);
+                emitted.push(close(
+                    store,
+                    session,
+                    trace_id,
+                    "session",
+                    "session",
+                    SpanKind::Internal,
+                    now_nanos,
+                    status,
+                    attrs,
+                    None,
+                )?);
             }
             SpanOp::OpenTurn { attrs } => {
                 let n = store.next_turn_index(session)?;
                 let key = turn_key(n);
                 let parent = SpanId::derive(session, "session");
-                store.open_span(&open(&key, Some(parent), &key, SpanKind::Internal, now_nanos, attrs, session))?;
+                store.open_span(&open(
+                    &key,
+                    Some(parent),
+                    &key,
+                    SpanKind::Internal,
+                    now_nanos,
+                    attrs,
+                    session,
+                ))?;
             }
             SpanOp::CloseTurn { status, attrs } => {
                 let key = turn_key(store.current_turn(session)?);
-                emitted.push(close(store, session, trace_id, &key, &key, SpanKind::Internal, now_nanos, status, attrs, None)?);
+                emitted.push(close(
+                    store,
+                    session,
+                    trace_id,
+                    &key,
+                    &key,
+                    SpanKind::Internal,
+                    now_nanos,
+                    status,
+                    attrs,
+                    None,
+                )?);
             }
-            SpanOp::OpenTool { tool_use_id, tool_name, attrs } => {
+            SpanOp::OpenTool {
+                tool_use_id,
+                tool_name,
+                attrs,
+            } => {
                 let key = tool_key(tool_use_id.as_deref(), tool_name);
                 let parent = SpanId::derive(session, &turn_key(store.current_turn(session)?));
-                store.open_span(&open(&key, Some(parent), tool_name, SpanKind::Client, now_nanos, attrs, session))?;
+                store.open_span(&open(
+                    &key,
+                    Some(parent),
+                    tool_name,
+                    SpanKind::Client,
+                    now_nanos,
+                    attrs,
+                    session,
+                ))?;
             }
-            SpanOp::CloseTool { tool_use_id, tool_name, status, duration_ms, attrs } => {
+            SpanOp::CloseTool {
+                tool_use_id,
+                tool_name,
+                status,
+                duration_ms,
+                attrs,
+            } => {
                 let key = tool_key(tool_use_id.as_deref(), tool_name);
-                emitted.push(close(store, session, trace_id, &key, tool_name, SpanKind::Client, now_nanos, status, attrs, *duration_ms)?);
+                emitted.push(close(
+                    store,
+                    session,
+                    trace_id,
+                    &key,
+                    tool_name,
+                    SpanKind::Client,
+                    now_nanos,
+                    status,
+                    attrs,
+                    *duration_ms,
+                )?);
             }
-            SpanOp::OpenAgent { agent_id, parent_tool_use_id, attrs } => {
+            SpanOp::OpenAgent {
+                agent_id,
+                parent_tool_use_id,
+                attrs,
+            } => {
                 let key = format!("agent:{agent_id}");
                 let parent = match parent_tool_use_id {
                     Some(tu) => SpanId::derive(session, &format!("tool:{tu}")),
                     None => SpanId::derive(session, &turn_key(store.current_turn(session)?)),
                 };
-                store.open_span(&open(&key, Some(parent), &key, SpanKind::Internal, now_nanos, attrs, session))?;
+                store.open_span(&open(
+                    &key,
+                    Some(parent),
+                    &key,
+                    SpanKind::Internal,
+                    now_nanos,
+                    attrs,
+                    session,
+                ))?;
             }
-            SpanOp::CloseAgent { agent_id, status, attrs } => {
+            SpanOp::CloseAgent {
+                agent_id,
+                status,
+                attrs,
+            } => {
                 let key = format!("agent:{agent_id}");
-                emitted.push(close(store, session, trace_id, &key, &key, SpanKind::Internal, now_nanos, status, attrs, None)?);
+                emitted.push(close(
+                    store,
+                    session,
+                    trace_id,
+                    &key,
+                    &key,
+                    SpanKind::Internal,
+                    now_nanos,
+                    status,
+                    attrs,
+                    None,
+                )?);
             }
             SpanOp::Mark { name, attrs } => {
                 let parent = SpanId::derive(session, &turn_key(store.current_turn(session)?));
@@ -196,17 +290,23 @@ mod tests {
         let h = ClaudeCode;
 
         // open a turn
-        let p = h.parse(&json!({"hook_event_name":"UserPromptSubmit","session_id":"s","prompt":"hi"})).unwrap();
+        let p = h
+            .parse(&json!({"hook_event_name":"UserPromptSubmit","session_id":"s","prompt":"hi"}))
+            .unwrap();
         assert!(apply(&s, &p, 1_000).unwrap().is_empty());
 
         // pre tool
-        let p = h.parse(&json!({"hook_event_name":"PreToolUse","session_id":"s",
-            "tool_name":"Bash","tool_use_id":"tu_1","tool_input":{"command":"ls"}})).unwrap();
+        let p = h
+            .parse(&json!({"hook_event_name":"PreToolUse","session_id":"s",
+            "tool_name":"Bash","tool_use_id":"tu_1","tool_input":{"command":"ls"}}))
+            .unwrap();
         assert!(apply(&s, &p, 2_000).unwrap().is_empty());
 
         // post tool with duration_ms=1 (=1_000_000 ns)
-        let p = h.parse(&json!({"hook_event_name":"PostToolUse","session_id":"s",
-            "tool_name":"Bash","tool_use_id":"tu_1","tool_response":{"ok":true},"duration_ms":1})).unwrap();
+        let p = h
+            .parse(&json!({"hook_event_name":"PostToolUse","session_id":"s",
+            "tool_name":"Bash","tool_use_id":"tu_1","tool_response":{"ok":true},"duration_ms":1}))
+            .unwrap();
         let spans = apply(&s, &p, 5_000_000).unwrap();
         assert_eq!(spans.len(), 1);
         let span = &spans[0];
@@ -225,8 +325,10 @@ mod tests {
         let (_d, s) = store();
         let h = ClaudeCode;
         // PostToolUse with no preceding PreToolUse, no duration
-        let p = h.parse(&json!({"hook_event_name":"PostToolUse","session_id":"s",
-            "tool_name":"Read","tool_use_id":"tu_x","tool_response":{}})).unwrap();
+        let p = h
+            .parse(&json!({"hook_event_name":"PostToolUse","session_id":"s",
+            "tool_name":"Read","tool_use_id":"tu_x","tool_response":{}}))
+            .unwrap();
         let spans = apply(&s, &p, 9_000).unwrap();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].start_unix_nano, 9_000);
@@ -239,12 +341,27 @@ mod tests {
     fn turn_span_emitted_on_stop() {
         let (_d, s) = store();
         let h = ClaudeCode;
-        apply(&s, &h.parse(&json!({"hook_event_name":"UserPromptSubmit","session_id":"s"})).unwrap(), 100).unwrap();
-        let spans = apply(&s, &h.parse(&json!({"hook_event_name":"Stop","session_id":"s"})).unwrap(), 500).unwrap();
+        apply(
+            &s,
+            &h.parse(&json!({"hook_event_name":"UserPromptSubmit","session_id":"s"}))
+                .unwrap(),
+            100,
+        )
+        .unwrap();
+        let spans = apply(
+            &s,
+            &h.parse(&json!({"hook_event_name":"Stop","session_id":"s"}))
+                .unwrap(),
+            500,
+        )
+        .unwrap();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].name, "turn:1");
         assert_eq!(spans[0].start_unix_nano, 100);
         assert_eq!(spans[0].end_unix_nano, 500);
-        assert_eq!(spans[0].parent_span_id, Some(SpanId::derive("s", "session")));
+        assert_eq!(
+            spans[0].parent_span_id,
+            Some(SpanId::derive("s", "session"))
+        );
     }
 }

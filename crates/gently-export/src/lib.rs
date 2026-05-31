@@ -107,7 +107,8 @@ mod tests {
             attributes: vec![],
         };
         let req = OtlpRequest::single(&Resource::new("s", "claude-code", "/w"), vec![span]);
-        s.outbox_enqueue(&serde_json::to_string(&req).unwrap()).unwrap();
+        s.outbox_enqueue(&serde_json::to_string(&req).unwrap())
+            .unwrap();
     }
 
     /// Fails the first `fail_n` sends, then succeeds; counts spans received.
@@ -124,7 +125,8 @@ mod tests {
                 return Err(ExportError::Transport("flaky".into()));
             }
             let req: OtlpRequest = serde_json::from_slice(&body).unwrap();
-            self.spans_received.fetch_add(req.span_count(), Ordering::SeqCst);
+            self.spans_received
+                .fetch_add(req.span_count(), Ordering::SeqCst);
             Ok(())
         }
     }

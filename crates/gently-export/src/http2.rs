@@ -23,7 +23,11 @@ impl Http2Transport {
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .expect("reqwest client builds with default rustls config");
-        Self { endpoint, token: token.into(), client }
+        Self {
+            endpoint,
+            token: token.into(),
+            client,
+        }
     }
 }
 
@@ -43,7 +47,9 @@ impl Transport for Http2Transport {
         if status.is_success() {
             Ok(())
         } else {
-            Err(ExportError::Transport(format!("collector returned {status}")))
+            Err(ExportError::Transport(format!(
+                "collector returned {status}"
+            )))
         }
     }
 }

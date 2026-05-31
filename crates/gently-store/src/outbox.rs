@@ -23,9 +23,9 @@ impl Store {
 
     /// Take up to `n` oldest rows as `(id, span_json)` for a send batch.
     pub fn outbox_take_batch(&self, n: usize) -> Result<Vec<(i64, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, span_json FROM outbox ORDER BY id ASC LIMIT ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, span_json FROM outbox ORDER BY id ASC LIMIT ?1")?;
         let rows = stmt
             .query_map(rusqlite::params![n as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -94,7 +94,12 @@ mod tests {
     fn bump_attempts_keeps_rows() {
         let (_d, s) = store();
         s.outbox_enqueue("{}").unwrap();
-        let ids: Vec<i64> = s.outbox_take_batch(10).unwrap().iter().map(|(id, _)| *id).collect();
+        let ids: Vec<i64> = s
+            .outbox_take_batch(10)
+            .unwrap()
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
         s.outbox_bump_attempts(&ids).unwrap();
         assert_eq!(s.outbox_len().unwrap(), 1);
     }

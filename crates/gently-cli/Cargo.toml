@@ -8,3 +8,24 @@ name = "gently"
 path = "src/main.rs"
 
 [dependencies]
+gently-core = { path = "../gently-core" }
+gently-store = { path = "../gently-store" }
+gently-harness = { path = "../gently-harness" }
+gently-export = { path = "../gently-export" }
+clap.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+comfy-table.workspace = true
+fs4.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+dirs = "5"
+toml = "0.8"
+
+[dev-dependencies]
+assert_cmd = "2"
+tempfile = "3"
+predicates = "3"

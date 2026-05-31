@@ -47,11 +47,25 @@ pub struct Parsed {
 /// current turn) and emit a completed span; `Mark` emits an instant span.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SpanOp {
-    OpenSession { attrs: Attrs },
-    CloseSession { status: Status, attrs: Attrs },
-    OpenTurn { attrs: Attrs },
-    CloseTurn { status: Status, attrs: Attrs },
-    OpenTool { tool_use_id: Option<String>, tool_name: String, attrs: Attrs },
+    OpenSession {
+        attrs: Attrs,
+    },
+    CloseSession {
+        status: Status,
+        attrs: Attrs,
+    },
+    OpenTurn {
+        attrs: Attrs,
+    },
+    CloseTurn {
+        status: Status,
+        attrs: Attrs,
+    },
+    OpenTool {
+        tool_use_id: Option<String>,
+        tool_name: String,
+        attrs: Attrs,
+    },
     CloseTool {
         tool_use_id: Option<String>,
         tool_name: String,
@@ -59,10 +73,21 @@ pub enum SpanOp {
         duration_ms: Option<u64>,
         attrs: Attrs,
     },
-    OpenAgent { agent_id: String, parent_tool_use_id: Option<String>, attrs: Attrs },
-    CloseAgent { agent_id: String, status: Status, attrs: Attrs },
+    OpenAgent {
+        agent_id: String,
+        parent_tool_use_id: Option<String>,
+        attrs: Attrs,
+    },
+    CloseAgent {
+        agent_id: String,
+        status: Status,
+        attrs: Attrs,
+    },
     /// An instant (zero-duration) span for an unmodeled or point-in-time event.
-    Mark { name: String, attrs: Attrs },
+    Mark {
+        name: String,
+        attrs: Attrs,
+    },
 }
 
 /// String-valued span attributes, kept as ordered pairs for stable encoding.

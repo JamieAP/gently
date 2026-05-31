@@ -76,7 +76,11 @@ pub struct Resource {
 
 impl Resource {
     /// Build a resource, filling host/os/version from the environment.
-    pub fn new(session_id: impl Into<String>, harness: impl Into<String>, cwd: impl Into<String>) -> Self {
+    pub fn new(
+        session_id: impl Into<String>,
+        harness: impl Into<String>,
+        cwd: impl Into<String>,
+    ) -> Self {
         Self {
             session_id: session_id.into(),
             harness: harness.into(),

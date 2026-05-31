@@ -45,7 +45,11 @@ pub struct OtlpSpan {
     pub trace_id: String,
     #[serde(rename = "spanId")]
     pub span_id: String,
-    #[serde(rename = "parentSpanId", skip_serializing_if = "String::is_empty", default)]
+    #[serde(
+        rename = "parentSpanId",
+        skip_serializing_if = "String::is_empty",
+        default
+    )]
     pub parent_span_id: String,
     pub name: String,
     pub kind: u8,
@@ -75,7 +79,11 @@ pub struct KeyValue {
 /// OTLP `AnyValue`. We only emit string and int values.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AnyValue {
-    #[serde(rename = "stringValue", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "stringValue",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub string_value: Option<String>,
     #[serde(rename = "intValue", skip_serializing_if = "Option::is_none", default)]
     pub int_value: Option<String>,
@@ -83,13 +91,19 @@ pub struct AnyValue {
 
 impl AnyValue {
     fn string(s: impl Into<String>) -> Self {
-        Self { string_value: Some(s.into()), int_value: None }
+        Self {
+            string_value: Some(s.into()),
+            int_value: None,
+        }
     }
 }
 
 impl KeyValue {
     fn string(key: impl Into<String>, value: impl Into<String>) -> Self {
-        Self { key: key.into(), value: AnyValue::string(value) }
+        Self {
+            key: key.into(),
+            value: AnyValue::string(value),
+        }
     }
 }
 
