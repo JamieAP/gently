@@ -26,30 +26,17 @@ pub fn apply(
     for op in &parsed.ops {
         match op {
             SpanOp::OpenSession { attrs } => {
-                store.open_span(&open(
+                emitted.push(open_provisional(
+                    store,
+                    session,
+                    trace_id,
                     "session",
                     None,
                     "session",
                     SpanKind::Internal,
                     now_nanos,
                     attrs,
-                    session,
-                ))?;
-                // Emit a provisional session-root span immediately so the root
-                // id always exists, even if SessionEnd never fires (crash/kill).
-                // CloseSession re-emits it with the full duration; the span id is
-                // deterministic, so the idempotent ingest just overwrites this.
-                emitted.push(Span {
-                    trace_id,
-                    span_id: SpanId::derive(session, "session"),
-                    parent_span_id: None,
-                    name: "session".into(),
-                    kind: SpanKind::Internal,
-                    start_unix_nano: now_nanos,
-                    end_unix_nano: now_nanos,
-                    status: Status::Unset,
-                    attributes: attrs.clone(),
-                });
+                )?);
             }
             SpanOp::CloseSession { status, attrs } => {
                 emitted.push(close(
@@ -69,15 +56,19 @@ pub fn apply(
                 let n = store.next_turn_index(session)?;
                 let key = turn_key(n);
                 let parent = SpanId::derive(session, "session");
-                store.open_span(&open(
+                // Provisional turn so an interrupted turn (no Stop) still appears;
+                // CloseTurn finalizes it via the same deterministic id.
+                emitted.push(open_provisional(
+                    store,
+                    session,
+                    trace_id,
                     &key,
                     Some(parent),
                     &key,
                     SpanKind::Internal,
                     now_nanos,
                     attrs,
-                    session,
-                ))?;
+                )?);
             }
             SpanOp::CloseTurn { status, attrs } => {
                 let key = turn_key(store.current_turn(session)?);
@@ -142,15 +133,19 @@ pub fn apply(
                     Some(tu) => SpanId::derive(session, &format!("tool:{tu}")),
                     None => SpanId::derive(session, &turn_key(store.current_turn(session)?)),
                 };
-                store.open_span(&open(
+                // Provisional agent span so a subagent whose SubagentStop never
+                // fires (unreliable per #7881) still appears; CloseAgent finalizes.
+                emitted.push(open_provisional(
+                    store,
+                    session,
+                    trace_id,
                     &key,
                     Some(parent),
                     &key,
                     SpanKind::Internal,
                     now_nanos,
                     attrs,
-                    session,
-                ))?;
+                )?);
             }
             SpanOp::CloseAgent {
                 agent_id,
@@ -215,6 +210,36 @@ fn tool_key(tool_use_id: Option<&str>, tool_name: &str) -> String {
         Some(id) => format!("tool:{id}"),
         None => format!("tool:{tool_name}:anon"),
     }
+}
+
+/// Record an open span in the store and return a provisional, self-contained
+/// span (zero-duration, status Unset) to emit immediately. The matching `Close*`
+/// later emits the same deterministic id with the real duration, which the
+/// idempotent ingest overwrites - so an interrupted span (no close) still shows.
+#[allow(clippy::too_many_arguments)]
+fn open_provisional(
+    store: &Store,
+    session: &str,
+    trace_id: TraceId,
+    logical_key: &str,
+    parent: Option<SpanId>,
+    name: &str,
+    kind: SpanKind,
+    now_nanos: u64,
+    attrs: &Attrs,
+) -> Result<Span, gently_store::StoreError> {
+    store.open_span(&open(logical_key, parent, name, kind, now_nanos, attrs, session))?;
+    Ok(Span {
+        trace_id,
+        span_id: SpanId::derive(session, logical_key),
+        parent_span_id: parent,
+        name: name.to_string(),
+        kind,
+        start_unix_nano: now_nanos,
+        end_unix_nano: now_nanos,
+        status: Status::Unset,
+        attributes: attrs.clone(),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -319,13 +344,16 @@ mod tests {
         let (_d, s) = store();
         let h = ClaudeCode;
 
-        // open a turn
+        // open a turn - emits a provisional turn span immediately
         let p = h
             .parse(&json!({"hook_event_name":"UserPromptSubmit","session_id":"s","prompt":"hi"}))
             .unwrap();
-        assert!(apply(&s, &p, 1_000).unwrap().is_empty());
+        let prov = apply(&s, &p, 1_000).unwrap();
+        assert_eq!(prov.len(), 1);
+        assert_eq!(prov[0].name, "turn:1");
+        assert_eq!(prov[0].end_unix_nano, prov[0].start_unix_nano);
 
-        // pre tool
+        // pre tool - tools stay close-only, so nothing emitted yet
         let p = h
             .parse(&json!({"hook_event_name":"PreToolUse","session_id":"s",
             "tool_name":"Bash","tool_use_id":"tu_1","tool_input":{"command":"ls"}}))
@@ -416,6 +444,33 @@ mod tests {
         // close value wins
         let event: Vec<&str> = spans[0].attributes.iter().filter(|(k, _)| k == "gently.event").map(|(_, v)| v.as_str()).collect();
         assert_eq!(event, vec!["PostToolUse"]);
+    }
+
+    #[test]
+    fn turn_and_agent_emit_provisional_on_open() {
+        let (_d, s) = store();
+        let h = ClaudeCode;
+
+        // UserPromptSubmit -> provisional turn:1 (zero-duration, unset status)
+        let spans = apply(&s, &h.parse(&json!({"hook_event_name":"UserPromptSubmit","session_id":"s"})).unwrap(), 10).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, "turn:1");
+        assert_eq!(spans[0].span_id, SpanId::derive("s", "turn:1"));
+        assert_eq!(spans[0].status, Status::Unset);
+        assert_eq!(spans[0].start_unix_nano, spans[0].end_unix_nano);
+
+        // SubagentStart -> provisional agent span
+        let spans = apply(&s, &h.parse(&json!({"hook_event_name":"SubagentStart","session_id":"s","agent_id":"ag1","agent_type":"explore"})).unwrap(), 20).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, "agent:ag1");
+        assert_eq!(spans[0].span_id, SpanId::derive("s", "agent:ag1"));
+
+        // Closing each finalizes the SAME id with real duration.
+        let stop = apply(&s, &h.parse(&json!({"hook_event_name":"Stop","session_id":"s"})).unwrap(), 500).unwrap();
+        assert_eq!(stop[0].span_id, SpanId::derive("s", "turn:1"));
+        assert_eq!(stop[0].start_unix_nano, 10);
+        assert_eq!(stop[0].end_unix_nano, 500);
+        assert_eq!(stop[0].status, Status::Ok);
     }
 
     #[test]

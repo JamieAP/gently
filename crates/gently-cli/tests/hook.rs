@@ -35,9 +35,10 @@ fn hook_is_silent_exits_zero_and_buffers_a_span() {
         r#"{"hook_event_name":"PostToolUse","session_id":"itest","cwd":"/w","tool_name":"Bash","tool_use_id":"tu_1","tool_response":{"ok":true},"duration_ms":5}"#,
     );
 
-    // The PostToolUse closed the tool span -> exactly one OTLP row buffered.
+    // Two OTLP rows buffered: the provisional turn span (emitted on
+    // UserPromptSubmit) and the completed Bash tool span (emitted on PostToolUse).
     let store = Store::open(&state.join("state.db")).unwrap();
-    assert_eq!(store.outbox_len().unwrap(), 1);
+    assert_eq!(store.outbox_len().unwrap(), 2);
 }
 
 #[test]
