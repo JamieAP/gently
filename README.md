@@ -53,9 +53,16 @@ The interesting decisions, and why:
   row to a local SQLite WAL and spawns the exporter detached - no network,
   no QUIC client, no blocking, always exit 0, never a byte on stdout (which the
   harness would parse as control output). 
-- **Durable & self-healing.** Completed spans queue in a local outbox; a `flock`'d,
-  detached exporter drains it over QUIC. A down collector just means the queue grows
-  and the next run retries. Idempotent ingest makes retries free.
+- **Durable & self-healing, no daemon.** Completed spans queue in a local outbox;
+  a `flock`'d, detached exporter - spawned *by the hook itself* - drains it over
+  QUIC. There's nothing long-lived to manage: each `gently export` is a disposable
+  worker, and the next hook is its supervisor. A down collector just grows the
+  queue; the run retries with exponential backoff, and idempotent ingest makes
+  retries free. A span the collector *rejects* (4xx) is isolated by bisection and
+  **quarantined**, so one poison span can't wedge the queue. The exporter's outcome
+  is recorded in the local store and surfaced by `gently status` - observability
+  without a daemon. (Export is triggered on every hook; terminal events always
+  flush, others throttle if an exporter is already running.)
 
 ## Quick start
 
@@ -102,6 +109,7 @@ gently traces                 # recent sessions
 gently trace <id>             # the span tree
 gently spans --tool-name Bash # filter
 gently stats                  # per-tool rollups
+gently status                 # local exporter health + queue depth
 gently trace <id> --json | python3 scripts/waterfall.py   # render a waterfall
 ```
 
@@ -145,7 +153,7 @@ the backend dedups by `span_id`.
 | `gently-store` | `~/.gently/state.db`: open-span tracking + outbox (WAL) |
 | `gently-harness` | `Harness` trait + `ClaudeCode` adapter + the stateful applier |
 | `gently-export` | `Transport` trait, QUIC (reqwest-http3) + HTTP/2, outbox drain |
-| `gently-cli` | the `gently` binary: `hook` · `export` · `traces`/`trace`/`spans`/`stats` · `mcp` · `init` |
+| `gently-cli` | the `gently` binary: `hook` · `export` · `traces`/`trace`/`spans`/`stats` · `status` · `mcp` · `init` |
 | `worker/` | `gently-collector` Cloudflare Worker (TypeScript, D1) |
 | `scripts/waterfall.py` | ASCII waterfall + structural-integrity checker |
 
