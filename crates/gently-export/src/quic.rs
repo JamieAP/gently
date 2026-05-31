@@ -55,7 +55,7 @@ impl QuicTransport {
                     msg.push_str(&format!(" | caused by: {s}"));
                     src = s.source();
                 }
-                ExportError::Transport(msg)
+                ExportError::Unavailable(msg)
             })?;
         Ok(Self {
             endpoint,
@@ -76,15 +76,7 @@ impl Transport for QuicTransport {
             .body(body)
             .send()
             .await
-            .map_err(|e| ExportError::Transport(e.to_string()))?;
-
-        let status = resp.status();
-        if status.is_success() {
-            Ok(())
-        } else {
-            Err(ExportError::Transport(format!(
-                "collector returned {status} over http3"
-            )))
-        }
+            .map_err(|e| ExportError::Unavailable(e.to_string()))?;
+        crate::http2::classify(resp.status())
     }
 }

@@ -28,7 +28,7 @@ pub fn run() {
 fn process() -> anyhow::Result<()> {
     let cfg = Config::load()?;
     cfg.ensure_state_dir()?;
-    init_log(&cfg);
+    crate::logging::init_file_log(&cfg.state_dir.join("hook.log"));
 
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw)?;
@@ -146,18 +146,4 @@ fn spawn_detached_export() {
     // Spawn and forget: do not wait. A failed spawn is non-fatal - the next
     // hook will try again and the outbox is durable.
     let _ = cmd.spawn();
-}
-
-fn init_log(cfg: &Config) {
-    let path = cfg.state_dir.join("hook.log");
-    if let Ok(file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = tracing_subscriber::fmt()
-            .with_writer(std::sync::Mutex::new(file))
-            .with_ansi(false)
-            .try_init();
-    }
 }

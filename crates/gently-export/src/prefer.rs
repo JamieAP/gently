@@ -66,7 +66,7 @@ mod tests {
             if self.ok {
                 Ok(())
             } else {
-                Err(ExportError::Transport("nope".into()))
+                Err(ExportError::Unavailable("nope".into()))
             }
         }
     }

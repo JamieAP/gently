@@ -10,9 +10,11 @@
 //! locked" errors. A down collector simply means the outbox grows and the next
 //! exporter run retries - the durability that makes the pipeline self-healing.
 
+mod health;
 mod open_spans;
 mod outbox;
 
+pub use health::Health;
 pub use open_spans::OpenSpan;
 
 use std::path::Path;
@@ -69,6 +71,19 @@ CREATE TABLE IF NOT EXISTS counters (
   session_id TEXT PRIMARY KEY,
   turn_index INTEGER NOT NULL DEFAULT 0,
   current_turn INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS quarantine (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  span_json TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  quarantined_unix_nano INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS health (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  last_attempt_unix_nano INTEGER,
+  last_ok_unix_nano INTEGER,
+  last_error TEXT,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0
 );
 "#;
 

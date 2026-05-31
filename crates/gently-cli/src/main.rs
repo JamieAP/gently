@@ -6,7 +6,9 @@ mod cmd_hook;
 mod cmd_init;
 mod cmd_mcp;
 mod cmd_query;
+mod cmd_status;
 mod config;
+mod logging;
 mod query_client;
 
 use clap::{Parser, Subcommand};
@@ -27,6 +29,8 @@ enum Command {
     Hook,
     /// Drain the local outbox to the collector.
     Export,
+    /// Show local exporter health and queue depth.
+    Status,
     /// Run the MCP stdio server exposing trace queries.
     Mcp,
     /// Install gently's hooks and MCP server into a harness.
@@ -92,6 +96,7 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
     match command {
         Command::Hook => unreachable!("handled in main"),
         Command::Export => cmd_export::run(),
+        Command::Status => cmd_status::run(),
         Command::Mcp => cmd_mcp::run(),
         Command::Init { claude: _ } => cmd_init::run_claude(),
         Command::Traces {

@@ -5,7 +5,6 @@
 //! A drain trims oldest rows above the configured cap before attempting delivery,
 //! so an outage can cause data loss. Queueing and delivery do not prove capture
 //! completeness. Repeated span IDs replace prior values in the Worker.
-//! Failed sends increment attempt counters in this version.
 
 mod http2;
 mod prefer;
@@ -20,10 +19,24 @@ use gently_store::Store;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExportError {
-    #[error("transport: {0}")]
-    Transport(String),
+    /// Collector unreachable, timed out, or returned 5xx - retryable; the
+    /// collector's fault, not the payload's. Rows stay queued for the next run.
+    #[error("{0}")]
+    Unavailable(String),
+    /// Collector reached but rejected the request (4xx) - the payload is bad and
+    /// will never succeed, so the offending span is quarantined, not retried.
+    #[error("collector rejected request (HTTP {0})")]
+    Rejected(u16),
     #[error("store: {0}")]
     Store(#[from] gently_store::StoreError),
+}
+
+impl ExportError {
+    /// Whether retrying could succeed. A 4xx rejection cannot; everything else
+    /// (connection failure, timeout, 5xx, a transient store error) might.
+    pub fn retryable(&self) -> bool {
+        !matches!(self, ExportError::Rejected(_))
+    }
 }
 
 /// A pluggable wire transport for OTLP batches. The HTTP/2 implementation ships
@@ -59,18 +72,38 @@ pub async fn drain<T: Transport>(
         if batch.is_empty() {
             break;
         }
-        let ids: Vec<i64> = batch.iter().map(|(id, _)| *id).collect();
-        let body = coalesce(&batch);
-
-        match transport.send(body).await {
-            Ok(()) => {
-                store.outbox_delete(&ids)?;
-                delivered += ids.len();
+        // Resolve the batch by bisection: a 2xx delivers a slice; a 4xx on a
+        // slice of one quarantines that poison span; a 4xx on a larger slice
+        // splits it to isolate the culprit without dropping good spans. A
+        // retryable error (collector down / 5xx / timeout) aborts the whole run
+        // - the rows stay queued and the next run (or the cmd_export backoff
+        // loop) retries them.
+        let mut stack: Vec<(usize, usize)> = vec![(0, batch.len())];
+        while let Some((lo, hi)) = stack.pop() {
+            if lo >= hi {
+                continue;
             }
-            Err(e) => {
-                store.outbox_bump_attempts(&ids)?;
-                tracing::warn!(error = %e, batch = ids.len(), "export batch failed; will retry");
-                return Err(e);
+            let slice = &batch[lo..hi];
+            match transport.send(coalesce(slice)).await {
+                Ok(()) => {
+                    let ids: Vec<i64> = slice.iter().map(|(id, _)| *id).collect();
+                    store.outbox_delete(&ids)?;
+                    delivered += slice.len();
+                }
+                Err(e) if e.retryable() => {
+                    tracing::warn!(error = %e, pending = slice.len(), "export unavailable; will retry");
+                    return Err(e);
+                }
+                Err(e) if hi - lo == 1 => {
+                    let id = slice[0].0;
+                    tracing::error!(error = %e, id, "collector rejected span; quarantining (poison)");
+                    store.outbox_quarantine(&[id], &e.to_string())?;
+                }
+                Err(_rejected) => {
+                    let mid = lo + (hi - lo) / 2;
+                    stack.push((lo, mid));
+                    stack.push((mid, hi));
+                }
             }
         }
     }
@@ -128,13 +161,47 @@ mod tests {
         async fn send(&self, body: Vec<u8>) -> Result<(), ExportError> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n < self.fail_n {
-                return Err(ExportError::Transport("flaky".into()));
+                return Err(ExportError::Unavailable("flaky".into()));
             }
             let req: OtlpRequest = serde_json::from_slice(&body).unwrap();
             self.spans_received
                 .fetch_add(req.span_count(), Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    /// Rejects (400) any batch containing a span named "poison".
+    struct PoisonRejector;
+    impl Transport for PoisonRejector {
+        async fn send(&self, body: Vec<u8>) -> Result<(), ExportError> {
+            let req: OtlpRequest = serde_json::from_slice(&body).unwrap();
+            let has_poison = req
+                .resource_spans
+                .iter()
+                .flat_map(|rs| rs.scope_spans.iter())
+                .flat_map(|ss| ss.spans.iter())
+                .any(|sp| sp.name == "poison");
+            if has_poison {
+                Err(ExportError::Rejected(400))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn poison_span_is_quarantined_others_delivered() {
+        let (_d, s) = store();
+        enqueue_span(&s, "good1");
+        enqueue_span(&s, "poison");
+        enqueue_span(&s, "good2");
+
+        // One batch contains the poison span -> drain bisects, quarantines it,
+        // and delivers the two good spans, returning Ok (not an error).
+        let delivered = drain(&s, &PoisonRejector, 10_000, 512).await.unwrap();
+        assert_eq!(delivered, 2);
+        assert_eq!(s.outbox_len().unwrap(), 0, "queue drained");
+        assert_eq!(s.quarantine_len().unwrap(), 1, "poison span quarantined");
     }
 
     #[tokio::test]
@@ -149,7 +216,7 @@ mod tests {
             spans_received: AtomicUsize::new(0),
         };
 
-        // first two drains fail -> rows survive, attempts bumped
+        // first two drains fail -> rows survive for a later retry
         assert!(drain(&s, &t, 10_000, 512).await.is_err());
         assert_eq!(s.outbox_len().unwrap(), 2);
         assert!(drain(&s, &t, 10_000, 512).await.is_err());

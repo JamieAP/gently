@@ -41,15 +41,21 @@ impl Transport for Http2Transport {
             .body(body)
             .send()
             .await
-            .map_err(|e| ExportError::Transport(e.to_string()))?;
+            .map_err(|e| ExportError::Unavailable(e.to_string()))?;
+        classify(resp.status())
+    }
+}
 
-        let status = resp.status();
-        if status.is_success() {
-            Ok(())
-        } else {
-            Err(ExportError::Transport(format!(
-                "collector returned {status}"
-            )))
-        }
+/// Map an HTTP status to delivery outcome: success, a 4xx rejection (poison), or
+/// otherwise (5xx / unexpected) an unavailable-style retryable error.
+pub(crate) fn classify(status: reqwest::StatusCode) -> Result<(), ExportError> {
+    if status.is_success() {
+        Ok(())
+    } else if status.is_client_error() {
+        Err(ExportError::Rejected(status.as_u16()))
+    } else {
+        Err(ExportError::Unavailable(format!(
+            "collector returned {status}"
+        )))
     }
 }

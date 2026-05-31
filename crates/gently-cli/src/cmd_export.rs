@@ -4,17 +4,28 @@
 //! the OS releases automatically on process death (so a crashed exporter leaves
 //! no stale lock - convergence is preserved). If another exporter holds the
 //! lock we exit immediately; it is already draining the shared outbox.
+//!
+//! Within a run we retry a retryable failure (collector down / 5xx / timeout) a
+//! few times with exponential backoff before giving up - the next hook-spawned
+//! run retries beyond that. A 4xx-rejected (poison) span is quarantined inside
+//! `drain`, never retried. The run's outcome is recorded in the store's health
+//! row so `gently status` can surface a silently-failing exporter.
 
 use crate::config::Config;
 use anyhow::{Context, Result};
 use fs4::fs_std::FileExt;
 use gently_export::{drain, Http2Transport, PreferQuic, QuicTransport};
 use gently_store::Store;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// In-run retry budget for retryable failures, and the base backoff.
+const MAX_RETRIES: u32 = 3;
+const BACKOFF_BASE: Duration = Duration::from_millis(250);
 
 pub fn run() -> Result<()> {
     let cfg = Config::load()?;
     cfg.ensure_state_dir()?;
-    init_log(&cfg);
+    crate::logging::init_file_log(&cfg.state_dir.join("export.log"));
 
     let lock_path = cfg.state_dir.join("export.lock");
     let lock = std::fs::OpenOptions::new()
@@ -43,11 +54,10 @@ pub fn run() -> Result<()> {
 
     // The QUIC (HTTP/3) client must be built inside the tokio runtime - reqwest
     // spawns the quinn endpoint driver on the current runtime, so constructing
-    // it outside fails with "no async runtime found". Build transports and drain
-    // within one block_on; prefer QUIC, fall back to HTTP/2 (logged).
+    // it outside fails with "no async runtime found". Build transports once and
+    // run the retry/backoff loop inside one block_on.
     let result = runtime.block_on(async {
         let http2 = Http2Transport::new(&cfg.collector_url, &cfg.token, cfg.export_timeout_secs);
-        // Only build the QUIC client when preferred (config `prefer_quic`).
         let quic = if cfg.prefer_quic {
             match QuicTransport::new(&cfg.collector_url, &cfg.token, cfg.export_timeout_secs) {
                 Ok(q) => {
@@ -64,33 +74,46 @@ pub fn run() -> Result<()> {
             None
         };
         let transport = PreferQuic::new(quic, http2);
-        drain(&store, &transport, cfg.outbox_cap, cfg.export_batch).await
+
+        // Retry retryable failures with exponential backoff; a non-retryable
+        // error never escapes drain (poison is quarantined inside it).
+        let mut last_err = None;
+        for attempt in 0..MAX_RETRIES {
+            match drain(&store, &transport, cfg.outbox_cap, cfg.export_batch).await {
+                Ok(n) => return Ok(n),
+                Err(e) => {
+                    let backoff = BACKOFF_BASE * 2u32.pow(attempt);
+                    tracing::warn!(error = %e, attempt = attempt + 1, ?backoff, "export retry");
+                    last_err = Some(e);
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+        Err(last_err.expect("loop ran at least once"))
     });
     // Release before reporting; the lock also drops at end of scope.
     let _ = FileExt::unlock(&lock);
 
-    match result {
+    // Record health so a silently-failing detached exporter is visible to
+    // `gently status` (best-effort: never fail the run on a health write).
+    let now = now_nanos();
+    match &result {
         Ok(n) => {
             tracing::info!(delivered = n, "export drain complete");
+            let _ = store.health_record_success(now);
             Ok(())
         }
-        // A failed batch is expected when the collector is down; the outbox kept
-        // the rows. Surface it for the CLI but it is not a crash condition.
-        Err(e) => Err(e).context("export drain"),
+        // Expected when the collector is down; the outbox kept the rows.
+        Err(e) => {
+            let _ = store.health_record_failure(now, &e.to_string());
+            Err(anyhow::anyhow!("{e}")).context("export drain")
+        }
     }
 }
 
-/// Log to `<state_dir>/export.log` so the detached exporter's transport choices
-/// (QUIC vs HTTP/2 fallback) and drain results are observable after the fact.
-fn init_log(cfg: &Config) {
-    if let Ok(file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(cfg.state_dir.join("export.log"))
-    {
-        let _ = tracing_subscriber::fmt()
-            .with_writer(std::sync::Mutex::new(file))
-            .with_ansi(false)
-            .try_init();
-    }
+fn now_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
