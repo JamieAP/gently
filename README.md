@@ -110,6 +110,32 @@ The adapter is tolerant by design - only `session_id` and `hook_event_name` are
 required, and any of the 30 hook events it does not explicitly model is recorded
 as a marker span.
 
+## OpenTelemetry compliance & deliberate deviations
+
+The wire format is OTLP/JSON-compliant (valid `resourceSpans → scopeSpans → spans`,
+correct field names, uint64-as-string encoding, standard `status`/`kind` enums) -
+a conformant parser reads it fine. But two patterns are **intentionally
+non-idiomatic**, and they only work because gently owns its collector. Do not
+point the exporter at a generic OTLP backend (Tempo/Jaeger/Honeycomb) expecting
+clean results without accounting for these:
+
+1. **Deterministic span/trace ids.** OTel recommends *random* ids; gently derives
+   them `blake3(session_id [+ logical_key])`. Any 8/16 bytes is a valid id, so
+   this is conformant-but-unusual. It's what lets stateless, short-lived hook
+   processes reconstruct parent links and makes ingest idempotent without shared
+   state.
+
+2. **Provisional-then-final double emit.** Standard OTel emits each span **once,
+   at end**; there is no span-update in the data model. gently emits the *same*
+   `span_id` twice - a zero-duration provisional on open (so an interrupted
+   session/turn/subagent still appears after a crash) and the full span on close -
+   and relies on the collector doing **last-write-wins on `span_id`** (the D1
+   `INSERT OR REPLACE`). A backend that doesn't upsert by span id would show
+   **duplicate spans**. This is gently-collector-specific, not portable OTel.
+
+If you need a standard backend: emit on close only (drop the provisional, losing
+crash-durability of in-flight spans), or ensure the backend dedups by `span_id`.
+
 ## Development
 
 ```bash
