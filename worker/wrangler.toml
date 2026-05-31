@@ -1,0 +1,9 @@
+name = "gently-collector"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "gently"
+# database_id is filled by: wrangler d1 create gently
+database_id = "REPLACE_AFTER_CREATE"
