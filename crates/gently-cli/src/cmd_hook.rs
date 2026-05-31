@@ -49,7 +49,11 @@ fn process() -> anyhow::Result<()> {
         store.outbox_enqueue(&serde_json::to_string(&req)?)?;
     }
 
-    spawn_detached_export();
+    // Terminal events flush unconditionally so the last spans always ship;
+    // other events throttle (skip the spawn if an exporter is already running).
+    let event = value.get("hook_event_name").and_then(|v| v.as_str()).unwrap_or("");
+    let terminal = matches!(event, "Stop" | "StopFailure" | "SessionEnd");
+    maybe_spawn_export(&cfg, terminal);
     Ok(())
 }
 
@@ -77,6 +81,43 @@ fn capture_raw(cfg: &Config, value: &serde_json::Value, raw: &str) {
         .open(dir.join(format!("{event}.jsonl")))
     {
         let _ = writeln!(f, "{}", raw.trim());
+    }
+}
+
+/// Spawn the detached exporter, unless throttled.
+///
+/// Hot-path guard: the exporter is a separate process, so spawning one on every
+/// hook would fork+exec on every tool call (and under parallel tools, many at
+/// once). When `force` is false we first probe the exporter lock - if an
+/// exporter already holds it, we skip the spawn entirely, because that running
+/// exporter drains in a loop until the outbox is empty and will pick up the row
+/// we just enqueued. `force` (terminal events) always spawns so the final flush
+/// is guaranteed even if the previous exporter had already moved past our row.
+fn maybe_spawn_export(cfg: &Config, force: bool) {
+    if !force && exporter_running(cfg) {
+        return;
+    }
+    spawn_detached_export();
+}
+
+/// Non-blocking probe: is an exporter currently holding the lock? Acquiring then
+/// immediately releasing is a cheap local file op; a held lock means "running".
+fn exporter_running(cfg: &Config) -> bool {
+    use fs4::fs_std::FileExt;
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(cfg.state_dir.join("export.lock"))
+    else {
+        return false; // can't tell → don't suppress the spawn
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = FileExt::unlock(&file);
+            false
+        }
+        Err(_) => true, // held by a running exporter
     }
 }
 

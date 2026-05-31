@@ -57,7 +57,17 @@ export default {
         const body = await req.json();
         const rows = flatten(body as Parameters<typeof flatten>[0]);
         await insertSpans(env, rows);
-        return jsonOk({ partialSuccess: {} });
+        // Log the negotiated wire protocol (HTTP/3 when QUIC is used) so the
+        // transport can be confirmed end-to-end via `wrangler tail`. Also echoed
+        // in the response for direct probes.
+        const httpProtocol = req.cf?.httpProtocol ?? "unknown";
+        console.log(JSON.stringify({ ev: "ingest", httpProtocol, spans: rows.length }));
+        return jsonOk({ partialSuccess: {}, httpProtocol });
+      }
+
+      // Lightweight probe: returns the negotiated protocol for this request.
+      if (req.method === "GET" && pathname === "/v1/whoami") {
+        return jsonOk({ httpProtocol: req.cf?.httpProtocol ?? "unknown" });
       }
 
       if (req.method === "GET" && pathname === "/v1/query") {

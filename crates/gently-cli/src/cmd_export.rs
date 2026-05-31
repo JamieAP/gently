@@ -36,10 +36,16 @@ pub fn run() -> Result<()> {
     // Prefer QUIC (HTTP/3 via a detected h3-capable curl); fall back to the
     // in-process HTTP/2 client when QUIC is unavailable or fails.
     let http2 = Http2Transport::new(&cfg.collector_url, &cfg.token);
-    let quic = QuicTransport::detect(&cfg.collector_url, &cfg.token, &cfg.state_dir);
-    if quic.is_some() {
-        tracing::info!("QUIC (HTTP/3) transport available; preferring it over HTTP/2");
-    }
+    let quic = match QuicTransport::new(&cfg.collector_url, &cfg.token) {
+        Ok(q) => {
+            tracing::info!("QUIC (HTTP/3) transport built; preferring it over HTTP/2");
+            Some(q)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "QUIC client unavailable; using HTTP/2 only");
+            None
+        }
+    };
     let transport = PreferQuic::new(quic, http2);
     let store = Store::open(&cfg.state_db())?;
 
