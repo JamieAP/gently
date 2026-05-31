@@ -51,7 +51,10 @@ fn process() -> anyhow::Result<()> {
 
     // Terminal events flush unconditionally so the last spans always ship;
     // other events throttle (skip the spawn if an exporter is already running).
-    let event = value.get("hook_event_name").and_then(|v| v.as_str()).unwrap_or("");
+    let event = value
+        .get("hook_event_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let terminal = matches!(event, "Stop" | "StopFailure" | "SessionEnd");
     maybe_spawn_export(&cfg, terminal);
     Ok(())

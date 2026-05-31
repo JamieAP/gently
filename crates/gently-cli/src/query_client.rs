@@ -68,7 +68,7 @@ impl QueryClient {
             base: format!("{}/v1/query", cfg.collector_url.trim_end_matches('/')),
             token: cfg.token.clone(),
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(cfg.query_timeout_secs))
                 .build()
                 .expect("reqwest client builds"),
         })

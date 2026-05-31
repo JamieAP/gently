@@ -51,10 +51,24 @@ fn scaffold_config(cfg: &Config) -> Result<()> {
     if path.exists() {
         return Ok(());
     }
-    let template = "# gently collector configuration\n\
-        # The Cloudflare Worker base URL and shared bearer token.\n\
-        collector_url = \"http://127.0.0.1:8787\"\n\
-        token = \"CHANGE_ME\"\n";
+    // Fully-documented template. Required keys at top; tunables (commented) show
+    // their built-in defaults so the file is self-explanatory. A minimal config
+    // is just collector_url + token.
+    let template = "# gently configuration  -  https://github.com (gently)\n\
+        #\n\
+        # REQUIRED: the collector (a Cloudflare Worker backed by D1, or a local\n\
+        # `wrangler dev`). Both export and queries use these. Override at runtime\n\
+        # with GENTLY_COLLECTOR_URL / GENTLY_TOKEN.\n\
+        collector_url = \"https://gently-collector.<account>.workers.dev\"\n\
+        token = \"CHANGE_ME\"\n\
+        \n\
+        # OPTIONAL tunables (shown with their defaults; uncomment to change):\n\
+        #\n\
+        # prefer_quic = true          # prefer HTTP/3 (QUIC) for export, fall back to HTTP/2\n\
+        # outbox_cap = 10000          # max buffered spans before the oldest are dropped\n\
+        # export_batch = 512          # spans coalesced into one export request\n\
+        # export_timeout_secs = 15    # per-request export timeout\n\
+        # query_timeout_secs = 30     # per-request query / MCP timeout\n";
     std::fs::write(&path, template).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }

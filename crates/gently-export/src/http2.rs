@@ -17,10 +17,10 @@ pub struct Http2Transport {
 impl Http2Transport {
     /// Build a transport targeting `collector_url` (the base URL; `/v1/traces`
     /// is appended) authenticated with `token`.
-    pub fn new(collector_url: &str, token: impl Into<String>) -> Self {
+    pub fn new(collector_url: &str, token: impl Into<String>, timeout_secs: u64) -> Self {
         let endpoint = format!("{}/v1/traces", collector_url.trim_end_matches('/'));
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(timeout_secs))
             .build()
             .expect("reqwest client builds with default rustls config");
         Self {

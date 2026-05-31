@@ -37,12 +37,16 @@ pub struct QuicTransport {
 impl QuicTransport {
     /// Build an HTTP/3-only client for `collector_url`. Returns an error if the
     /// client cannot be constructed; the caller then runs HTTP/2 only.
-    pub fn new(collector_url: &str, token: impl Into<String>) -> Result<Self, ExportError> {
+    pub fn new(
+        collector_url: &str,
+        token: impl Into<String>,
+        timeout_secs: u64,
+    ) -> Result<Self, ExportError> {
         ensure_crypto_provider();
         let endpoint = format!("{}/v1/traces", collector_url.trim_end_matches('/'));
         let client = reqwest::Client::builder()
             .http3_prior_knowledge()
-            .timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(timeout_secs))
             .build()
             .map_err(|e| {
                 let mut msg = format!("building http3 client: {e}");
@@ -53,7 +57,11 @@ impl QuicTransport {
                 }
                 ExportError::Transport(msg)
             })?;
-        Ok(Self { endpoint, token: token.into(), client })
+        Ok(Self {
+            endpoint,
+            token: token.into(),
+            client,
+        })
     }
 }
 
@@ -74,7 +82,9 @@ impl Transport for QuicTransport {
         if status.is_success() {
             Ok(())
         } else {
-            Err(ExportError::Transport(format!("collector returned {status} over http3")))
+            Err(ExportError::Transport(format!(
+                "collector returned {status} over http3"
+            )))
         }
     }
 }

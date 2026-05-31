@@ -16,10 +16,7 @@ pub use prefer::PreferQuic;
 pub use quic::QuicTransport;
 
 use gently_core::OtlpRequest;
-use gently_store::{Store, OUTBOX_CAP};
-
-/// How many outbox rows to coalesce into a single wire request.
-const BATCH: usize = 512;
+use gently_store::Store;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExportError {
@@ -43,17 +40,22 @@ pub trait Transport {
 /// Drain the outbox into `transport` until it is empty or a batch fails.
 ///
 /// Returns the number of spans successfully delivered. Trims the outbox to
-/// [`OUTBOX_CAP`] first, logging any drops. This bounds rows during a drain,
-/// not while hooks enqueue without a drain.
-pub async fn drain<T: Transport>(store: &Store, transport: &T) -> Result<usize, ExportError> {
-    let dropped = store.outbox_trim(OUTBOX_CAP)?;
+/// `cap` first, logging any drops. Queue length can exceed the cap between
+/// drains. Coalesces up to `batch_size` rows per wire request.
+pub async fn drain<T: Transport>(
+    store: &Store,
+    transport: &T,
+    cap: usize,
+    batch_size: usize,
+) -> Result<usize, ExportError> {
+    let dropped = store.outbox_trim(cap)?;
     if dropped > 0 {
         tracing::warn!(dropped, "outbox over capacity; dropped oldest spans");
     }
 
     let mut delivered = 0usize;
     loop {
-        let batch = store.outbox_take_batch(BATCH)?;
+        let batch = store.outbox_take_batch(batch_size)?;
         if batch.is_empty() {
             break;
         }
@@ -148,13 +150,13 @@ mod tests {
         };
 
         // first two drains fail -> rows survive, attempts bumped
-        assert!(drain(&s, &t).await.is_err());
+        assert!(drain(&s, &t, 10_000, 512).await.is_err());
         assert_eq!(s.outbox_len().unwrap(), 2);
-        assert!(drain(&s, &t).await.is_err());
+        assert!(drain(&s, &t, 10_000, 512).await.is_err());
         assert_eq!(s.outbox_len().unwrap(), 2);
 
         // third drain succeeds -> rows gone, 2 spans delivered in one batch
-        let delivered = drain(&s, &t).await.unwrap();
+        let delivered = drain(&s, &t, 10_000, 512).await.unwrap();
         assert_eq!(delivered, 2);
         assert_eq!(s.outbox_len().unwrap(), 0);
         assert_eq!(t.spans_received.load(Ordering::SeqCst), 2);

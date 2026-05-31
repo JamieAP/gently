@@ -19,7 +19,10 @@ pub struct PreferQuic<P: Transport, F: Transport> {
 impl<P: Transport, F: Transport> PreferQuic<P, F> {
     /// `preferred` is `None` when no QUIC transport could be constructed.
     pub fn new(preferred: Option<P>, fallback: F) -> Self {
-        Self { preferred, fallback }
+        Self {
+            preferred,
+            fallback,
+        }
     }
 }
 
@@ -48,7 +51,10 @@ mod tests {
     }
     impl Recorder {
         fn new(ok: bool) -> Self {
-            Self { calls: AtomicUsize::new(0), ok }
+            Self {
+                calls: AtomicUsize::new(0),
+                ok,
+            }
         }
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)

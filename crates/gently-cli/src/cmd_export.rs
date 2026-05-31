@@ -46,19 +46,25 @@ pub fn run() -> Result<()> {
     // it outside fails with "no async runtime found". Build transports and drain
     // within one block_on; prefer QUIC, fall back to HTTP/2 (logged).
     let result = runtime.block_on(async {
-        let http2 = Http2Transport::new(&cfg.collector_url, &cfg.token);
-        let quic = match QuicTransport::new(&cfg.collector_url, &cfg.token) {
-            Ok(q) => {
-                tracing::info!("QUIC (HTTP/3) transport built; preferring it over HTTP/2");
-                Some(q)
+        let http2 = Http2Transport::new(&cfg.collector_url, &cfg.token, cfg.export_timeout_secs);
+        // Only build the QUIC client when preferred (config `prefer_quic`).
+        let quic = if cfg.prefer_quic {
+            match QuicTransport::new(&cfg.collector_url, &cfg.token, cfg.export_timeout_secs) {
+                Ok(q) => {
+                    tracing::info!("QUIC (HTTP/3) transport built; preferring it over HTTP/2");
+                    Some(q)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "QUIC client unavailable; using HTTP/2 only");
+                    None
+                }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "QUIC client unavailable; using HTTP/2 only");
-                None
-            }
+        } else {
+            tracing::info!("prefer_quic=false; using HTTP/2");
+            None
         };
         let transport = PreferQuic::new(quic, http2);
-        drain(&store, &transport).await
+        drain(&store, &transport, cfg.outbox_cap, cfg.export_batch).await
     });
     // Release before reporting; the lock also drops at end of scope.
     let _ = FileExt::unlock(&lock);

@@ -80,6 +80,21 @@ gently init --claude                       # hooks + MCP server + ~/.gently/conf
 Set your collector in `~/.gently/config.toml` (or `GENTLY_COLLECTOR_URL` /
 `GENTLY_TOKEN`), then restart your session. Spans flow on every tool call.
 
+`config.toml` needs only `collector_url` + `token`; everything else has a sane
+default (shown here, commented in the scaffold). `collector_url` is the one knob
+that picks the store - point it at a `*.workers.dev` (CF D1, the default) or a
+local `wrangler dev` (`http://127.0.0.1:8787`); both export *and* queries follow it.
+
+```toml
+collector_url = "https://gently-collector.<account>.workers.dev"
+token         = "…"
+# prefer_quic = true        # prefer HTTP/3, fall back to HTTP/2
+# outbox_cap  = 10000       # buffered spans before oldest dropped
+# export_batch = 512        # spans per export request
+# export_timeout_secs = 15
+# query_timeout_secs  = 30
+```
+
 **3 - Query** - from the shell, or as MCP tools the agent can call on itself:
 
 ```bash

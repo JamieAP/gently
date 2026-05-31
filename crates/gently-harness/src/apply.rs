@@ -228,7 +228,15 @@ fn open_provisional(
     now_nanos: u64,
     attrs: &Attrs,
 ) -> Result<Span, gently_store::StoreError> {
-    store.open_span(&open(logical_key, parent, name, kind, now_nanos, attrs, session))?;
+    store.open_span(&open(
+        logical_key,
+        parent,
+        name,
+        kind,
+        now_nanos,
+        attrs,
+        session,
+    ))?;
     Ok(Span {
         trace_id,
         span_id: SpanId::derive(session, logical_key),
@@ -404,7 +412,8 @@ mod tests {
         // SessionStart emits a provisional root immediately (start == end).
         let spans = apply(
             &s,
-            &h.parse(&json!({"hook_event_name":"SessionStart","session_id":"s"})).unwrap(),
+            &h.parse(&json!({"hook_event_name":"SessionStart","session_id":"s"}))
+                .unwrap(),
             100,
         )
         .unwrap();
@@ -417,12 +426,16 @@ mod tests {
         // SessionEnd re-emits the same id spanning the full session.
         let spans = apply(
             &s,
-            &h.parse(&json!({"hook_event_name":"SessionEnd","session_id":"s"})).unwrap(),
+            &h.parse(&json!({"hook_event_name":"SessionEnd","session_id":"s"}))
+                .unwrap(),
             900,
         )
         .unwrap();
         assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].span_id, root_id, "same deterministic id => idempotent replace");
+        assert_eq!(
+            spans[0].span_id, root_id,
+            "same deterministic id => idempotent replace"
+        );
         assert_eq!(spans[0].start_unix_nano, 100);
         assert_eq!(spans[0].end_unix_nano, 900);
     }
@@ -431,18 +444,37 @@ mod tests {
     fn paired_tool_span_has_unique_attribute_keys() {
         let (_d, s) = store();
         let h = ClaudeCode;
-        apply(&s, &h.parse(&json!({"hook_event_name":"UserPromptSubmit","session_id":"s"})).unwrap(), 1).unwrap();
+        apply(
+            &s,
+            &h.parse(&json!({"hook_event_name":"UserPromptSubmit","session_id":"s"}))
+                .unwrap(),
+            1,
+        )
+        .unwrap();
         apply(&s, &h.parse(&json!({"hook_event_name":"PreToolUse","session_id":"s",
             "tool_name":"Bash","tool_use_id":"tu_1","tool_input":{"command":"ls"},"permission_mode":"default"})).unwrap(), 2).unwrap();
         let spans = apply(&s, &h.parse(&json!({"hook_event_name":"PostToolUse","session_id":"s",
             "tool_name":"Bash","tool_use_id":"tu_1","tool_response":{"ok":true},"permission_mode":"default"})).unwrap(), 3).unwrap();
-        let keys: Vec<&str> = spans[0].attributes.iter().map(|(k, _)| k.as_str()).collect();
+        let keys: Vec<&str> = spans[0]
+            .attributes
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
         let mut uniq = keys.clone();
         uniq.sort_unstable();
         uniq.dedup();
-        assert_eq!(keys.len(), uniq.len(), "no duplicate attribute keys: {keys:?}");
+        assert_eq!(
+            keys.len(),
+            uniq.len(),
+            "no duplicate attribute keys: {keys:?}"
+        );
         // close value wins
-        let event: Vec<&str> = spans[0].attributes.iter().filter(|(k, _)| k == "gently.event").map(|(_, v)| v.as_str()).collect();
+        let event: Vec<&str> = spans[0]
+            .attributes
+            .iter()
+            .filter(|(k, _)| k == "gently.event")
+            .map(|(_, v)| v.as_str())
+            .collect();
         assert_eq!(event, vec!["PostToolUse"]);
     }
 
@@ -452,7 +484,13 @@ mod tests {
         let h = ClaudeCode;
 
         // UserPromptSubmit -> provisional turn:1 (zero-duration, unset status)
-        let spans = apply(&s, &h.parse(&json!({"hook_event_name":"UserPromptSubmit","session_id":"s"})).unwrap(), 10).unwrap();
+        let spans = apply(
+            &s,
+            &h.parse(&json!({"hook_event_name":"UserPromptSubmit","session_id":"s"}))
+                .unwrap(),
+            10,
+        )
+        .unwrap();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].name, "turn:1");
         assert_eq!(spans[0].span_id, SpanId::derive("s", "turn:1"));
@@ -466,7 +504,13 @@ mod tests {
         assert_eq!(spans[0].span_id, SpanId::derive("s", "agent:ag1"));
 
         // Closing each finalizes the SAME id with real duration.
-        let stop = apply(&s, &h.parse(&json!({"hook_event_name":"Stop","session_id":"s"})).unwrap(), 500).unwrap();
+        let stop = apply(
+            &s,
+            &h.parse(&json!({"hook_event_name":"Stop","session_id":"s"}))
+                .unwrap(),
+            500,
+        )
+        .unwrap();
         assert_eq!(stop[0].span_id, SpanId::derive("s", "turn:1"));
         assert_eq!(stop[0].start_unix_nano, 10);
         assert_eq!(stop[0].end_unix_nano, 500);
