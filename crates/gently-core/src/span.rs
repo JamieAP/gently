@@ -24,6 +24,17 @@ impl SpanKind {
             SpanKind::Consumer => 5,
         }
     }
+
+    /// Inverse of [`SpanKind::as_otlp`]; unknown codes map to `Internal`.
+    pub fn from_otlp(code: u8) -> Self {
+        match code {
+            2 => SpanKind::Server,
+            3 => SpanKind::Client,
+            4 => SpanKind::Producer,
+            5 => SpanKind::Consumer,
+            _ => SpanKind::Internal,
+        }
+    }
 }
 
 /// Span status. `Error` carries an optional human message.

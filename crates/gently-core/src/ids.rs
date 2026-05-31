@@ -46,6 +46,18 @@ impl SpanId {
     pub fn to_hex(&self) -> String {
         hex(&self.0)
     }
+
+    /// Parse an 8-byte (16 hex char) span id. Returns `None` on malformed input.
+    pub fn from_hex(s: &str) -> Option<Self> {
+        if s.len() != 16 {
+            return None;
+        }
+        let mut b = [0u8; 8];
+        for (i, byte) in b.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+        }
+        Some(Self(b))
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
