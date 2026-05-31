@@ -113,6 +113,18 @@ impl OtlpRequest {
         }
     }
 
+    /// Merge several requests into one by concatenating their resource groups.
+    /// Used by the exporter to coalesce a batch of single-span outbox rows into
+    /// one wire request.
+    pub fn merge(requests: Vec<OtlpRequest>) -> Self {
+        Self {
+            resource_spans: requests
+                .into_iter()
+                .flat_map(|r| r.resource_spans)
+                .collect(),
+        }
+    }
+
     /// Total spans across all resource/scope groups.
     pub fn span_count(&self) -> usize {
         self.resource_spans

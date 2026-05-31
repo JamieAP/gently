@@ -4,3 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+gently-core = { path = "../gently-core" }
+gently-store = { path = "../gently-store" }
+reqwest.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = "3"
