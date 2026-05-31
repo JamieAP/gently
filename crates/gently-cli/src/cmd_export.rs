@@ -14,6 +14,7 @@ use gently_store::Store;
 pub fn run() -> Result<()> {
     let cfg = Config::load()?;
     cfg.ensure_state_dir()?;
+    init_log(&cfg);
 
     let lock_path = cfg.state_dir.join("export.lock");
     let lock = std::fs::OpenOptions::new()
@@ -33,20 +34,6 @@ pub fn run() -> Result<()> {
     }
 
     cfg.require_collector()?;
-    // Prefer QUIC (HTTP/3 via a detected h3-capable curl); fall back to the
-    // in-process HTTP/2 client when QUIC is unavailable or fails.
-    let http2 = Http2Transport::new(&cfg.collector_url, &cfg.token);
-    let quic = match QuicTransport::new(&cfg.collector_url, &cfg.token) {
-        Ok(q) => {
-            tracing::info!("QUIC (HTTP/3) transport built; preferring it over HTTP/2");
-            Some(q)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "QUIC client unavailable; using HTTP/2 only");
-            None
-        }
-    };
-    let transport = PreferQuic::new(quic, http2);
     let store = Store::open(&cfg.state_db())?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -54,7 +41,25 @@ pub fn run() -> Result<()> {
         .build()
         .context("building tokio runtime")?;
 
-    let result = runtime.block_on(drain(&store, &transport));
+    // The QUIC (HTTP/3) client must be built inside the tokio runtime - reqwest
+    // spawns the quinn endpoint driver on the current runtime, so constructing
+    // it outside fails with "no async runtime found". Build transports and drain
+    // within one block_on; prefer QUIC, fall back to HTTP/2 (logged).
+    let result = runtime.block_on(async {
+        let http2 = Http2Transport::new(&cfg.collector_url, &cfg.token);
+        let quic = match QuicTransport::new(&cfg.collector_url, &cfg.token) {
+            Ok(q) => {
+                tracing::info!("QUIC (HTTP/3) transport built; preferring it over HTTP/2");
+                Some(q)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "QUIC client unavailable; using HTTP/2 only");
+                None
+            }
+        };
+        let transport = PreferQuic::new(quic, http2);
+        drain(&store, &transport).await
+    });
     // Release before reporting; the lock also drops at end of scope.
     let _ = FileExt::unlock(&lock);
 
@@ -66,5 +71,20 @@ pub fn run() -> Result<()> {
         // A failed batch is expected when the collector is down; the outbox kept
         // the rows. Surface it for the CLI but it is not a crash condition.
         Err(e) => Err(e).context("export drain"),
+    }
+}
+
+/// Log to `<state_dir>/export.log` so the detached exporter's transport choices
+/// (QUIC vs HTTP/2 fallback) and drain results are observable after the fact.
+fn init_log(cfg: &Config) {
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(cfg.state_dir.join("export.log"))
+    {
+        let _ = tracing_subscriber::fmt()
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false)
+            .try_init();
     }
 }

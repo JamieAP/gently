@@ -12,7 +12,20 @@
 //! hot path never touches this module - no client build, no TLS, no QUIC code.
 
 use crate::{ExportError, Transport};
+use std::sync::Once;
 use std::time::Duration;
+
+/// reqwest's HTTP/3 path uses rustls' no-bundled-provider variant, so a
+/// process-default [`CryptoProvider`](rustls::crypto::CryptoProvider) must exist
+/// before the QUIC client is built. Install ring once; an `Err` means another
+/// provider is already installed, which is equally fine.
+static INSTALL_PROVIDER: Once = Once::new();
+
+fn ensure_crypto_provider() {
+    INSTALL_PROVIDER.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 /// In-process HTTP/3 transport to the collector's `/v1/traces`.
 pub struct QuicTransport {
@@ -25,12 +38,21 @@ impl QuicTransport {
     /// Build an HTTP/3-only client for `collector_url`. Returns an error if the
     /// client cannot be constructed; the caller then runs HTTP/2 only.
     pub fn new(collector_url: &str, token: impl Into<String>) -> Result<Self, ExportError> {
+        ensure_crypto_provider();
         let endpoint = format!("{}/v1/traces", collector_url.trim_end_matches('/'));
         let client = reqwest::Client::builder()
             .http3_prior_knowledge()
             .timeout(Duration::from_secs(15))
             .build()
-            .map_err(|e| ExportError::Transport(format!("building http3 client: {e}")))?;
+            .map_err(|e| {
+                let mut msg = format!("building http3 client: {e}");
+                let mut src = std::error::Error::source(&e);
+                while let Some(s) = src {
+                    msg.push_str(&format!(" | caused by: {s}"));
+                    src = s.source();
+                }
+                ExportError::Transport(msg)
+            })?;
         Ok(Self { endpoint, token: token.into(), client })
     }
 }
