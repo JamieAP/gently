@@ -1,0 +1,6 @@
+[package]
+name = "gently-store"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

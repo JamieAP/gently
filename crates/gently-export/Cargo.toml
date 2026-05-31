@@ -1,0 +1,6 @@
+[package]
+name = "gently-export"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

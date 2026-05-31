@@ -1,0 +1,10 @@
+[package]
+name = "gently-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "gently"
+path = "src/main.rs"
+
+[dependencies]
