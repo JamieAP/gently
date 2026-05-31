@@ -8,7 +8,7 @@
 use crate::config::Config;
 use anyhow::{Context, Result};
 use fs4::fs_std::FileExt;
-use gently_export::{drain, Http2Transport};
+use gently_export::{drain, Http2Transport, PreferQuic, QuicTransport};
 use gently_store::Store;
 
 pub fn run() -> Result<()> {
@@ -33,7 +33,14 @@ pub fn run() -> Result<()> {
     }
 
     cfg.require_collector()?;
-    let transport = Http2Transport::new(&cfg.collector_url, &cfg.token);
+    // Prefer QUIC (HTTP/3 via a detected h3-capable curl); fall back to the
+    // in-process HTTP/2 client when QUIC is unavailable or fails.
+    let http2 = Http2Transport::new(&cfg.collector_url, &cfg.token);
+    let quic = QuicTransport::detect(&cfg.collector_url, &cfg.token, &cfg.state_dir);
+    if quic.is_some() {
+        tracing::info!("QUIC (HTTP/3) transport available; preferring it over HTTP/2");
+    }
+    let transport = PreferQuic::new(quic, http2);
     let store = Store::open(&cfg.state_db())?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()

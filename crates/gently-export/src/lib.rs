@@ -8,8 +8,12 @@
 //! Failed sends increment attempt counters in this version.
 
 mod http2;
+mod prefer;
+mod quic;
 
 pub use http2::Http2Transport;
+pub use prefer::PreferQuic;
+pub use quic::QuicTransport;
 
 use gently_core::OtlpRequest;
 use gently_store::{Store, OUTBOX_CAP};

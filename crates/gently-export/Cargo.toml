@@ -10,7 +10,9 @@ reqwest.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# tokio only for spawn_blocking (curl subprocess); same feature set the CLI
+# already builds, so the artifact is reused - no extra tokio recompile.
+tokio = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
 tempfile = "3"
