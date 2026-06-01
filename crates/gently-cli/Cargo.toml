@@ -24,6 +24,7 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 dirs = "5"
 toml = "0.8"
+toml_edit = "0.22"
 
 [dev-dependencies]
 assert_cmd = "2"

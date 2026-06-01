@@ -50,6 +50,9 @@ enum Command {
         /// Install into Claude Code (`~/.claude`).
         #[arg(long, default_value_t = true)]
         claude: bool,
+        /// Install into Codex (`~/.codex/config.toml`).
+        #[arg(long, default_value_t = false)]
+        codex: bool,
     },
     /// List recent traces.
     Traces {
@@ -118,7 +121,13 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Export => cmd_export::run(),
         Command::Status => cmd_status::run(),
         Command::Mcp => cmd_mcp::run(),
-        Command::Init { claude: _ } => cmd_init::run_claude(),
+        Command::Init { claude: _, codex } => {
+            if codex {
+                cmd_init::run_codex()
+            } else {
+                cmd_init::run_claude()
+            }
+        }
         Command::Traces {
             limit,
             harness,
