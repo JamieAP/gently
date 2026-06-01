@@ -145,6 +145,10 @@ mod tests {
             }
             other => panic!("expected OpenTool, got {other:?}"),
         }
+        // raw tool_input content is digested, never placed verbatim in a span
+        let pre_attrs = format!("{:?}", parsed.ops);
+        assert!(pre_attrs.contains("gently.tool_input.sha256"));
+        assert!(!pre_attrs.contains("\"ls\""));
 
         let post = json!({"hook_event_name":"PostToolUse","session_id":"s",
             "cwd":"/w","tool_name":"shell_command","tool_use_id":"call_1",
@@ -237,6 +241,30 @@ mod tests {
         assert!(
             matches!(&parsed.ops[..], [SpanOp::Mark { name, .. }] if name == "PermissionRequest")
         );
+    }
+
+    #[test]
+    fn subagent_stop_closes_agent_when_id_present() {
+        let parsed = Codex
+            .parse(&json!({"hook_event_name":"SubagentStop","session_id":"s","agent_id":"ag1"}))
+            .unwrap();
+        match &parsed.ops[..] {
+            [SpanOp::CloseAgent {
+                agent_id, status, ..
+            }] => {
+                assert_eq!(agent_id, "ag1");
+                assert_eq!(*status, Status::Ok);
+            }
+            other => panic!("expected CloseAgent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subagent_stop_without_id_falls_back_to_mark() {
+        let parsed = Codex
+            .parse(&json!({"hook_event_name":"SubagentStop","session_id":"s"}))
+            .unwrap();
+        assert!(matches!(&parsed.ops[..], [SpanOp::Mark { name, .. }] if name == "SubagentStop"));
     }
 
     #[test]
