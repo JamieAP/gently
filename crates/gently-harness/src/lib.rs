@@ -9,10 +9,12 @@
 
 mod apply;
 mod claude;
+mod codex;
 mod hooks;
 
 pub use apply::apply;
 pub use claude::ClaudeCode;
+pub use codex::Codex;
 
 use gently_core::Status;
 
