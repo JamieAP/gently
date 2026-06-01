@@ -9,6 +9,7 @@
 
 mod apply;
 mod claude;
+mod hooks;
 
 pub use apply::apply;
 pub use claude::ClaudeCode;
@@ -39,6 +40,9 @@ pub trait Harness {
 pub struct Parsed {
     pub session_id: String,
     pub cwd: String,
+    /// The harness-reported transcript path, when the payload carries one
+    /// (Claude's `transcript_path`). `None` for harnesses/events that omit it.
+    pub transcript_path: Option<String>,
     pub ops: Vec<SpanOp>,
 }
 

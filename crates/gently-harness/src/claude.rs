@@ -6,9 +6,9 @@
 //! adapter is forward-compatible by construction. No raw prompt or tool content
 //! is ever placed in a span - only a digest and byte length.
 
-use crate::{Attrs, Harness, HarnessError, Parsed, SpanOp};
+use crate::hooks::{common_attrs, mark, push_digest, push_value_digest, str_field, u64_field};
+use crate::{Harness, HarnessError, Parsed, SpanOp};
 use gently_core::Status;
-use sha2::{Digest, Sha256};
 
 /// The Claude Code harness adapter.
 pub struct ClaudeCode;
@@ -25,6 +25,9 @@ impl Harness for ClaudeCode {
         let session_id =
             str_field(raw, "session_id").ok_or(HarnessError::MissingField("session_id"))?;
         let cwd = str_field(raw, "cwd").unwrap_or_default();
+        // Authoritative session file, handed to the hook on every event - kept
+        // verbatim so a consumer can read the transcript without slug-guessing.
+        let transcript_path = str_field(raw, "transcript_path");
 
         let ops = match event {
             "SessionStart" => vec![SpanOp::OpenSession {
@@ -87,6 +90,7 @@ impl Harness for ClaudeCode {
                     return Ok(Parsed {
                         session_id,
                         cwd,
+                        transcript_path,
                         ops: vec![mark(raw, event)],
                     });
                 };
@@ -101,6 +105,7 @@ impl Harness for ClaudeCode {
                     return Ok(Parsed {
                         session_id,
                         cwd,
+                        transcript_path,
                         ops: vec![mark(raw, event)],
                     });
                 };
@@ -116,49 +121,10 @@ impl Harness for ClaudeCode {
         Ok(Parsed {
             session_id,
             cwd,
+            transcript_path,
             ops,
         })
     }
-}
-
-fn mark(raw: &serde_json::Value, event: &str) -> SpanOp {
-    SpanOp::Mark {
-        name: event.to_string(),
-        attrs: common_attrs(raw, event),
-    }
-}
-
-fn common_attrs(raw: &serde_json::Value, event: &str) -> Attrs {
-    let mut attrs = vec![("gently.event".to_string(), event.to_string())];
-    if let Some(pm) = str_field(raw, "permission_mode") {
-        attrs.push(("gently.permission_mode".into(), pm));
-    }
-    if let Some(at) = str_field(raw, "agent_type") {
-        attrs.push(("gently.agent_type".into(), at));
-    }
-    attrs
-}
-
-fn str_field(raw: &serde_json::Value, key: &str) -> Option<String> {
-    raw.get(key).and_then(|v| v.as_str()).map(str::to_string)
-}
-
-fn u64_field(raw: &serde_json::Value, key: &str) -> Option<u64> {
-    raw.get(key).and_then(serde_json::Value::as_u64)
-}
-
-/// Append a `<key>.sha256` (first 16 hex chars) and `<key>.bytes` attribute for
-/// an arbitrary JSON value, never the value itself.
-fn push_value_digest(attrs: &mut Attrs, key: &str, value: &serde_json::Value) {
-    let bytes = serde_json::to_vec(value).unwrap_or_default();
-    push_digest(attrs, key, &bytes);
-}
-
-fn push_digest(attrs: &mut Attrs, key: &str, bytes: &[u8]) {
-    let digest = Sha256::digest(bytes);
-    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
-    attrs.push((format!("{key}.sha256"), hex));
-    attrs.push((format!("{key}.bytes"), bytes.len().to_string()));
 }
 
 #[cfg(test)]
