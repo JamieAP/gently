@@ -338,7 +338,7 @@ fn close(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ClaudeCode, Harness};
+    use crate::{ClaudeCode, Codex, Harness};
     use serde_json::json;
 
     fn store() -> (tempfile::TempDir, Store) {
@@ -514,6 +514,53 @@ mod tests {
         assert_eq!(stop[0].span_id, SpanId::derive("s", "turn:1"));
         assert_eq!(stop[0].start_unix_nano, 10);
         assert_eq!(stop[0].end_unix_nano, 500);
+        assert_eq!(stop[0].status, Status::Ok);
+    }
+
+    #[test]
+    fn codex_session_without_end_keeps_provisional_root_and_parents_turn() {
+        let (_d, s) = store();
+        let h = Codex;
+
+        // SessionStart -> provisional root (zero-width, Unset), id "session".
+        let start = apply(
+            &s,
+            &h.parse(&json!({"hook_event_name":"SessionStart","session_id":"cx"}))
+                .unwrap(),
+            100,
+        )
+        .unwrap();
+        assert_eq!(start.len(), 1);
+        assert_eq!(start[0].span_id, SpanId::derive("cx", "session"));
+        assert_eq!(start[0].parent_span_id, None);
+        assert_eq!(start[0].start_unix_nano, start[0].end_unix_nano); // provisional
+
+        // UserPromptSubmit -> turn parented to the session root.
+        let turn = apply(
+            &s,
+            &h.parse(&json!({"hook_event_name":"UserPromptSubmit","session_id":"cx"}))
+                .unwrap(),
+            200,
+        )
+        .unwrap();
+        assert_eq!(turn[0].name, "turn:1");
+        assert_eq!(
+            turn[0].parent_span_id,
+            Some(SpanId::derive("cx", "session")),
+            "turn parents to the provisional session root even though SessionEnd never fires"
+        );
+
+        // Stop -> turn finalized; session root is never re-emitted (no SessionEnd).
+        let stop = apply(
+            &s,
+            &h.parse(&json!({"hook_event_name":"Stop","session_id":"cx"}))
+                .unwrap(),
+            900,
+        )
+        .unwrap();
+        assert_eq!(stop[0].name, "turn:1");
+        assert_eq!(stop[0].start_unix_nano, 200);
+        assert_eq!(stop[0].end_unix_nano, 900);
         assert_eq!(stop[0].status, Status::Ok);
     }
 
