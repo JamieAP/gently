@@ -8,24 +8,25 @@
 //! log, but never surface a fault that could disrupt the harness.
 
 use crate::config::Config;
+use crate::HarnessKind;
 use gently_core::{OtlpRequest, Resource};
-use gently_harness::{apply, ClaudeCode, Harness};
+use gently_harness::{apply, ClaudeCode, Codex, Harness};
 use gently_store::Store;
 use std::io::{Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Run the hook. Never returns an error to the caller; never touches stdout.
-pub fn run() {
+pub fn run(harness: HarnessKind) {
     // Catch every panic so a bug in our span logic cannot ever break the
     // harness session. The result is logged and discarded; exit stays 0.
     let _ = std::panic::catch_unwind(|| {
-        if let Err(e) = process() {
+        if let Err(e) = process(harness) {
             tracing::error!(error = %e, "hook processing failed");
         }
     });
 }
 
-fn process() -> anyhow::Result<()> {
+fn process(harness: HarnessKind) -> anyhow::Result<()> {
     let cfg = Config::load()?;
     cfg.ensure_state_dir()?;
     crate::logging::init_file_log(&cfg.state_dir.join("hook.log"));
@@ -38,11 +39,15 @@ fn process() -> anyhow::Result<()> {
         capture_raw(&cfg, &value, &raw);
     }
 
-    let parsed = ClaudeCode.parse(&value)?;
+    let adapter: &dyn Harness = match harness {
+        HarnessKind::Claude => &ClaudeCode,
+        HarnessKind::Codex => &Codex,
+    };
+    let parsed = adapter.parse(&value)?;
     // `tmux_pane` is filled from `$TMUX_PANE` inside `Resource::new`; the
     // transcript path rides in from the payload so a pane→session query also
     // yields the exact session file.
-    let resource = Resource::new(&parsed.session_id, ClaudeCode.name(), &parsed.cwd)
+    let resource = Resource::new(&parsed.session_id, adapter.name(), &parsed.cwd)
         .with_transcript_path(parsed.transcript_path.as_deref().unwrap_or_default());
 
     let store = Store::open(&cfg.state_db())?;
@@ -59,9 +64,17 @@ fn process() -> anyhow::Result<()> {
         .get("hook_event_name")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let terminal = matches!(event, "Stop" | "StopFailure" | "SessionEnd");
-    maybe_spawn_export(&cfg, terminal);
+    maybe_spawn_export(&cfg, is_terminal_event(harness, event));
     Ok(())
+}
+
+/// Terminal events flush the exporter unconditionally so the last spans always
+/// ship. The set is harness-specific: Codex has no `SessionEnd`/`StopFailure`.
+fn is_terminal_event(harness: HarnessKind, event: &str) -> bool {
+    match harness {
+        HarnessKind::Claude => matches!(event, "Stop" | "StopFailure" | "SessionEnd"),
+        HarnessKind::Codex => event == "Stop",
+    }
 }
 
 fn now_nanos() -> u64 {

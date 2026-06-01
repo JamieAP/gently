@@ -11,9 +11,17 @@ mod config;
 mod logging;
 mod query_client;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use cmd_query::Format;
 use query_client::SpanFilters;
+
+/// Which coding harness produced the hook event. Selected explicitly because
+/// Claude Code and Codex stdin payloads are too similar to distinguish reliably.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum HarnessKind {
+    Claude,
+    Codex,
+}
 
 #[derive(Parser)]
 #[command(name = "gently", version, about = "OTel tracing for coding harnesses")]
@@ -26,7 +34,11 @@ struct Cli {
 enum Command {
     /// Harness hook entrypoint (reads the event JSON on stdin). Never writes
     /// stdout and always exits 0.
-    Hook,
+    Hook {
+        /// Which harness produced the event (selects the parser).
+        #[arg(long, value_enum, default_value_t = HarnessKind::Claude)]
+        harness: HarnessKind,
+    },
     /// Drain the local outbox to the collector.
     Export,
     /// Show local exporter health and queue depth.
@@ -89,8 +101,8 @@ fn main() {
 
     // The hook path is special: it must never return a non-zero exit nor print
     // to stdout, so it is dispatched first and swallows all errors internally.
-    if let Command::Hook = cli.command {
-        cmd_hook::run();
+    if let Command::Hook { harness } = cli.command {
+        cmd_hook::run(harness);
         return;
     }
 
@@ -102,7 +114,7 @@ fn main() {
 
 fn dispatch(command: Command) -> anyhow::Result<()> {
     match command {
-        Command::Hook => unreachable!("handled in main"),
+        Command::Hook { .. } => unreachable!("handled in main"),
         Command::Export => cmd_export::run(),
         Command::Status => cmd_status::run(),
         Command::Mcp => cmd_mcp::run(),
