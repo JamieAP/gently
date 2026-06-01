@@ -58,7 +58,11 @@ for s in spans:
     if not p: continue
     cs, ce = n(s["start_unix_nano"]), n(s.get("end_unix_nano")) or n(s["start_unix_nano"])
     ps, pe = n(p["start_unix_nano"]), n(p.get("end_unix_nano")) or n(p["start_unix_nano"])
-    if cs < ps - EPS or ce > pe + EPS:
+    # An unclosed/provisional parent (zero- or negative-width: end <= start, e.g.
+    # a Codex session root with no SessionEnd, or a crashed Claude session) has no
+    # meaningful upper bound - only check the lower bound against it.
+    unclosed = pe <= ps
+    if cs < ps - EPS or (not unclosed and ce > pe + EPS):
         violations.append((s["name"], p["name"]))
 root = [s for s in spans if s["name"] == "session" and not s.get("parent_span_id")]
 def ok(b): return "PASS ✓" if b else "FAIL ✗"
