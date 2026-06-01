@@ -39,7 +39,11 @@ fn process() -> anyhow::Result<()> {
     }
 
     let parsed = ClaudeCode.parse(&value)?;
-    let resource = Resource::new(&parsed.session_id, ClaudeCode.name(), &parsed.cwd);
+    // `tmux_pane` is filled from `$TMUX_PANE` inside `Resource::new`; the
+    // transcript path rides in from the payload so a pane→session query also
+    // yields the exact session file.
+    let resource = Resource::new(&parsed.session_id, ClaudeCode.name(), &parsed.cwd)
+        .with_transcript_path(parsed.transcript_path.as_deref().unwrap_or_default());
 
     let store = Store::open(&cfg.state_db())?;
     let spans = apply(&store, &parsed, now_nanos())?;

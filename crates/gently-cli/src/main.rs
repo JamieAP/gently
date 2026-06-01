@@ -74,6 +74,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Resolve the live session id running in a tmux pane (e.g. `%42`), via the
+    /// `gently.tmux_pane` the live session stamps on every event.
+    Whoami {
+        #[arg(long)]
+        pane: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() {
@@ -125,5 +133,6 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
             Format::from_json_flag(json),
         ),
         Command::Stats { json } => cmd_query::stats(Format::from_json_flag(json)),
+        Command::Whoami { pane, json } => cmd_query::whoami(pane, Format::from_json_flag(json)),
     }
 }

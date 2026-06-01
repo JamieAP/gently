@@ -83,8 +83,11 @@ impl Config {
             export_timeout_secs: file
                 .export_timeout_secs
                 .unwrap_or(DEFAULT_EXPORT_TIMEOUT_SECS),
-            query_timeout_secs: file
-                .query_timeout_secs
+            // Env-overridable so a latency-sensitive caller (e.g. a tmux launcher
+            // resolving a pane) can demand a tight fast-fail instead of the 30s
+            // default that suits interactive querying.
+            query_timeout_secs: env_u64("GENTLY_QUERY_TIMEOUT_SECS")
+                .or(file.query_timeout_secs)
                 .unwrap_or(DEFAULT_QUERY_TIMEOUT_SECS),
         })
     }
@@ -120,6 +123,11 @@ fn env_or(key: &str, fallback: String) -> String {
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or(fallback)
+}
+
+/// Read a `u64` from an env var, or `None` if unset/empty/unparseable.
+fn env_u64(key: &str) -> Option<u64> {
+    std::env::var(key).ok().and_then(|v| v.trim().parse().ok())
 }
 
 #[cfg(test)]

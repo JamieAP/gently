@@ -33,6 +33,36 @@ pub struct SpanRow {
     pub harness: Option<String>,
     pub tool_name: Option<String>,
     pub tool_use_id: Option<String>,
+    /// Raw OTLP resource attributes as a JSON array string, as the collector
+    /// stores them (carries `gently.tmux_pane`, `gently.transcript_path`,
+    /// `gently.cwd`, …). `None` if the collector omits it. Parse with
+    /// [`SpanRow::resource_attr`].
+    #[serde(default)]
+    pub resource_json: Option<String>,
+    /// Raw OTLP span attributes as a JSON array string (`gently.event`,
+    /// `gently.tool_name`, digests, …). `None` if omitted.
+    #[serde(default)]
+    pub attrs_json: Option<String>,
+}
+
+impl SpanRow {
+    /// Extract one resource attribute's string value from [`Self::resource_json`]
+    /// (the OTLP `[{key,value:{stringValue}}]` shape). Returns `None` when the
+    /// blob is absent, unparseable, or lacks the key.
+    pub fn resource_attr(&self, key: &str) -> Option<String> {
+        let blob = self.resource_json.as_deref()?;
+        let attrs: serde_json::Value = serde_json::from_str(blob).ok()?;
+        attrs.as_array()?.iter().find_map(|kv| {
+            (kv.get("key")?.as_str()? == key)
+                .then(|| {
+                    kv.get("value")?
+                        .get("stringValue")?
+                        .as_str()
+                        .map(String::from)
+                })
+                .flatten()
+        })
+    }
 }
 
 /// Per-tool rollup from `op=stats`.

@@ -125,6 +125,51 @@ fn status_label(code: i64) -> &'static str {
     }
 }
 
+/// Resolve the live session running in a tmux pane: the most recent span whose
+/// `gently.tmux_pane` resource attribute equals `pane`. Because the live session
+/// re-stamps this on every hook event, the newest match is authoritative and
+/// survives `--resume`/compaction (which strip the id from argv and stale a
+/// one-shot `@claude_sid`). Table form prints just the session id (nothing when
+/// unknown, so a shell caller can fall back); JSON adds transcript path, cwd and
+/// trace id so a consumer can read the transcript and pull the trace.
+pub fn whoami(pane: String, fmt: Format) -> Result<()> {
+    let cfg = Config::load()?;
+    let client = QueryClient::new(&cfg)?;
+    // A pane runs one harness at a time; a generous recent window is plenty to
+    // catch the newest span it emitted. Filtering is client-side because the
+    // pane lives in the resource-attr blob, not a collector-indexed column.
+    let rows = runtime()?.block_on(client.spans(&SpanFilters {
+        limit: Some(1000),
+        ..Default::default()
+    }))?;
+    let best = rows
+        .into_iter()
+        .filter(|r| r.resource_attr("gently.tmux_pane").as_deref() == Some(pane.as_str()))
+        .max_by_key(|r| r.start_unix_nano.parse::<u128>().unwrap_or(0));
+
+    match fmt {
+        Format::Json => {
+            let body = match &best {
+                Some(r) => serde_json::json!({
+                    "tmux_pane": pane,
+                    "session_id": r.session_id,
+                    "transcript_path": r.resource_attr("gently.transcript_path"),
+                    "cwd": r.resource_attr("gently.cwd"),
+                    "trace_id": r.trace_id,
+                }),
+                None => serde_json::json!({ "tmux_pane": pane, "session_id": null }),
+            };
+            println!("{}", serde_json::to_string_pretty(&body)?);
+        }
+        Format::Table => {
+            if let Some(sid) = best.and_then(|r| r.session_id) {
+                println!("{sid}");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Render the spans of one trace as an indented tree by walking parent links.
 fn print_tree(rows: &[SpanRow]) {
     // children keyed by parent span id; roots have no (or unknown) parent.

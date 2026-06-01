@@ -151,17 +151,27 @@ impl OtlpRequest {
 
 impl From<&Resource> for OtlpResource {
     fn from(r: &Resource) -> Self {
-        Self {
-            attributes: vec![
-                KeyValue::string("service.name", "gently"),
-                KeyValue::string("gently.harness", &r.harness),
-                KeyValue::string("gently.session_id", &r.session_id),
-                KeyValue::string("gently.cwd", &r.cwd),
-                KeyValue::string("host.name", &r.host),
-                KeyValue::string("os.type", &r.os),
-                KeyValue::string("gently.version", &r.version),
-            ],
+        let mut attributes = vec![
+            KeyValue::string("service.name", "gently"),
+            KeyValue::string("gently.harness", &r.harness),
+            KeyValue::string("gently.session_id", &r.session_id),
+            KeyValue::string("gently.cwd", &r.cwd),
+            KeyValue::string("host.name", &r.host),
+            KeyValue::string("os.type", &r.os),
+            KeyValue::string("gently.version", &r.version),
+        ];
+        // Optional context: only emitted when present so non-tmux / non-claude
+        // sessions don't carry empty keys. A pane→session query filters on these.
+        if !r.tmux_pane.is_empty() {
+            attributes.push(KeyValue::string("gently.tmux_pane", &r.tmux_pane));
         }
+        if !r.transcript_path.is_empty() {
+            attributes.push(KeyValue::string(
+                "gently.transcript_path",
+                &r.transcript_path,
+            ));
+        }
+        Self { attributes }
     }
 }
 
