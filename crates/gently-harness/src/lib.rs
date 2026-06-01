@@ -45,6 +45,11 @@ pub struct Parsed {
     /// The harness-reported transcript path, when the payload carries one
     /// (Claude's `transcript_path`). `None` for harnesses/events that omit it.
     pub transcript_path: Option<String>,
+    /// The harness-reported turn id, when the payload carries one (Codex's
+    /// `turn_id`). Drives turn-span identity in `apply` so out-of-order turn
+    /// lifecycle events resolve the correct turn. `None` for harnesses that
+    /// don't supply one (Claude), which fall back to the monotonic counter.
+    pub turn_id: Option<String>,
     pub ops: Vec<SpanOp>,
 }
 

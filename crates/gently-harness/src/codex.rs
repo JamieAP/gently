@@ -30,6 +30,7 @@ impl Harness for Codex {
             str_field(raw, "session_id").ok_or(HarnessError::MissingField("session_id"))?;
         let cwd = str_field(raw, "cwd").unwrap_or_default();
         let transcript_path = str_field(raw, "transcript_path");
+        let turn_id = str_field(raw, "turn_id");
 
         let ops = match event {
             "SessionStart" => vec![SpanOp::OpenSession {
@@ -84,6 +85,7 @@ impl Harness for Codex {
                         session_id,
                         cwd,
                         transcript_path,
+                        turn_id,
                         ops: vec![mark(raw, event)],
                     });
                 };
@@ -99,6 +101,7 @@ impl Harness for Codex {
                         session_id,
                         cwd,
                         transcript_path,
+                        turn_id,
                         ops: vec![mark(raw, event)],
                     });
                 };
@@ -115,6 +118,7 @@ impl Harness for Codex {
             session_id,
             cwd,
             transcript_path,
+            turn_id,
             ops,
         })
     }

@@ -53,8 +53,7 @@ pub fn apply(
                 )?);
             }
             SpanOp::OpenTurn { attrs } => {
-                let n = store.next_turn_index(session)?;
-                let key = turn_key(n);
+                let (key, name) = resolve_turn(store, session, parsed.turn_id.as_deref(), true)?;
                 let parent = SpanId::derive(session, "session");
                 // Provisional turn so an interrupted turn (no Stop) still appears;
                 // CloseTurn finalizes it via the same deterministic id.
@@ -64,20 +63,20 @@ pub fn apply(
                     trace_id,
                     &key,
                     Some(parent),
-                    &key,
+                    &name,
                     SpanKind::Internal,
                     now_nanos,
                     attrs,
                 )?);
             }
             SpanOp::CloseTurn { status, attrs } => {
-                let key = turn_key(store.current_turn(session)?);
+                let (key, name) = resolve_turn(store, session, parsed.turn_id.as_deref(), false)?;
                 emitted.push(close(
                     store,
                     session,
                     trace_id,
                     &key,
-                    &key,
+                    &name,
                     SpanKind::Internal,
                     now_nanos,
                     status,
@@ -91,7 +90,9 @@ pub fn apply(
                 attrs,
             } => {
                 let key = tool_key(tool_use_id.as_deref(), tool_name);
-                let parent = SpanId::derive(session, &turn_key(store.current_turn(session)?));
+                let (turn_lkey, _) =
+                    resolve_turn(store, session, parsed.turn_id.as_deref(), false)?;
+                let parent = SpanId::derive(session, &turn_lkey);
                 store.open_span(&open(
                     &key,
                     Some(parent),
@@ -131,7 +132,11 @@ pub fn apply(
                 let key = format!("agent:{agent_id}");
                 let parent = match parent_tool_use_id {
                     Some(tu) => SpanId::derive(session, &format!("tool:{tu}")),
-                    None => SpanId::derive(session, &turn_key(store.current_turn(session)?)),
+                    None => {
+                        let (turn_lkey, _) =
+                            resolve_turn(store, session, parsed.turn_id.as_deref(), false)?;
+                        SpanId::derive(session, &turn_lkey)
+                    }
                 };
                 // Provisional agent span so a subagent whose SubagentStop never
                 // fires (unreliable per #7881) still appears; CloseAgent finalizes.
@@ -167,7 +172,9 @@ pub fn apply(
                 )?);
             }
             SpanOp::Mark { name, attrs } => {
-                let parent = SpanId::derive(session, &turn_key(store.current_turn(session)?));
+                let (turn_lkey, _) =
+                    resolve_turn(store, session, parsed.turn_id.as_deref(), false)?;
+                let parent = SpanId::derive(session, &turn_lkey);
                 let key = format!("mark:{name}:{now_nanos}");
                 emitted.push(Span {
                     trace_id,
@@ -188,6 +195,34 @@ pub fn apply(
 
 fn turn_key(n: u64) -> String {
     format!("turn:{n}")
+}
+
+/// Resolve the (logical_key, display_name) of the turn an op belongs to. When
+/// the harness supplies a turn id (Codex), the turn span is keyed by that stable
+/// id and named by its per-session ordinal, so out-of-order `Stop`s and tool
+/// events resolve the correct turn. Otherwise (Claude) we fall back to the
+/// monotonic counter, where key and name coincide. `opening` only affects the
+/// counter path: a new turn advances the counter; other ops read the current.
+fn resolve_turn(
+    store: &Store,
+    session: &str,
+    turn_id: Option<&str>,
+    opening: bool,
+) -> Result<(String, String), gently_store::StoreError> {
+    match turn_id {
+        Some(tid) => {
+            let ordinal = store.turn_ordinal(session, tid)?;
+            Ok((format!("turn:{tid}"), format!("turn:{ordinal}")))
+        }
+        None => {
+            let n = if opening {
+                store.next_turn_index(session)?
+            } else {
+                store.current_turn(session)?
+            };
+            Ok((turn_key(n), turn_key(n)))
+        }
+    }
 }
 
 /// Merge `base` with `overrides`, keeping keys unique. An overriding key
@@ -515,6 +550,53 @@ mod tests {
         assert_eq!(stop[0].start_unix_nano, 10);
         assert_eq!(stop[0].end_unix_nano, 500);
         assert_eq!(stop[0].status, Status::Ok);
+    }
+
+    #[test]
+    fn codex_turns_keyed_by_turn_id_survive_out_of_order_stop() {
+        let (_d, s) = store();
+        let h = Codex;
+        // Two prompts → two turns, ids "a" then "b".
+        let a = apply(
+            &s,
+            &h.parse(
+                &json!({"hook_event_name":"UserPromptSubmit","session_id":"cx","turn_id":"a"}),
+            )
+            .unwrap(),
+            100,
+        )
+        .unwrap();
+        assert_eq!(a[0].name, "turn:1");
+        let b = apply(
+            &s,
+            &h.parse(
+                &json!({"hook_event_name":"UserPromptSubmit","session_id":"cx","turn_id":"b"}),
+            )
+            .unwrap(),
+            200,
+        )
+        .unwrap();
+        assert_eq!(b[0].name, "turn:2");
+
+        // A tool in turn "b" parents to turn "b" - NOT merely the latest counter.
+        apply(&s, &h.parse(&json!({"hook_event_name":"PreToolUse","session_id":"cx","turn_id":"b","tool_name":"Bash","tool_use_id":"t1","tool_input":{}})).unwrap(), 250).unwrap();
+        let tool = apply(&s, &h.parse(&json!({"hook_event_name":"PostToolUse","session_id":"cx","turn_id":"b","tool_name":"Bash","tool_use_id":"t1","tool_response":{}})).unwrap(), 300).unwrap();
+        assert_eq!(tool[0].parent_span_id, Some(SpanId::derive("cx", "turn:b")));
+
+        // A Stop carrying turn_id "a" closes turn "a" specifically - the bug was
+        // that it closed the latest turn ("b") via the counter.
+        let close_a = apply(
+            &s,
+            &h.parse(&json!({"hook_event_name":"Stop","session_id":"cx","turn_id":"a"}))
+                .unwrap(),
+            400,
+        )
+        .unwrap();
+        assert_eq!(close_a[0].span_id, SpanId::derive("cx", "turn:a"));
+        assert_eq!(close_a[0].name, "turn:1");
+        assert_eq!(close_a[0].start_unix_nano, 100);
+        assert_eq!(close_a[0].end_unix_nano, 400);
+        assert_eq!(close_a[0].status, Status::Ok);
     }
 
     #[test]

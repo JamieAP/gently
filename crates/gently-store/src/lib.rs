@@ -72,6 +72,12 @@ CREATE TABLE IF NOT EXISTS counters (
   turn_index INTEGER NOT NULL DEFAULT 0,
   current_turn INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS turn_ordinals (
+  session_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  PRIMARY KEY (session_id, turn_id)
+);
 CREATE TABLE IF NOT EXISTS quarantine (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   span_json TEXT NOT NULL,

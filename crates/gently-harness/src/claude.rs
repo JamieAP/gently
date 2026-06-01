@@ -91,6 +91,7 @@ impl Harness for ClaudeCode {
                         session_id,
                         cwd,
                         transcript_path,
+                        turn_id: None,
                         ops: vec![mark(raw, event)],
                     });
                 };
@@ -106,6 +107,7 @@ impl Harness for ClaudeCode {
                         session_id,
                         cwd,
                         transcript_path,
+                        turn_id: None,
                         ops: vec![mark(raw, event)],
                     });
                 };
@@ -122,6 +124,7 @@ impl Harness for ClaudeCode {
             session_id,
             cwd,
             transcript_path,
+            turn_id: None,
             ops,
         })
     }
