@@ -7,12 +7,24 @@ export interface Env {
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 1000;
+const START_ASC = "start_asc";
+const START_DESC = "start_desc";
 
 function clampLimit(raw: string | null, def = DEFAULT_LIMIT): number {
   if (!raw) return def;
   const n = parseInt(raw, 10);
   if (isNaN(n) || n < 1) return def;
   return Math.min(n, MAX_LIMIT);
+}
+
+function startOrder(raw: string | null | undefined, def = START_DESC): string {
+  return raw === START_ASC ? "ASC" : def === START_ASC ? "ASC" : "DESC";
+}
+
+function intFilter(raw: string | null | undefined): number | null {
+  if (raw === null || raw === undefined || raw === "") return null;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) ? n : null;
 }
 
 export async function insertSpans(env: Env, rows: Row[]): Promise<void> {
@@ -59,7 +71,14 @@ export interface TraceSummary {
 
 export async function traces(
   env: Env,
-  params: { limit?: string | null; since?: string | null; harness?: string | null },
+  params: {
+    limit?: string | null;
+    harness?: string | null;
+    session_id?: string | null;
+    since?: string | null;
+    until?: string | null;
+    order?: string | null;
+  },
 ): Promise<TraceSummary[]> {
   const limit = clampLimit(params.limit ?? null);
   const conditions: string[] = [];
@@ -73,8 +92,17 @@ export async function traces(
     conditions.push("harness = ?");
     bindings.push(params.harness);
   }
+  if (params.session_id) {
+    conditions.push("session_id = ?");
+    bindings.push(params.session_id);
+  }
+  if (params.until) {
+    conditions.push("start_unix_nano <= ?");
+    bindings.push(params.until);
+  }
 
   const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const direction = startOrder(params.order, START_DESC);
 
   const stmt = env.DB.prepare(
     `SELECT trace_id, session_id, harness,
@@ -84,7 +112,7 @@ export async function traces(
      FROM spans
      ${where}
      GROUP BY trace_id
-     ORDER BY start DESC
+     ORDER BY start ${direction}
      LIMIT ?`,
   ).bind(...bindings, limit);
 
@@ -123,10 +151,16 @@ export async function spans(
   env: Env,
   params: {
     trace_id?: string | null;
+    session_id?: string | null;
+    harness?: string | null;
     tool_name?: string | null;
+    name?: string | null;
     status?: string | null;
+    kind?: string | null;
     since?: string | null;
+    until?: string | null;
     limit?: string | null;
+    order?: string | null;
   },
 ): Promise<SpanRow[]> {
   const limit = clampLimit(params.limit ?? null);
@@ -137,23 +171,46 @@ export async function spans(
     conditions.push("trace_id = ?");
     bindings.push(params.trace_id);
   }
+  if (params.session_id) {
+    conditions.push("session_id = ?");
+    bindings.push(params.session_id);
+  }
+  if (params.harness) {
+    conditions.push("harness = ?");
+    bindings.push(params.harness);
+  }
   if (params.tool_name) {
     conditions.push("tool_name = ?");
     bindings.push(params.tool_name);
   }
-  if (params.status !== null && params.status !== undefined && params.status !== "") {
+  if (params.name) {
+    conditions.push("name = ?");
+    bindings.push(params.name);
+  }
+  const status = intFilter(params.status);
+  if (status !== null) {
     conditions.push("status = ?");
-    bindings.push(parseInt(params.status, 10));
+    bindings.push(status);
+  }
+  const kind = intFilter(params.kind);
+  if (kind !== null) {
+    conditions.push("kind = ?");
+    bindings.push(kind);
   }
   if (params.since) {
     conditions.push("start_unix_nano >= ?");
     bindings.push(params.since);
   }
+  if (params.until) {
+    conditions.push("start_unix_nano <= ?");
+    bindings.push(params.until);
+  }
 
   const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const direction = startOrder(params.order, START_DESC);
 
   const result = await env.DB.prepare(
-    `SELECT * FROM spans ${where} ORDER BY start_unix_nano DESC LIMIT ?`,
+    `SELECT * FROM spans ${where} ORDER BY start_unix_nano ${direction} LIMIT ?`,
   )
     .bind(...bindings, limit)
     .all<SpanRow>();

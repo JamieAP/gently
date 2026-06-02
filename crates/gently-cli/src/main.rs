@@ -14,7 +14,7 @@ mod query_client;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use cmd_query::Format;
-use query_client::SpanFilters;
+use query_client::{SpanFilters, TraceFilters};
 
 /// Which coding harness produced the hook event. Selected explicitly because
 /// Claude Code and Codex stdin payloads are too similar to distinguish reliably.
@@ -62,6 +62,14 @@ enum Command {
         #[arg(long)]
         harness: Option<String>,
         #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        until: Option<String>,
+        #[arg(long)]
+        order: Option<String>,
+        #[arg(long)]
         json: bool,
     },
     /// Show one trace as a span tree.
@@ -75,13 +83,25 @@ enum Command {
         #[arg(long)]
         trace_id: Option<String>,
         #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long)]
+        harness: Option<String>,
+        #[arg(long)]
         tool_name: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
         #[arg(long)]
         status: Option<String>,
         #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
         since: Option<String>,
         #[arg(long)]
+        until: Option<String>,
+        #[arg(long)]
         limit: Option<u32>,
+        #[arg(long)]
+        order: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -132,25 +152,51 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Traces {
             limit,
             harness,
+            session_id,
+            since,
+            until,
+            order,
             json,
-        } => cmd_query::traces(limit, harness, Format::from_json_flag(json)),
+        } => cmd_query::traces(
+            TraceFilters {
+                limit,
+                harness,
+                session_id,
+                since,
+                until,
+                order,
+            },
+            Format::from_json_flag(json),
+        ),
         Command::Trace { trace_id, json } => {
             cmd_query::trace(trace_id, Format::from_json_flag(json))
         }
         Command::Spans {
             trace_id,
+            session_id,
+            harness,
             tool_name,
+            name,
             status,
+            kind,
             since,
+            until,
             limit,
+            order,
             json,
         } => cmd_query::spans(
             SpanFilters {
                 trace_id,
+                session_id,
+                harness,
                 tool_name,
+                name,
                 status,
+                kind,
                 since,
+                until,
                 limit,
+                order,
             },
             Format::from_json_flag(json),
         ),

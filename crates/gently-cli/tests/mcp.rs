@@ -38,6 +38,7 @@ fn mcp_initialize_and_tools_list() {
         .map(|t| t["name"].as_str().unwrap())
         .collect();
     assert!(names.contains(&"list_traces"));
+    assert!(names.contains(&"sessions"));
     assert!(names.contains(&"get_trace"));
     assert!(names.contains(&"search_spans"));
     assert!(names.contains(&"trace_stats"));

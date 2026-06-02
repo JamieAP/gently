@@ -11,9 +11,9 @@ All require `Authorization: Bearer <GENTLY_TOKEN>` → 401 otherwise.
 | Method · path | Purpose |
 |---|---|
 | `POST /v1/traces` | OTLP/JSON ingest. Flattens spans, upserts into D1 (`INSERT OR REPLACE` on `span_id` → idempotent). Echoes the negotiated `httpProtocol`. |
-| `GET /v1/query?op=traces` | recent traces (aggregated per session): `trace_id`, `session_id`, `harness`, start, `span_count`, `error_count`. |
+| `GET /v1/query?op=traces` | traces/sessions aggregated by `trace_id`: `trace_id`, `session_id`, `harness`, start, `span_count`, `error_count`. Filters: `session_id`, `harness`, `since`, `until`, `limit`, `order`. |
 | `GET /v1/query?op=trace&trace_id=` | all spans for a trace, ordered by start. |
-| `GET /v1/query?op=spans&…` | filtered spans (`trace_id`, `tool_name`, `status`, `since`, `limit`). |
+| `GET /v1/query?op=spans&…` | filtered spans (`trace_id`, `session_id`, `harness`, `tool_name`, `name`, `status`, `kind`, `since`, `until`, `limit`, `order`). |
 | `GET /v1/query?op=stats` | per-tool counts, error counts, average duration. |
 | `GET /v1/whoami` | returns the negotiated protocol (e.g. `{"httpProtocol":"HTTP/3"}`) - used to confirm QUIC on the wire. |
 
@@ -34,7 +34,7 @@ CREATE TABLE spans (
   attrs_json TEXT, resource_json TEXT,
   ingested_unix_nano TEXT NOT NULL
 );
--- indexes on trace_id, session_id, start_unix_nano, tool_name
+-- indexes on trace_id/session_id/harness/tool_name/name/status/kind + start_unix_nano
 ```
 
 Trace-scoped attributes (`session_id`, `harness`) are lifted from the OTLP

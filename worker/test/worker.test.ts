@@ -1,5 +1,7 @@
 import { env, SELF } from "cloudflare:test";
 import { describe, it, expect, beforeAll } from "vitest";
+import worker from "../src/index";
+import type { Env } from "../src/d1";
 import schemaSql from "../schema.sql?raw";
 
 const BEARER = "Bearer test-token-secret";
@@ -46,8 +48,8 @@ function makeOtlpFixture() {
                 spanId: SPAN_ID_2,
                 name: "turn:1",
                 kind: 0,
-                startTimeUnixNano: "1700000000000000000",
-                endTimeUnixNano: "1700000002000000000",
+                startTimeUnixNano: "1700000003000000000",
+                endTimeUnixNano: "1700000004000000000",
                 attributes: [],
                 status: { code: 2 },
               },
@@ -93,8 +95,8 @@ describe("POST /v1/traces", () => {
     });
 
     expect(res.status).toBe(200);
-    const body = await res.json<{ partialSuccess: Record<string, unknown> }>();
-    expect(body).toEqual({ partialSuccess: {} });
+    const body = await res.json<{ partialSuccess: Record<string, unknown>; httpProtocol: string }>();
+    expect(body).toEqual({ partialSuccess: {}, httpProtocol: "unknown" });
 
     const countResult = await env.DB.prepare("SELECT COUNT(*) AS n FROM spans").first<{
       n: number;
@@ -126,6 +128,8 @@ describe("POST /v1/traces", () => {
     });
 
     expect(res.status).toBe(401);
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+    expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
   });
 
   it("rejects with 401 when bearer token is wrong", async () => {
@@ -137,6 +141,17 @@ describe("POST /v1/traces", () => {
       },
       body: JSON.stringify(makeOtlpFixture()),
     });
+
+    expect(res.status).toBe(401);
+  });
+
+  it("rejects even Bearer blank when Worker token secret is empty", async () => {
+    const res = await worker.fetch(
+      new Request("https://x/v1/query?op=traces", {
+        headers: { Authorization: "Bearer " },
+      }),
+      { DB: env.DB, GENTLY_TOKEN: "" } satisfies Env,
+    );
 
     expect(res.status).toBe(401);
   });
@@ -152,6 +167,8 @@ describe("GET /v1/query", () => {
     );
 
     expect(res.status).toBe(200);
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+    expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
     const rows = await res.json<Array<{ span_id: string; trace_id: string }>>();
     expect(rows.length).toBe(2);
     const spanIds = rows.map((r) => r.span_id);
@@ -181,6 +198,23 @@ describe("GET /v1/query", () => {
     expect(found?.error_count).toBe(1);
   });
 
+  it("op=traces filters by session_id and orders by start ascending", async () => {
+    const res = await SELF.fetch(
+      "https://x/v1/query?op=traces&session_id=sess-abc&order=start_asc",
+      {
+        headers: { Authorization: BEARER },
+      },
+    );
+
+    expect(res.status).toBe(200);
+    const rows = await res.json<Array<{ trace_id: string; session_id: string }>>();
+    expect(rows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ trace_id: TRACE_ID, session_id: "sess-abc" }),
+      ]),
+    );
+  });
+
   it("op=spans returns filtered spans by trace_id", async () => {
     const res = await SELF.fetch(
       `https://x/v1/query?op=spans&trace_id=${TRACE_ID}`,
@@ -192,6 +226,26 @@ describe("GET /v1/query", () => {
     expect(res.status).toBe(200);
     const rows = await res.json<Array<{ span_id: string }>>();
     expect(rows.length).toBe(2);
+  });
+
+  it("op=spans supports indexed filters and explicit order", async () => {
+    const res = await SELF.fetch(
+      `https://x/v1/query?op=spans&trace_id=${TRACE_ID}&session_id=sess-abc&harness=claude-code&order=start_asc`,
+      {
+        headers: { Authorization: BEARER },
+      },
+    );
+
+    expect(res.status).toBe(200);
+    const rows = await res.json<Array<{ span_id: string }>>();
+    expect(rows.map((r) => r.span_id)).toEqual([SPAN_ID_1, SPAN_ID_2]);
+
+    const statusRes = await SELF.fetch("https://x/v1/query?op=spans&status=2&kind=0&name=turn:1", {
+      headers: { Authorization: BEARER },
+    });
+    expect(statusRes.status).toBe(200);
+    const statusRows = await statusRes.json<Array<{ span_id: string }>>();
+    expect(statusRows.map((r) => r.span_id)).toEqual([SPAN_ID_2]);
   });
 
   it("op=stats returns per-tool stats", async () => {

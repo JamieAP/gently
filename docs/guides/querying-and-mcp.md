@@ -6,9 +6,9 @@ server are two front-ends onto it.
 ## From the CLI
 
 ```bash
-gently traces [--limit N] [--harness claude-code] [--json]
+gently traces [--limit N] [--harness claude-code] [--session-id ..] [--since <nanos>] [--until <nanos>] [--order start_desc|start_asc] [--json]
 gently trace <trace_id> [--json]          # span tree (indented) or raw spans
-gently spans [--trace-id ..] [--tool-name ..] [--status 0|1|2] [--since <nanos>] [--limit N] [--json]
+gently spans [--trace-id ..] [--session-id ..] [--harness ..] [--tool-name ..] [--name ..] [--status 0|1|2] [--kind ..] [--since <nanos>] [--until <nanos>] [--limit N] [--order start_desc|start_asc] [--json]
 gently stats [--json]                     # per-tool counts, errors, avg duration
 gently status                             # local exporter health + queue depth
 ```
@@ -38,9 +38,10 @@ can call to introspect its own runs. `gently init` registers it in
 
 | Tool | Args | Returns |
 |---|---|---|
-| `list_traces` | `limit?`, `harness?` | recent sessions, newest first |
+| `list_traces` | `limit?`, `harness?`, `session_id?`, `since?`, `until?`, `order?` | sessions/traces, newest first by default |
+| `sessions` | same as `list_traces` | alias for `list_traces` |
 | `get_trace` | `trace_id` | all spans for a trace (tree reconstruction) |
-| `search_spans` | `trace_id?`, `tool_name?`, `status?`, `since?`, `limit?` | filtered spans |
+| `search_spans` | `trace_id?`, `session_id?`, `harness?`, `tool_name?`, `name?`, `status?`, `kind?`, `since?`, `until?`, `limit?`, `order?` | filtered spans |
 | `trace_stats` | - | per-tool rollups |
 
 All tools are read-only. Because the MCP call is itself a tool use, it shows up as

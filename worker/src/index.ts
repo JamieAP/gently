@@ -7,6 +7,7 @@ export type { Env };
 // Constant-time-ish bearer token comparison: equal lengths + XOR accumulation.
 // Not cryptographically strict, but prevents trivial timing oracle via early exit.
 function tokenMatches(actual: string, expected: string): boolean {
+  if (expected.length === 0) return false;
   if (actual.length !== expected.length) return false;
   let diff = 0;
   for (let i = 0; i < actual.length; i++) {
@@ -18,25 +19,34 @@ function tokenMatches(actual: string, expected: string): boolean {
 function unauthorized(): Response {
   return new Response(JSON.stringify({ error: "Unauthorized" }), {
     status: 401,
-    headers: { "Content-Type": "application/json" },
+    headers: jsonHeaders(),
   });
 }
 
 function notFound(): Response {
   return new Response(JSON.stringify({ error: "Not found" }), {
     status: 404,
-    headers: { "Content-Type": "application/json" },
+    headers: jsonHeaders(),
   });
 }
 
 function jsonOk(data: unknown): Response {
   return new Response(JSON.stringify(data), {
     status: 200,
-    headers: { "Content-Type": "application/json" },
+    headers: jsonHeaders(),
   });
 }
 
+function jsonHeaders(): HeadersInit {
+  return {
+    "Content-Type": "application/json",
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+  };
+}
+
 function checkAuth(req: Request, env: Env): boolean {
+  if (!env.GENTLY_TOKEN) return false;
   const authHeader = req.headers.get("Authorization");
   if (!authHeader) return false;
   const prefix = "Bearer ";
@@ -76,8 +86,11 @@ export default {
         if (op === "traces") {
           const result = await traces(env, {
             limit: url.searchParams.get("limit"),
-            since: url.searchParams.get("since"),
             harness: url.searchParams.get("harness"),
+            session_id: url.searchParams.get("session_id"),
+            since: url.searchParams.get("since"),
+            until: url.searchParams.get("until"),
+            order: url.searchParams.get("order"),
           });
           return jsonOk(result);
         }
@@ -91,10 +104,16 @@ export default {
         if (op === "spans") {
           const result = await spans(env, {
             trace_id: url.searchParams.get("trace_id"),
+            session_id: url.searchParams.get("session_id"),
+            harness: url.searchParams.get("harness"),
             tool_name: url.searchParams.get("tool_name"),
+            name: url.searchParams.get("name"),
             status: url.searchParams.get("status"),
+            kind: url.searchParams.get("kind"),
             since: url.searchParams.get("since"),
+            until: url.searchParams.get("until"),
             limit: url.searchParams.get("limit"),
+            order: url.searchParams.get("order"),
           });
           return jsonOk(result);
         }
@@ -111,7 +130,7 @@ export default {
     } catch (_err) {
       return new Response(JSON.stringify({ error: "Internal server error" }), {
         status: 500,
-        headers: { "Content-Type": "application/json" },
+        headers: jsonHeaders(),
       });
     }
   },

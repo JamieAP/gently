@@ -26,6 +26,8 @@ success (relative), last error.
 Lists recent traces (one per session), newest first.
 
 * `--limit <N>` · `--harness <name>` · `--json`
+* Also accepts `--session-id <id>`, `--since <unix_nano>`,
+  `--until <unix_nano>`, and `--order <start_desc|start_asc>`.
 
 ## `gently trace <trace_id>`
 
@@ -38,6 +40,9 @@ Filtered span search.
 
 * `--trace-id <id>` · `--tool-name <name>` · `--status <0|1|2>` ·
   `--since <unix_nano>` · `--limit <N>` · `--json`
+* Also accepts `--session-id <id>`, `--harness <name>`, `--name <span_name>`,
+  `--kind <code>`, `--until <unix_nano>`, and
+  `--order <start_desc|start_asc>`.
 
 ## `gently stats`
 

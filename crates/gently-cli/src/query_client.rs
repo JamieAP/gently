@@ -79,10 +79,27 @@ pub struct ToolStat {
 #[derive(Clone, Debug, Default)]
 pub struct SpanFilters {
     pub trace_id: Option<String>,
+    pub session_id: Option<String>,
+    pub harness: Option<String>,
     pub tool_name: Option<String>,
+    pub name: Option<String>,
     pub status: Option<String>,
+    pub kind: Option<String>,
     pub since: Option<String>,
+    pub until: Option<String>,
     pub limit: Option<u32>,
+    pub order: Option<String>,
+}
+
+/// Filters for `op=traces`.
+#[derive(Clone, Debug, Default)]
+pub struct TraceFilters {
+    pub limit: Option<u32>,
+    pub harness: Option<String>,
+    pub session_id: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub order: Option<String>,
 }
 
 /// HTTP client for the collector query API.
@@ -132,17 +149,25 @@ impl QueryClient {
             .context("decoding collector response")
     }
 
-    pub async fn traces(
-        &self,
-        limit: Option<u32>,
-        harness: Option<&str>,
-    ) -> Result<Vec<TraceSummary>> {
+    pub async fn traces(&self, f: &TraceFilters) -> Result<Vec<TraceSummary>> {
         let mut p = vec![("op", "traces".to_string())];
-        if let Some(l) = limit {
+        if let Some(l) = f.limit {
             p.push(("limit", l.to_string()));
         }
-        if let Some(h) = harness {
-            p.push(("harness", h.to_string()));
+        if let Some(v) = &f.harness {
+            p.push(("harness", v.clone()));
+        }
+        if let Some(v) = &f.session_id {
+            p.push(("session_id", v.clone()));
+        }
+        if let Some(v) = &f.since {
+            p.push(("since", v.clone()));
+        }
+        if let Some(v) = &f.until {
+            p.push(("until", v.clone()));
+        }
+        if let Some(v) = &f.order {
+            p.push(("order", v.clone()));
         }
         self.get(&p).await
     }
@@ -160,17 +185,35 @@ impl QueryClient {
         if let Some(v) = &f.trace_id {
             p.push(("trace_id", v.clone()));
         }
+        if let Some(v) = &f.session_id {
+            p.push(("session_id", v.clone()));
+        }
+        if let Some(v) = &f.harness {
+            p.push(("harness", v.clone()));
+        }
         if let Some(v) = &f.tool_name {
             p.push(("tool_name", v.clone()));
+        }
+        if let Some(v) = &f.name {
+            p.push(("name", v.clone()));
         }
         if let Some(v) = &f.status {
             p.push(("status", v.clone()));
         }
+        if let Some(v) = &f.kind {
+            p.push(("kind", v.clone()));
+        }
         if let Some(v) = &f.since {
             p.push(("since", v.clone()));
         }
+        if let Some(v) = &f.until {
+            p.push(("until", v.clone()));
+        }
         if let Some(v) = f.limit {
             p.push(("limit", v.to_string()));
+        }
+        if let Some(v) = &f.order {
+            p.push(("order", v.clone()));
         }
         let mut rows: Vec<SpanRow> = self.get(&p).await?;
         self.resolve_local_raw_values(&mut rows)?;

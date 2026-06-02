@@ -1,7 +1,7 @@
 //! `gently traces|trace|spans|stats` - query the collector and render results.
 
 use crate::config::Config;
-use crate::query_client::{QueryClient, SpanFilters, SpanRow};
+use crate::query_client::{QueryClient, SpanFilters, SpanRow, TraceFilters};
 use anyhow::Result;
 use comfy_table::{Cell, Table};
 use std::collections::HashMap;
@@ -29,10 +29,10 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
         .build()?)
 }
 
-pub fn traces(limit: Option<u32>, harness: Option<String>, fmt: Format) -> Result<()> {
+pub fn traces(filters: TraceFilters, fmt: Format) -> Result<()> {
     let cfg = Config::load()?;
     let client = QueryClient::new(&cfg)?;
-    let rows = runtime()?.block_on(client.traces(limit, harness.as_deref()))?;
+    let rows = runtime()?.block_on(client.traces(&filters))?;
 
     if let Format::Json = fmt {
         println!("{}", serde_json::to_string_pretty(&rows)?);

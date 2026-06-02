@@ -7,7 +7,7 @@
 //! are read-only.
 
 use crate::config::Config;
-use crate::query_client::{QueryClient, SpanFilters};
+use crate::query_client::{QueryClient, SpanFilters, TraceFilters};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -82,10 +82,16 @@ fn call_tool(params: &Value, client: &QueryClient, rt: &tokio::runtime::Runtime)
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
     let payload: Value = match name {
-        "list_traces" => {
-            let limit = args.get("limit").and_then(Value::as_u64).map(|v| v as u32);
-            let harness = args.get("harness").and_then(Value::as_str);
-            serde_json::to_value(rt.block_on(client.traces(limit, harness))?)?
+        "list_traces" | "sessions" => {
+            let f = TraceFilters {
+                limit: args.get("limit").and_then(Value::as_u64).map(|v| v as u32),
+                harness: str_arg(&args, "harness"),
+                session_id: str_arg(&args, "session_id"),
+                since: str_arg(&args, "since"),
+                until: str_arg(&args, "until"),
+                order: str_arg(&args, "order"),
+            };
+            serde_json::to_value(rt.block_on(client.traces(&f))?)?
         }
         "get_trace" => {
             let trace_id = args
@@ -97,10 +103,16 @@ fn call_tool(params: &Value, client: &QueryClient, rt: &tokio::runtime::Runtime)
         "search_spans" => {
             let f = SpanFilters {
                 trace_id: str_arg(&args, "trace_id"),
+                session_id: str_arg(&args, "session_id"),
+                harness: str_arg(&args, "harness"),
                 tool_name: str_arg(&args, "tool_name"),
+                name: str_arg(&args, "name"),
                 status: str_arg(&args, "status"),
+                kind: str_arg(&args, "kind"),
                 since: str_arg(&args, "since"),
+                until: str_arg(&args, "until"),
                 limit: args.get("limit").and_then(Value::as_u64).map(|v| v as u32),
+                order: str_arg(&args, "order"),
             };
             serde_json::to_value(rt.block_on(client.spans(&f))?)?
         }
@@ -122,10 +134,26 @@ fn tool_specs() -> Value {
     json!([
         {
             "name": "list_traces",
-            "description": "List recent harness traces (one per session), newest first.",
+            "description": "List harness sessions/traces, newest first by default.",
             "inputSchema": {"type": "object", "properties": {
                 "limit": {"type": "integer", "description": "max traces"},
-                "harness": {"type": "string", "description": "filter by harness, e.g. claude-code"}
+                "harness": {"type": "string", "description": "filter by harness, e.g. claude-code"},
+                "session_id": {"type": "string", "description": "filter by exact session id"},
+                "since": {"type": "string", "description": "minimum start_unix_nano"},
+                "until": {"type": "string", "description": "maximum start_unix_nano"},
+                "order": {"type": "string", "enum": ["start_desc", "start_asc"], "description": "sort order"}
+            }}
+        },
+        {
+            "name": "sessions",
+            "description": "Alias for list_traces; returns harness sessions/traces.",
+            "inputSchema": {"type": "object", "properties": {
+                "limit": {"type": "integer", "description": "max sessions"},
+                "harness": {"type": "string", "description": "filter by harness, e.g. claude-code"},
+                "session_id": {"type": "string", "description": "filter by exact session id"},
+                "since": {"type": "string", "description": "minimum start_unix_nano"},
+                "until": {"type": "string", "description": "maximum start_unix_nano"},
+                "order": {"type": "string", "enum": ["start_desc", "start_asc"], "description": "sort order"}
             }}
         },
         {
@@ -137,13 +165,19 @@ fn tool_specs() -> Value {
         },
         {
             "name": "search_spans",
-            "description": "Search spans filtered by trace_id, tool_name, status, or since.",
+            "description": "Search spans by indexed columns; newest first by default.",
             "inputSchema": {"type": "object", "properties": {
                 "trace_id": {"type": "string"},
+                "session_id": {"type": "string"},
+                "harness": {"type": "string", "description": "filter by harness, e.g. codex"},
                 "tool_name": {"type": "string"},
+                "name": {"type": "string", "description": "span name"},
                 "status": {"type": "string", "description": "OTLP status code 0/1/2"},
+                "kind": {"type": "string", "description": "OTLP span kind code"},
                 "since": {"type": "string", "description": "start_unix_nano lower bound"},
-                "limit": {"type": "integer"}
+                "until": {"type": "string", "description": "start_unix_nano upper bound"},
+                "limit": {"type": "integer"},
+                "order": {"type": "string", "enum": ["start_desc", "start_asc"], "description": "sort order"}
             }}
         },
         {
