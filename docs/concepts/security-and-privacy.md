@@ -20,6 +20,12 @@ Debug mode: `GENTLY_DEBUG=1` writes **full raw payloads** to
 `~/.gently/raw/*.jsonl` for schema verification. It's off by default and local
 only.
 
+The hook also keeps selected raw prompt, tool input/response, and assistant
+message values in local SQLite keyed by their digest. These values are never
+placed in the export outbox or sent to the Worker. Set
+`GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES=1` on `gently trace`, `gently spans`, or
+`gently mcp` to enrich returned span attributes from that local table.
+
 ## Transport & authentication
 
 * **In transit:** TLS 1.3 over HTTP/3 (QUIC) or HTTP/2.

@@ -4,6 +4,7 @@
 //! the collector through one typed interface.
 
 use crate::config::Config;
+use crate::local_raw;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -89,11 +90,18 @@ pub struct QueryClient {
     base: String,
     token: String,
     client: reqwest::Client,
+    local_raw_store: Option<gently_store::Store>,
 }
 
 impl QueryClient {
     pub fn new(cfg: &Config) -> Result<Self> {
         cfg.require_collector()?;
+        let local_raw_store = if local_raw::resolve_enabled() {
+            cfg.ensure_state_dir()?;
+            Some(gently_store::Store::open(&cfg.state_db())?)
+        } else {
+            None
+        };
         Ok(Self {
             base: format!("{}/v1/query", cfg.collector_url.trim_end_matches('/')),
             token: cfg.token.clone(),
@@ -101,6 +109,7 @@ impl QueryClient {
                 .timeout(std::time::Duration::from_secs(cfg.query_timeout_secs))
                 .build()
                 .expect("reqwest client builds"),
+            local_raw_store,
         })
     }
 
@@ -139,8 +148,11 @@ impl QueryClient {
     }
 
     pub async fn trace(&self, trace_id: &str) -> Result<Vec<SpanRow>> {
-        self.get(&[("op", "trace".into()), ("trace_id", trace_id.to_string())])
-            .await
+        let mut rows: Vec<SpanRow> = self
+            .get(&[("op", "trace".into()), ("trace_id", trace_id.to_string())])
+            .await?;
+        self.resolve_local_raw_values(&mut rows)?;
+        Ok(rows)
     }
 
     pub async fn spans(&self, f: &SpanFilters) -> Result<Vec<SpanRow>> {
@@ -160,10 +172,19 @@ impl QueryClient {
         if let Some(v) = f.limit {
             p.push(("limit", v.to_string()));
         }
-        self.get(&p).await
+        let mut rows: Vec<SpanRow> = self.get(&p).await?;
+        self.resolve_local_raw_values(&mut rows)?;
+        Ok(rows)
     }
 
     pub async fn stats(&self) -> Result<Vec<ToolStat>> {
         self.get(&[("op", "stats".into())]).await
+    }
+
+    fn resolve_local_raw_values(&self, rows: &mut [SpanRow]) -> Result<()> {
+        if let Some(store) = &self.local_raw_store {
+            local_raw::resolve_rows(store, rows)?;
+        }
+        Ok(())
     }
 }

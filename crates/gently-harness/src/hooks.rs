@@ -26,6 +26,12 @@ pub(crate) fn common_attrs(raw: &serde_json::Value, event: &str) -> Attrs {
     if let Some(at) = str_field(raw, "agent_type") {
         attrs.push(("gently.agent_type".into(), at));
     }
+    push_first_str_digest(
+        &mut attrs,
+        "gently.assistant",
+        raw,
+        &["last_assistant_message", "assistant", "assistant_message"],
+    );
     attrs
 }
 
@@ -42,6 +48,21 @@ pub(crate) fn u64_field(raw: &serde_json::Value, key: &str) -> Option<u64> {
 pub(crate) fn push_value_digest(attrs: &mut Attrs, key: &str, value: &serde_json::Value) {
     let bytes = serde_json::to_vec(value).unwrap_or_default();
     push_digest(attrs, key, &bytes);
+}
+
+pub(crate) fn push_first_str_digest(
+    attrs: &mut Attrs,
+    key: &str,
+    raw: &serde_json::Value,
+    fields: &[&str],
+) -> bool {
+    for field in fields {
+        if let Some(value) = str_field(raw, field) {
+            push_digest(attrs, key, value.as_bytes());
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn push_digest(attrs: &mut Attrs, key: &str, bytes: &[u8]) {

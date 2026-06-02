@@ -38,6 +38,7 @@ For the essentials and the state location:
 | `GENTLY_TOKEN` | `token` |
 | `GENTLY_STATE_DIR` | the state directory (default `~/.gently`) |
 | `GENTLY_DEBUG` (any value) | also write raw hook payloads to `~/.gently/raw/` |
+| `GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES=1` | enrich CLI/MCP span JSON from local SHA-to-raw-value SQLite lookups |
 
 ## Where things live
 
@@ -46,7 +47,7 @@ For the essentials and the state location:
 | Path | Contents |
 |---|---|
 | `config.toml` | collector URL + token |
-| `state.db` | the SQLite outbox, open spans, turn counters, health, quarantine |
+| `state.db` | the SQLite outbox, open spans, turn counters, local SHA-to-raw values, health, quarantine |
 | `export.log` / `hook.log` | diagnostics (rotated at 5 MB) |
 | `export.lock` | exporter singleton lock |
 | `raw/*.jsonl` | raw hook payloads - only when `GENTLY_DEBUG` is set (any value) |

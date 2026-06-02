@@ -114,7 +114,12 @@ fn install_mcp(home: &Path, exe: &Path) -> Result<()> {
         .context("mcpServers is not an object")?;
     servers.insert(
         "gently".to_string(),
-        json!({"type": "stdio", "command": exe.to_string_lossy(), "args": ["mcp"]}),
+        json!({
+            "type": "stdio",
+            "command": exe.to_string_lossy(),
+            "args": ["mcp"],
+            "env": {"GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES": "1"}
+        }),
     );
     write_json(&path, &config)
 }
@@ -283,6 +288,9 @@ fn ensure_codex_mcp(doc: &mut DocumentMut, exe: &str) {
     let mut args = Array::new();
     args.push("mcp");
     server["args"] = value(args);
+    let mut env = Table::new();
+    env["GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES"] = value("1");
+    server.insert("env", Item::Table(env));
     servers.insert("gently", Item::Table(server));
 }
 
@@ -350,6 +358,8 @@ trust_level = "trusted"
         assert!(out.contains("gently hook --harness codex"));
         assert!(out.contains("[mcp_servers.gently]"));
         assert!(out.contains("args = [\"mcp\"]"));
+        assert!(out.contains("[mcp_servers.gently.env]"));
+        assert!(out.contains("GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES = \"1\""));
         assert_eq!(added, CODEX_MODELED_EVENTS.len());
 
         let _: toml::Value = toml::from_str(&out).unwrap();

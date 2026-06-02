@@ -15,6 +15,11 @@ gently status                             # local exporter health + queue depth
 
 `--json` on any query prints raw JSON for piping.
 
+By default, query JSON contains only the collector's digest attributes. Set
+`GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES=1` on the CLI or MCP server process to add
+matching local-only raw attributes such as `gently.tool_input`,
+`gently.tool_response`, `gently.prompt`, and `gently.assistant`.
+
 ### Waterfall
 
 `scripts/waterfall.py` reads `gently trace --json` and renders a depth-indented,

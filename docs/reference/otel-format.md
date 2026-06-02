@@ -36,8 +36,9 @@ resourceSpans[] → { resource{attributes[]}, scopeSpans[] → { scope, spans[] 
 ## Span attributes (`gently.*`)
 
 `event`, `tool_name`, `tool_use_id`, `permission_mode`, and digest pairs
-`…sha256` + `…bytes` for tool input/response and prompts. Keys are unique
-(close-event values win on merge). No raw content - see
+`…sha256` + `…bytes` for tool input/response, prompts, and assistant messages.
+Keys are unique (close-event values win on merge). No raw content is exported;
+local CLI/MCP results can opt into SHA-based local resolution - see
 [Security & privacy](../concepts/security-and-privacy.md).
 
 ## Deliberate deviations

@@ -6,7 +6,9 @@
 //! adapter is forward-compatible by construction. No raw prompt or tool content
 //! is ever placed in a span - only a digest and byte length.
 
-use crate::hooks::{common_attrs, mark, push_digest, push_value_digest, str_field, u64_field};
+use crate::hooks::{
+    common_attrs, mark, push_first_str_digest, push_value_digest, str_field, u64_field,
+};
 use crate::{Harness, HarnessError, Parsed, SpanOp};
 use gently_core::Status;
 
@@ -39,9 +41,12 @@ impl Harness for ClaudeCode {
             }],
             "UserPromptSubmit" => {
                 let mut attrs = common_attrs(raw, event);
-                if let Some(p) = str_field(raw, "prompt") {
-                    push_digest(&mut attrs, "gently.prompt", p.as_bytes());
-                }
+                push_first_str_digest(
+                    &mut attrs,
+                    "gently.prompt",
+                    raw,
+                    &["prompt", "user_prompt", "user"],
+                );
                 vec![SpanOp::OpenTurn { attrs }]
             }
             "Stop" => vec![SpanOp::CloseTurn {

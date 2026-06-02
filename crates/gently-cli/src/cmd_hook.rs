@@ -8,6 +8,7 @@
 //! log, but never surface a fault that could disrupt the harness.
 
 use crate::config::Config;
+use crate::local_raw;
 use crate::HarnessKind;
 use gently_core::{OtlpRequest, Resource};
 use gently_harness::{apply, ClaudeCode, Codex, Harness};
@@ -39,6 +40,11 @@ fn process(harness: HarnessKind) -> anyhow::Result<()> {
         capture_raw(&cfg, &value, &raw);
     }
 
+    let store = Store::open(&cfg.state_db())?;
+    if let Err(e) = local_raw::capture_hook_values(&store, &value) {
+        tracing::warn!(error = %e, "local raw value capture failed");
+    }
+
     let adapter: &dyn Harness = match harness {
         HarnessKind::Claude => &ClaudeCode,
         HarnessKind::Codex => &Codex,
@@ -50,7 +56,6 @@ fn process(harness: HarnessKind) -> anyhow::Result<()> {
     let resource = Resource::new(&parsed.session_id, adapter.name(), &parsed.cwd)
         .with_transcript_path(parsed.transcript_path.as_deref().unwrap_or_default());
 
-    let store = Store::open(&cfg.state_db())?;
     let spans = apply(&store, &parsed, now_nanos())?;
 
     for span in spans {

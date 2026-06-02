@@ -13,6 +13,7 @@
 mod health;
 mod open_spans;
 mod outbox;
+mod raw_values;
 
 pub use health::Health;
 pub use open_spans::OpenSpan;
@@ -83,6 +84,11 @@ CREATE TABLE IF NOT EXISTS quarantine (
   span_json TEXT NOT NULL,
   reason TEXT NOT NULL,
   quarantined_unix_nano INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS raw_values (
+  sha256 TEXT NOT NULL PRIMARY KEY,
+  value TEXT NOT NULL,
+  created_unix_nano INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS health (
   id INTEGER PRIMARY KEY CHECK (id = 1),

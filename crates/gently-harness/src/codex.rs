@@ -10,7 +10,7 @@
 //! the design spec). No raw prompt or tool content is placed in a span - only a
 //! digest and byte length.
 
-use crate::hooks::{common_attrs, mark, push_digest, push_value_digest, str_field};
+use crate::hooks::{common_attrs, mark, push_first_str_digest, push_value_digest, str_field};
 use crate::{Harness, HarnessError, Parsed, SpanOp};
 use gently_core::Status;
 
@@ -38,9 +38,12 @@ impl Harness for Codex {
             }],
             "UserPromptSubmit" => {
                 let mut attrs = common_attrs(raw, event);
-                if let Some(p) = str_field(raw, "prompt") {
-                    push_digest(&mut attrs, "gently.prompt", p.as_bytes());
-                }
+                push_first_str_digest(
+                    &mut attrs,
+                    "gently.prompt",
+                    raw,
+                    &["prompt", "user_prompt", "user"],
+                );
                 vec![SpanOp::OpenTurn { attrs }]
             }
             // Codex has no StopFailure hook; a turn always closes Ok. Aborts are
@@ -187,6 +190,23 @@ mod tests {
                 assert!(!joined.contains("secret content"));
             }
             other => panic!("expected OpenTurn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assistant_message_gets_digest_not_content() {
+        let parsed = Codex
+            .parse(&json!({"hook_event_name":"Stop","session_id":"s",
+                "last_assistant_message":"assistant secret here"}))
+            .unwrap();
+        match &parsed.ops[..] {
+            [SpanOp::CloseTurn { attrs, .. }] => {
+                let joined = format!("{attrs:?}");
+                assert!(joined.contains("gently.assistant.sha256"));
+                assert!(joined.contains("gently.assistant.bytes"));
+                assert!(!joined.contains("assistant secret"));
+            }
+            other => panic!("expected CloseTurn, got {other:?}"),
         }
     }
 

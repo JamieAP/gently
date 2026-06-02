@@ -8,6 +8,7 @@ mod cmd_mcp;
 mod cmd_query;
 mod cmd_status;
 mod config;
+mod local_raw;
 mod logging;
 mod query_client;
 
