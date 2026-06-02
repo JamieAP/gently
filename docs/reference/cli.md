@@ -27,7 +27,8 @@ Lists recent traces (one per session), newest first.
 
 * `--limit <N>` · `--harness <name>` · `--json`
 * Also accepts `--session-id <id>`, `--since <unix_nano>`,
-  `--until <unix_nano>`, and `--order <start_desc|start_asc>`.
+  `--until <unix_nano>`, and
+  `--order <start_desc|start_asc|last_activity>`.
 
 ## `gently trace <trace_id>`
 
@@ -51,7 +52,8 @@ Per-tool rollups: span count, error count, average duration. `--json` available.
 ## `gently mcp`
 
 Runs the stdio MCP server (see [Querying & MCP](../guides/querying-and-mcp.md)).
-Invoked by the harness, not by hand.
+Invoked by the harness, not by hand. MCP query tools accept an optional local
+`jq` filter and expose `response_fields` / `span_attr_keys` discovery tools.
 
 ## `gently init --claude`
 

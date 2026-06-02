@@ -10,6 +10,7 @@ mod cmd_status;
 mod config;
 mod local_raw;
 mod logging;
+mod mcp_jq;
 mod query_client;
 
 use clap::{Parser, Subcommand, ValueEnum};

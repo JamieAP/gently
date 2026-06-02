@@ -11,7 +11,7 @@ All require `Authorization: Bearer <GENTLY_TOKEN>` → 401 otherwise.
 | Method · path | Purpose |
 |---|---|
 | `POST /v1/traces` | OTLP/JSON ingest. Flattens spans, upserts into D1 (`INSERT OR REPLACE` on `span_id` → idempotent). Echoes the negotiated `httpProtocol`. |
-| `GET /v1/query?op=traces` | traces/sessions aggregated by `trace_id`: `trace_id`, `session_id`, `harness`, start, `span_count`, `error_count`. Filters: `session_id`, `harness`, `since`, `until`, `limit`, `order`. |
+| `GET /v1/query?op=traces` | traces/sessions aggregated by `trace_id`: `trace_id`, `session_id`, `harness`, `start`, `last_activity`, `span_count`, `error_count`. Filters: `session_id`, `harness`, `since`, `until`, `limit`, `order` (`start_desc`, `start_asc`, `last_activity`, `last_activity_desc`, `last_activity_asc`). |
 | `GET /v1/query?op=trace&trace_id=` | all spans for a trace, ordered by start. |
 | `GET /v1/query?op=spans&…` | filtered spans (`trace_id`, `session_id`, `harness`, `tool_name`, `name`, `status`, `kind`, `since`, `until`, `limit`, `order`). |
 | `GET /v1/query?op=stats` | per-tool counts, error counts, average duration. |

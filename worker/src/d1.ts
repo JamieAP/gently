@@ -9,6 +9,9 @@ const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 1000;
 const START_ASC = "start_asc";
 const START_DESC = "start_desc";
+const LAST_ACTIVITY = "last_activity";
+const LAST_ACTIVITY_ASC = "last_activity_asc";
+const LAST_ACTIVITY_DESC = "last_activity_desc";
 
 function clampLimit(raw: string | null, def = DEFAULT_LIMIT): number {
   if (!raw) return def;
@@ -19,6 +22,20 @@ function clampLimit(raw: string | null, def = DEFAULT_LIMIT): number {
 
 function startOrder(raw: string | null | undefined, def = START_DESC): string {
   return raw === START_ASC ? "ASC" : def === START_ASC ? "ASC" : "DESC";
+}
+
+function traceOrder(raw: string | null | undefined): { column: string; direction: string } {
+  switch (raw) {
+    case START_ASC:
+      return { column: "start", direction: "ASC" };
+    case LAST_ACTIVITY:
+    case LAST_ACTIVITY_DESC:
+      return { column: "last_activity", direction: "DESC" };
+    case LAST_ACTIVITY_ASC:
+      return { column: "last_activity", direction: "ASC" };
+    default:
+      return { column: "start", direction: "DESC" };
+  }
 }
 
 function intFilter(raw: string | null | undefined): number | null {
@@ -65,6 +82,7 @@ export interface TraceSummary {
   session_id: string | null;
   harness: string | null;
   start: string;
+  last_activity: string;
   span_count: number;
   error_count: number;
 }
@@ -102,17 +120,18 @@ export async function traces(
   }
 
   const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-  const direction = startOrder(params.order, START_DESC);
+  const order = traceOrder(params.order);
 
   const stmt = env.DB.prepare(
     `SELECT trace_id, session_id, harness,
             MIN(start_unix_nano) AS start,
+            MAX(COALESCE(end_unix_nano, start_unix_nano)) AS last_activity,
             COUNT(*) AS span_count,
             SUM(status = 2) AS error_count
      FROM spans
      ${where}
      GROUP BY trace_id
-     ORDER BY start ${direction}
+     ORDER BY ${order.column} ${order.direction}
      LIMIT ?`,
   ).bind(...bindings, limit);
 

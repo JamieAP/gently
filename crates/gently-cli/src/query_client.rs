@@ -15,6 +15,8 @@ pub struct TraceSummary {
     pub session_id: Option<String>,
     pub harness: Option<String>,
     pub start: Option<String>,
+    #[serde(default)]
+    pub last_activity: Option<String>,
     pub span_count: i64,
     pub error_count: Option<i64>,
 }

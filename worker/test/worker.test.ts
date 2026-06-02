@@ -11,6 +11,8 @@ const TRACE_ID = "aabbccddeeff00112233445566778899";
 const SPAN_ID_1 = "aabbccddeeff0011";
 const SPAN_ID_2 = "aabbccddeeff0022";
 const PARENT_SPAN_ID = "aabbccddeeff0000";
+const ACTIVE_TRACE_ID = "bbccddee00112233445566778899aabb";
+const ACTIVE_SPAN_ID = "bbccddee00112233";
 
 function makeOtlpFixture() {
   return {
@@ -52,6 +54,44 @@ function makeOtlpFixture() {
                 endTimeUnixNano: "1700000004000000000",
                 attributes: [],
                 status: { code: 2 },
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function makeSingleSpanTrace(
+  traceId: string,
+  spanId: string,
+  sessionId: string,
+  start: string,
+  end: string,
+) {
+  return {
+    resourceSpans: [
+      {
+        resource: {
+          attributes: [
+            { key: "service.name", value: { stringValue: "gently" } },
+            { key: "gently.session_id", value: { stringValue: sessionId } },
+            { key: "gently.harness", value: { stringValue: "codex" } },
+          ],
+        },
+        scopeSpans: [
+          {
+            spans: [
+              {
+                traceId,
+                spanId,
+                name: "turn:active",
+                kind: 1,
+                startTimeUnixNano: start,
+                endTimeUnixNano: end,
+                attributes: [],
+                status: { code: 1 },
               },
             ],
           },
@@ -213,6 +253,35 @@ describe("GET /v1/query", () => {
         expect.objectContaining({ trace_id: TRACE_ID, session_id: "sess-abc" }),
       ]),
     );
+  });
+
+  it("op=traces supports last_activity ordering", async () => {
+    await SELF.fetch("https://x/v1/traces", {
+      method: "POST",
+      headers: { Authorization: BEARER, "Content-Type": "application/json" },
+      body: JSON.stringify(
+        makeSingleSpanTrace(
+          ACTIVE_TRACE_ID,
+          ACTIVE_SPAN_ID,
+          "sess-active",
+          "1699999990000000000",
+          "1700000010000000000",
+        ),
+      ),
+    });
+
+    const res = await SELF.fetch("https://x/v1/query?op=traces&order=last_activity&limit=1", {
+      headers: { Authorization: BEARER },
+    });
+
+    expect(res.status).toBe(200);
+    const rows = await res.json<Array<{ trace_id: string; last_activity: string }>>();
+    expect(rows).toEqual([
+      expect.objectContaining({
+        trace_id: ACTIVE_TRACE_ID,
+        last_activity: "1700000010000000000",
+      }),
+    ]);
   });
 
   it("op=spans returns filtered spans by trace_id", async () => {

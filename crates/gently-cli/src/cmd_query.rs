@@ -39,12 +39,20 @@ pub fn traces(filters: TraceFilters, fmt: Format) -> Result<()> {
         return Ok(());
     }
     let mut table = Table::new();
-    table.set_header(vec!["trace_id", "session", "harness", "spans", "errors"]);
+    table.set_header(vec![
+        "trace_id",
+        "session",
+        "harness",
+        "last_activity",
+        "spans",
+        "errors",
+    ]);
     for r in &rows {
         table.add_row(vec![
             Cell::new(&r.trace_id),
             Cell::new(r.session_id.as_deref().unwrap_or("-")),
             Cell::new(r.harness.as_deref().unwrap_or("-")),
+            Cell::new(r.last_activity.as_deref().unwrap_or("-")),
             Cell::new(r.span_count),
             Cell::new(r.error_count.unwrap_or(0)),
         ]);
