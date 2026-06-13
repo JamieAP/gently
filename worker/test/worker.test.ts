@@ -216,6 +216,74 @@ describe("GET /v1/query", () => {
     expect(spanIds).toContain(SPAN_ID_2);
   });
 
+  it("op=trace derives effective_end from descendants for a provisional parent", async () => {
+    // A Codex-style session root that never closed (end == start), with a child
+    // tool that ran later. The stored root width is zero; the derived effective
+    // end must reach the child's end. nanos exceed 2^53 - assert as strings.
+    const EFF_TRACE = "ddeeff00112233445566778899aabbcc";
+    const ROOT = "ddeeff0011223300";
+    const CHILD = "ddeeff0011223311";
+    const ROOT_START = "1700000100000000000";
+    const CHILD_END = "1700000900000000000";
+    await SELF.fetch("https://x/v1/traces", {
+      method: "POST",
+      headers: { Authorization: BEARER, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        resourceSpans: [
+          {
+            resource: {
+              attributes: [
+                { key: "gently.session_id", value: { stringValue: "sess-eff" } },
+                { key: "gently.harness", value: { stringValue: "codex" } },
+              ],
+            },
+            scopeSpans: [
+              {
+                spans: [
+                  {
+                    traceId: EFF_TRACE,
+                    spanId: ROOT,
+                    name: "session",
+                    kind: 1,
+                    startTimeUnixNano: ROOT_START,
+                    endTimeUnixNano: ROOT_START, // provisional: never finalized
+                    status: { code: 0 },
+                  },
+                  {
+                    traceId: EFF_TRACE,
+                    spanId: CHILD,
+                    parentSpanId: ROOT,
+                    name: "Bash",
+                    kind: 3,
+                    startTimeUnixNano: "1700000200000000000",
+                    endTimeUnixNano: CHILD_END,
+                    attributes: [{ key: "gently.tool_name", value: { stringValue: "Bash" } }],
+                    status: { code: 1 },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    });
+
+    const res = await SELF.fetch(`https://x/v1/query?op=trace&trace_id=${EFF_TRACE}`, {
+      headers: { Authorization: BEARER },
+    });
+    expect(res.status).toBe(200);
+    const rows = await res.json<
+      Array<{ span_id: string; end_unix_nano: string | null; effective_end_unix_nano: string }>
+    >();
+    const root = rows.find((r) => r.span_id === ROOT)!;
+    const child = rows.find((r) => r.span_id === CHILD)!;
+    // Root's stored end is still provisional, but its derived end reaches the child.
+    expect(root.end_unix_nano).toBe(ROOT_START);
+    expect(root.effective_end_unix_nano).toBe(CHILD_END);
+    // A finalized leaf is unaffected: its effective end is its own end.
+    expect(child.effective_end_unix_nano).toBe(CHILD_END);
+  });
+
   it("op=traces returns aggregated trace with correct span_count", async () => {
     const res = await SELF.fetch("https://x/v1/query?op=traces", {
       headers: { Authorization: BEARER },

@@ -155,11 +155,38 @@ export interface SpanRow {
   attrs_json: string | null;
   resource_json: string | null;
   ingested_unix_nano: string;
+  // Derived (not stored): the greatest end across this span and all its
+  // transitive descendants - see `trace()`.
+  effective_end_unix_nano: string;
 }
 
+// This version derives a display end by recursively taking the maximum
+// observed endpoint over each span's whole subtree, including finalized spans.
+// The recorded observations do not establish complete capture or completion.
+// Kept as TEXT: nanosecond values must not round-trip through a JS number.
 export async function trace(env: Env, trace_id: string): Promise<SpanRow[]> {
   const result = await env.DB.prepare(
-    `SELECT * FROM spans WHERE trace_id = ? ORDER BY start_unix_nano ASC`,
+    `WITH RECURSIVE subtree(root_id, node_id, node_end) AS (
+       SELECT span_id, span_id,
+              CAST(COALESCE(end_unix_nano, start_unix_nano) AS INTEGER)
+       FROM spans WHERE trace_id = ?1
+       UNION ALL
+       SELECT st.root_id, s.span_id,
+              CAST(COALESCE(s.end_unix_nano, s.start_unix_nano) AS INTEGER)
+       FROM spans s JOIN subtree st ON s.parent_span_id = st.node_id
+       WHERE s.trace_id = ?1
+     ),
+     eff AS (
+       SELECT root_id, MAX(node_end) AS effective_end
+       FROM subtree GROUP BY root_id
+     )
+     SELECT s.*,
+            CAST(COALESCE(eff.effective_end,
+                          CAST(COALESCE(s.end_unix_nano, s.start_unix_nano) AS INTEGER))
+                 AS TEXT) AS effective_end_unix_nano
+     FROM spans s LEFT JOIN eff ON eff.root_id = s.span_id
+     WHERE s.trace_id = ?1
+     ORDER BY s.start_unix_nano ASC`,
   )
     .bind(trace_id)
     .all<SpanRow>();
