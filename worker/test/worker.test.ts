@@ -327,6 +327,43 @@ describe("GET /v1/query", () => {
     expect(parent.effective_end_unix_nano).toBe(P_END); // own end, not the child's earlier end
   });
 
+  it("op=trace derives a provisional non-root turn from its direct children", async () => {
+    // A finalized session root, a provisional (interrupted) turn under it, and a
+    // finalized tool under the turn. The turn must take its child's end.
+    const FT = "ff00112233445566778899aabbccddee";
+    const ROOT = "ff0011223344aa00";
+    const TURN = "ff0011223344aa11"; // provisional: end == start
+    const TOOL = "ff0011223344aa22";
+    const TURN_START = "1700002000000000000";
+    const TOOL_END = "1700002800000000000";
+    await SELF.fetch("https://x/v1/traces", {
+      method: "POST",
+      headers: { Authorization: BEARER, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        resourceSpans: [
+          {
+            resource: { attributes: [{ key: "gently.harness", value: { stringValue: "codex" } }] },
+            scopeSpans: [
+              {
+                spans: [
+                  { traceId: FT, spanId: ROOT, name: "session", kind: 1, startTimeUnixNano: "1700002000000000000", endTimeUnixNano: "1700003000000000000", status: { code: 1 } },
+                  { traceId: FT, spanId: TURN, parentSpanId: ROOT, name: "turn:1", kind: 1, startTimeUnixNano: TURN_START, endTimeUnixNano: TURN_START, status: { code: 0 } },
+                  { traceId: FT, spanId: TOOL, parentSpanId: TURN, name: "Bash", kind: 3, startTimeUnixNano: "1700002100000000000", endTimeUnixNano: TOOL_END, status: { code: 1 } },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    });
+    const res = await SELF.fetch(`https://x/v1/query?op=trace&trace_id=${FT}`, {
+      headers: { Authorization: BEARER },
+    });
+    const rows = await res.json<Array<{ span_id: string; effective_end_unix_nano: string }>>();
+    const turn = rows.find((r) => r.span_id === TURN)!;
+    expect(turn.effective_end_unix_nano).toBe(TOOL_END); // reaches its tool child, not stuck at start
+  });
+
   it("op=traces returns aggregated trace with correct span_count", async () => {
     const res = await SELF.fetch("https://x/v1/query?op=traces", {
       headers: { Authorization: BEARER },

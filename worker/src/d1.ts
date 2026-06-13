@@ -160,34 +160,28 @@ export interface SpanRow {
   effective_end_unix_nano: string;
 }
 
-// This version derives a display end by recursively taking the maximum
-// observed endpoint over subtrees rooted at provisional spans (a null end or
-// end equal to start). Finalized spans retain their own stored endpoint.
-// The observations do not establish complete capture or completion. TEXT
-// avoids JS integer rounding; overlapping provisional subtrees can repeat work.
 export async function trace(env: Env, trace_id: string): Promise<SpanRow[]> {
   const result = await env.DB.prepare(
-    `WITH RECURSIVE subtree(root_id, node_id) AS (
-       SELECT span_id, span_id
-       FROM spans
-       WHERE trace_id = ?1
-         AND (end_unix_nano IS NULL OR end_unix_nano = start_unix_nano)
-       UNION ALL
-       SELECT st.root_id, s.span_id
-       FROM spans s JOIN subtree st ON s.parent_span_id = st.node_id
-       WHERE s.trace_id = ?1
+    `WITH agg AS (
+       SELECT MAX(CAST(COALESCE(end_unix_nano, start_unix_nano) AS INTEGER)) AS trace_max
+       FROM spans WHERE trace_id = ?1
      ),
-     eff AS (
-       SELECT st.root_id,
-              MAX(CAST(COALESCE(s.end_unix_nano, s.start_unix_nano) AS INTEGER)) AS effective_end
-       FROM subtree st JOIN spans s ON s.span_id = st.node_id
-       GROUP BY st.root_id
+     child_max AS (
+       SELECT parent_span_id AS pid,
+              MAX(CAST(COALESCE(end_unix_nano, start_unix_nano) AS INTEGER)) AS m
+       FROM spans
+       WHERE trace_id = ?1 AND parent_span_id IS NOT NULL
+       GROUP BY parent_span_id
      )
      SELECT s.*,
-            CAST(COALESCE(eff.effective_end,
-                          CAST(COALESCE(s.end_unix_nano, s.start_unix_nano) AS INTEGER))
-                 AS TEXT) AS effective_end_unix_nano
-     FROM spans s LEFT JOIN eff ON eff.root_id = s.span_id
+            CAST(CASE
+              WHEN s.end_unix_nano IS NOT NULL AND s.end_unix_nano <> s.start_unix_nano
+                THEN CAST(s.end_unix_nano AS INTEGER)
+              WHEN s.parent_span_id IS NULL
+                THEN agg.trace_max
+              ELSE COALESCE(cm.m, CAST(s.start_unix_nano AS INTEGER))
+            END AS TEXT) AS effective_end_unix_nano
+     FROM spans s CROSS JOIN agg LEFT JOIN child_max cm ON cm.pid = s.span_id
      WHERE s.trace_id = ?1
      ORDER BY s.start_unix_nano ASC`,
   )
