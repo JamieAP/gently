@@ -217,10 +217,15 @@ export async function trace(env: Env, trace_id: string): Promise<SpanRow[]> {
                        COALESCE(cb.cmin, CAST(s.start_unix_nano AS INTEGER)))
             END AS TEXT) AS effective_start_unix_nano,
             CAST(CASE
-              WHEN s.end_unix_nano IS NOT NULL AND s.end_unix_nano <> s.start_unix_nano
-                THEN CAST(s.end_unix_nano AS INTEGER)
+              -- Parentless display bounds use the whole recorded trace, even
+              -- when the stored endpoint is non-provisional. A resumed root's
+              -- latest SessionStart can extend that stored endpoint without a
+              -- closing hook. The aggregate is an observation, not proof of
+              -- actual completion; this case precedes the finalized check.
               WHEN s.parent_span_id IS NULL
                 THEN agg.trace_max
+              WHEN s.end_unix_nano IS NOT NULL AND s.end_unix_nano <> s.start_unix_nano
+                THEN CAST(s.end_unix_nano AS INTEGER)
               ELSE COALESCE(cb.cmax, CAST(s.start_unix_nano AS INTEGER))
             END AS TEXT) AS effective_end_unix_nano
      FROM spans s CROSS JOIN agg LEFT JOIN child_bounds cb ON cb.pid = s.span_id

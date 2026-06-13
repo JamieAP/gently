@@ -475,6 +475,43 @@ describe("GET /v1/query", () => {
     expect(root.effective_start_unix_nano).toBe(TOOL_START); // session root = trace min
   });
 
+  it("a resumed session root (end != start) still spans the whole trace", async () => {
+    // Monotonic ingest sets a resumed root's end to the latest SessionStart, so
+    // end != start even though it never truly closed. effective_end must still be
+    // the trace max (a child ending later), not the stale stored end.
+    const FT = "aa00112233445566778899aabbccddff";
+    const ROOT = "aa001122334455a0";
+    const TOOL = "aa001122334455a1";
+    const ROOT_START = "1700005000000000000";
+    const ROOT_STORED_END = "1700005100000000000"; // last SessionStart (looks "finalized")
+    const TOOL_END = "1700005900000000000"; // a child ran well past the root's stored end
+    await SELF.fetch("https://x/v1/traces", {
+      method: "POST",
+      headers: { Authorization: BEARER, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        resourceSpans: [
+          {
+            resource: { attributes: [{ key: "gently.harness", value: { stringValue: "codex" } }] },
+            scopeSpans: [
+              {
+                spans: [
+                  { traceId: FT, spanId: ROOT, name: "session", kind: 1, startTimeUnixNano: ROOT_START, endTimeUnixNano: ROOT_STORED_END, status: { code: 0 } },
+                  { traceId: FT, spanId: TOOL, parentSpanId: ROOT, name: "Bash", kind: 3, startTimeUnixNano: "1700005200000000000", endTimeUnixNano: TOOL_END, status: { code: 1 } },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    });
+    const res = await SELF.fetch(`https://x/v1/query?op=trace&trace_id=${FT}`, {
+      headers: { Authorization: BEARER },
+    });
+    const rows = await res.json<Array<{ span_id: string; effective_end_unix_nano: string }>>();
+    const root = rows.find((r) => r.span_id === ROOT)!;
+    expect(root.effective_end_unix_nano).toBe(TOOL_END); // trace max, not the stale stored end
+  });
+
   it("op=traces returns aggregated trace with correct span_count", async () => {
     const res = await SELF.fetch("https://x/v1/query?op=traces", {
       headers: { Authorization: BEARER },
