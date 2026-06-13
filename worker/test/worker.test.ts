@@ -197,6 +197,77 @@ describe("POST /v1/traces", () => {
   });
 });
 
+describe("idempotent-monotonic ingest", () => {
+  function spanPayload(
+    spanId: string,
+    traceId: string,
+    start: string,
+    end: string,
+    statusCode: number,
+    event: string,
+    parentSpanId?: string,
+  ) {
+    return {
+      resourceSpans: [
+        {
+          resource: { attributes: [{ key: "gently.harness", value: { stringValue: "codex" } }] },
+          scopeSpans: [
+            {
+              spans: [
+                {
+                  traceId, spanId, parentSpanId,
+                  name: "turn:1", kind: 1,
+                  startTimeUnixNano: start, endTimeUnixNano: end,
+                  attributes: [{ key: "gently.event", value: { stringValue: event } }],
+                  status: { code: statusCode },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+  }
+  const post = (body: unknown) =>
+    SELF.fetch("https://x/v1/traces", {
+      method: "POST",
+      headers: { Authorization: BEARER, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  const readSpan = (id: string) =>
+    env.DB.prepare(
+      "SELECT start_unix_nano, end_unix_nano, status, attrs_json FROM spans WHERE span_id = ?",
+    )
+      .bind(id)
+      .first<{ start_unix_nano: string; end_unix_nano: string; status: number; attrs_json: string }>();
+
+  it("a later-delivered provisional report cannot revert a finalized span", async () => {
+    const S = "1111111111111111";
+    const T = "11111111111111111111111111111111";
+    // finalized first ...
+    await post(spanPayload(S, T, "1700000000000000000", "1700000005000000000", 1, "PostToolUse"));
+    // ... then a stale/retried provisional (end == start, unset status) arrives LATE
+    await post(spanPayload(S, T, "1700000000000000000", "1700000000000000000", 0, "PreToolUse"));
+    const row = await readSpan(S);
+    expect(row?.end_unix_nano).toBe("1700000005000000000"); // latest end kept, not reverted
+    expect(row?.status).toBe(1); // content from the finalized (latest-ending) report
+    expect(row?.attrs_json).toContain("PostToolUse");
+    expect(row?.attrs_json).not.toContain("PreToolUse");
+  });
+
+  it("a resume re-emit keeps the earliest start (session origin) and latest end", async () => {
+    const S = "2222222222222222";
+    const T = "22222222222222222222222222222222";
+    // original open at the session origin ...
+    await post(spanPayload(S, T, "1700000100000000000", "1700000100000000000", 0, "SessionStart"));
+    // ... then a resume re-emits the SAME root much later (the bug: start shoved forward)
+    await post(spanPayload(S, T, "1700009999000000000", "1700009999000000000", 0, "SessionStart"));
+    const row = await readSpan(S);
+    expect(row?.start_unix_nano).toBe("1700000100000000000"); // earliest origin preserved
+    expect(row?.end_unix_nano).toBe("1700009999000000000"); // latest activity
+  });
+});
+
 describe("GET /v1/query", () => {
   it("op=trace returns spans for a trace ordered by start", async () => {
     const res = await SELF.fetch(

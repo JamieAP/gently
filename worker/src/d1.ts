@@ -47,14 +47,48 @@ function intFilter(raw: string | null | undefined): number | null {
 export async function insertSpans(env: Env, rows: Row[]): Promise<void> {
   if (rows.length === 0) return;
 
+  // Idempotent-monotonic upsert. The hook layer is a distributed, retrying,
+  // multi-process emitter with no delivery-order guarantee: the same span_id is
+  // reported provisionally on open, again on close, and (for the session root)
+  // again on every resume. `INSERT OR REPLACE` let the last-delivered report win
+  // - so a retried provisional could revert a finalized span, and a resume could
+  // shove the session root's start forward past its own history. Instead a
+  // span's stored extent is the ENVELOPE of all its reports (earliest start,
+  // latest end), and its content comes from the most-finalized report (the one
+  // that ends latest; ties favour the newcomer). Bounds converge across replays,
+  // but conflicting metadata at equal end times depends on arrival order. Nanos
+  // are CAST to INTEGER (< 2^63) for comparison; stored values stay as received TEXT.
+  const newer =
+    "CAST(COALESCE(excluded.end_unix_nano, excluded.start_unix_nano) AS INTEGER) >= " +
+    "CAST(COALESCE(end_unix_nano, start_unix_nano) AS INTEGER)";
+  const pick = (col: string) => `${col} = CASE WHEN ${newer} THEN excluded.${col} ELSE ${col} END`;
   const stmts = rows.map((r) =>
     env.DB.prepare(
-      `INSERT OR REPLACE INTO spans
+      `INSERT INTO spans
         (span_id, trace_id, parent_span_id, name, kind,
          start_unix_nano, end_unix_nano, status,
          session_id, harness, tool_name, tool_use_id,
          attrs_json, resource_json, ingested_unix_nano)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(span_id) DO UPDATE SET
+         start_unix_nano = CASE
+           WHEN CAST(excluded.start_unix_nano AS INTEGER) < CAST(start_unix_nano AS INTEGER)
+           THEN excluded.start_unix_nano ELSE start_unix_nano END,
+         end_unix_nano = CASE
+           WHEN CAST(COALESCE(excluded.end_unix_nano, excluded.start_unix_nano) AS INTEGER)
+              > CAST(COALESCE(end_unix_nano, start_unix_nano) AS INTEGER)
+           THEN excluded.end_unix_nano ELSE end_unix_nano END,
+         ${pick("status")},
+         ${pick("name")},
+         ${pick("kind")},
+         ${pick("parent_span_id")},
+         ${pick("session_id")},
+         ${pick("harness")},
+         ${pick("tool_name")},
+         ${pick("tool_use_id")},
+         ${pick("attrs_json")},
+         ${pick("resource_json")},
+         ${pick("ingested_unix_nano")}`,
     ).bind(
       r.span_id,
       r.trace_id,
