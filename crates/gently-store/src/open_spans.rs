@@ -68,6 +68,23 @@ impl Store {
         Ok(row)
     }
 
+    /// Drop provisional open spans whose start is older than `cutoff_unix_nano`,
+    /// returning how many were removed. A span's closing event may never arrive.
+    /// Codex emits no `SessionEnd`, and fires no `Stop` for a turn interrupted
+    /// with Esc (openai/codex#22858), so session and turn rows would otherwise
+    /// accumulate without bound. Provisional spans are queued for export on
+    /// open; delivery is not assured. This only bounds local bookkeeping growth
+    /// without inventing an end. A later close may no longer recover the original
+    /// start. Sessions interleave on one host, so a later event is no signal that
+    /// an earlier span has closed.
+    pub fn reap_open_spans(&self, cutoff_unix_nano: u64) -> Result<usize> {
+        let n = self.conn.execute(
+            "DELETE FROM open_spans WHERE start_unix_nano < ?1",
+            rusqlite::params![cutoff_unix_nano as i64],
+        )?;
+        Ok(n)
+    }
+
     /// Increment and return the next turn index for a session, and mark it as
     /// the current turn (used to parent tool spans). Starts at 1.
     pub fn next_turn_index(&self, session_id: &str) -> Result<u64> {
@@ -160,6 +177,31 @@ mod tests {
         s.open_span(&span).unwrap();
         assert_eq!(s.take_open("s", "tool:tu_1").unwrap().as_ref(), Some(&span));
         assert_eq!(s.take_open("s", "tool:tu_1").unwrap(), None);
+    }
+
+    #[test]
+    fn reap_open_spans_drops_only_rows_older_than_cutoff() {
+        let (_d, s) = store();
+        let mk = |key: &str, start: u64| super::OpenSpan {
+            session_id: "s".into(),
+            logical_key: key.into(),
+            span_id: key.into(),
+            parent_span_id: None,
+            name: key.into(),
+            kind: 1,
+            start_unix_nano: start,
+            attrs_json: "[]".into(),
+        };
+        s.open_span(&mk("old", 100)).unwrap();
+        s.open_span(&mk("fresh", 1_000)).unwrap();
+
+        // Cutoff between the two: only the stale row is reaped.
+        assert_eq!(s.reap_open_spans(500).unwrap(), 1);
+        assert_eq!(s.take_open("s", "old").unwrap(), None, "stale row gone");
+        assert!(s.take_open("s", "fresh").unwrap().is_some(), "fresh kept");
+        // Idempotent: nothing left older than cutoff.
+        s.open_span(&mk("fresh", 1_000)).unwrap();
+        assert_eq!(s.reap_open_spans(500).unwrap(), 0);
     }
 
     #[test]

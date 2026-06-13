@@ -16,6 +16,12 @@ use gently_store::Store;
 use std::io::{Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// How long a provisional open span lingers before the reaper drops its local
+/// bookkeeping. Sized well past any real session (a day) so a live but quiet
+/// session is never reaped out from under itself; the provisional span already
+/// lives in the collector regardless.
+const OPEN_SPAN_TTL_NANOS: u64 = 24 * 3600 * 1_000_000_000;
+
 /// Run the hook. Never returns an error to the caller; never touches stdout.
 pub fn run(harness: HarnessKind) {
     // Catch every panic so a bug in our span logic cannot ever break the
@@ -37,7 +43,7 @@ fn process(harness: HarnessKind) -> anyhow::Result<()> {
     let value: serde_json::Value = serde_json::from_str(&raw)?;
 
     if std::env::var_os("GENTLY_DEBUG").is_some() {
-        capture_raw(&cfg, &value, &raw);
+        capture_raw(&cfg, harness, &value, &raw);
     }
 
     let store = Store::open(&cfg.state_db())?;
@@ -61,6 +67,17 @@ fn process(harness: HarnessKind) -> anyhow::Result<()> {
     for span in spans {
         let req = OtlpRequest::single(&resource, vec![span]);
         store.outbox_enqueue(&serde_json::to_string(&req)?)?;
+    }
+
+    // Reap provisional open spans whose close never came (Codex has no
+    // SessionEnd, and fires no Stop for an Esc-interrupted turn - openai/codex
+    // #22858), so the local table cannot grow without bound. Cheap single
+    // DELETE; best-effort so it never disrupts the hook.
+    let cutoff = now_nanos().saturating_sub(OPEN_SPAN_TTL_NANOS);
+    match store.reap_open_spans(cutoff) {
+        Ok(n) if n > 0 => tracing::info!(reaped = n, "reaped stale open spans"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "open-span reap failed"),
     }
 
     // Terminal events flush unconditionally so the last spans always ship;
@@ -89,14 +106,23 @@ fn now_nanos() -> u64 {
         .unwrap_or(0)
 }
 
-/// Append the raw event payload to `<state_dir>/raw/<event>.jsonl`. Best-effort:
-/// the schema-verification debug aid must never interfere with the pipeline.
-fn capture_raw(cfg: &Config, value: &serde_json::Value, raw: &str) {
+/// Append the raw event payload to `<state_dir>/raw/<harness>/<event>.jsonl` and
+/// refresh a redacted env snapshot at `<state_dir>/raw/<harness>/env.json`.
+/// Namespacing by harness keeps Claude and Codex payloads separable for coverage
+/// audits (the payload itself has no harness field); the env snapshot records
+/// exactly what each harness hands the hook process. Best-effort: this
+/// schema-verification debug aid (gated on `GENTLY_DEBUG`) must never interfere
+/// with the pipeline.
+fn capture_raw(cfg: &Config, harness: HarnessKind, value: &serde_json::Value, raw: &str) {
+    let hname = match harness {
+        HarnessKind::Claude => "claude",
+        HarnessKind::Codex => "codex",
+    };
     let event = value
         .get("hook_event_name")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
-    let dir = cfg.state_dir.join("raw");
+    let dir = cfg.state_dir.join("raw").join(hname);
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
@@ -107,6 +133,26 @@ fn capture_raw(cfg: &Config, value: &serde_json::Value, raw: &str) {
     {
         let _ = writeln!(f, "{}", raw.trim());
     }
+    if let Ok(env_json) = serde_json::to_string_pretty(&redacted_env()) {
+        let _ = std::fs::write(dir.join("env.json"), env_json);
+    }
+}
+
+/// A process-environment snapshot with filtering by variable name.
+/// Only names containing the listed markers are masked; secrets with other
+/// names remain in the snapshot. This denylist is not a complete secret detector.
+fn redacted_env() -> std::collections::BTreeMap<String, String> {
+    const SECRET_MARKERS: [&str; 6] = ["KEY", "TOKEN", "SECRET", "PASSWORD", "AUTH", "CREDENTIAL"];
+    std::env::vars()
+        .map(|(k, v)| {
+            let upper = k.to_ascii_uppercase();
+            if SECRET_MARKERS.iter().any(|m| upper.contains(m)) {
+                (k, "<redacted>".to_string())
+            } else {
+                (k, v)
+            }
+        })
+        .collect()
 }
 
 /// Spawn the detached exporter, unless throttled.
