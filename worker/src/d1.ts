@@ -161,24 +161,27 @@ export interface SpanRow {
 }
 
 // This version derives a display end by recursively taking the maximum
-// observed endpoint over each span's whole subtree, including finalized spans.
-// The recorded observations do not establish complete capture or completion.
-// Kept as TEXT: nanosecond values must not round-trip through a JS number.
+// observed endpoint over subtrees rooted at provisional spans (a null end or
+// end equal to start). Finalized spans retain their own stored endpoint.
+// The observations do not establish complete capture or completion. TEXT
+// avoids JS integer rounding; overlapping provisional subtrees can repeat work.
 export async function trace(env: Env, trace_id: string): Promise<SpanRow[]> {
   const result = await env.DB.prepare(
-    `WITH RECURSIVE subtree(root_id, node_id, node_end) AS (
-       SELECT span_id, span_id,
-              CAST(COALESCE(end_unix_nano, start_unix_nano) AS INTEGER)
-       FROM spans WHERE trace_id = ?1
+    `WITH RECURSIVE subtree(root_id, node_id) AS (
+       SELECT span_id, span_id
+       FROM spans
+       WHERE trace_id = ?1
+         AND (end_unix_nano IS NULL OR end_unix_nano = start_unix_nano)
        UNION ALL
-       SELECT st.root_id, s.span_id,
-              CAST(COALESCE(s.end_unix_nano, s.start_unix_nano) AS INTEGER)
+       SELECT st.root_id, s.span_id
        FROM spans s JOIN subtree st ON s.parent_span_id = st.node_id
        WHERE s.trace_id = ?1
      ),
      eff AS (
-       SELECT root_id, MAX(node_end) AS effective_end
-       FROM subtree GROUP BY root_id
+       SELECT st.root_id,
+              MAX(CAST(COALESCE(s.end_unix_nano, s.start_unix_nano) AS INTEGER)) AS effective_end
+       FROM subtree st JOIN spans s ON s.span_id = st.node_id
+       GROUP BY st.root_id
      )
      SELECT s.*,
             CAST(COALESCE(eff.effective_end,

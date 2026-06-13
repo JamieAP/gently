@@ -284,6 +284,49 @@ describe("GET /v1/query", () => {
     expect(child.effective_end_unix_nano).toBe(CHILD_END);
   });
 
+  it("op=trace leaves a finalized parent's end untouched (no provisional recursion)", async () => {
+    // A finalized parent (end > start) that ends AFTER its child must keep its
+    // own end - it is NOT anchored, so the recursion never runs for it. This
+    // guards the fix that anchors recursion only on provisional spans.
+    const FT = "eeff00112233445566778899aabbccdd";
+    const P = "eeff001122334400";
+    const C = "eeff001122334411";
+    const P_END = "1700001000000000000"; // parent ends last
+    await SELF.fetch("https://x/v1/traces", {
+      method: "POST",
+      headers: { Authorization: BEARER, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        resourceSpans: [
+          {
+            resource: { attributes: [{ key: "gently.harness", value: { stringValue: "claude-code" } }] },
+            scopeSpans: [
+              {
+                spans: [
+                  {
+                    traceId: FT, spanId: P, name: "session", kind: 1,
+                    startTimeUnixNano: "1700000500000000000", endTimeUnixNano: P_END,
+                    status: { code: 1 },
+                  },
+                  {
+                    traceId: FT, spanId: C, parentSpanId: P, name: "turn:1", kind: 1,
+                    startTimeUnixNano: "1700000600000000000", endTimeUnixNano: "1700000700000000000",
+                    status: { code: 1 },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    });
+    const res = await SELF.fetch(`https://x/v1/query?op=trace&trace_id=${FT}`, {
+      headers: { Authorization: BEARER },
+    });
+    const rows = await res.json<Array<{ span_id: string; effective_end_unix_nano: string }>>();
+    const parent = rows.find((r) => r.span_id === P)!;
+    expect(parent.effective_end_unix_nano).toBe(P_END); // own end, not the child's earlier end
+  });
+
   it("op=traces returns aggregated trace with correct span_count", async () => {
     const res = await SELF.fetch("https://x/v1/query?op=traces", {
       headers: { Authorization: BEARER },
