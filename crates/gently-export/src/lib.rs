@@ -19,12 +19,15 @@ use gently_store::Store;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExportError {
-    /// Collector unreachable, timed out, or returned 5xx - retryable; the
-    /// collector's fault, not the payload's. Rows stay queued for the next run.
+    /// Retryable: collector unreachable, timed out, returned 5xx, or rejected on
+    /// recoverable auth/throttle grounds (401/403/408/429) - not the payload's
+    /// fault. Rows stay queued so a corrected token or a passed throttle drains
+    /// them on the next run.
     #[error("{0}")]
     Unavailable(String),
-    /// Collector reached but rejected the request (4xx) - the payload is bad and
-    /// will never succeed, so the offending span is quarantined, not retried.
+    /// Poison: collector reached and rejected the request as genuinely
+    /// unprocessable (e.g. 400/413/422) - the same bytes will never succeed, so
+    /// the offending span is quarantined rather than retried forever.
     #[error("collector rejected request (HTTP {0})")]
     Rejected(u16),
     #[error("store: {0}")]
@@ -32,8 +35,9 @@ pub enum ExportError {
 }
 
 impl ExportError {
-    /// Whether retrying could succeed. A 4xx rejection cannot; everything else
-    /// (connection failure, timeout, 5xx, a transient store error) might.
+    /// Whether retrying could succeed. Only a genuine poison rejection cannot;
+    /// everything else (connection failure, timeout, 5xx, auth/throttle 4xx, a
+    /// transient store error) might.
     pub fn retryable(&self) -> bool {
         !matches!(self, ExportError::Rejected(_))
     }
