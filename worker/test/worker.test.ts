@@ -435,6 +435,46 @@ describe("GET /v1/query", () => {
     expect(turn.effective_end_unix_nano).toBe(TOOL_END); // reaches its tool child, not stuck at start
   });
 
+  it("op=trace derives effective_start when a turn opens AFTER its own children", async () => {
+    // The Codex shape: a tool keyed to a turn starts before that turn's span
+    // (UserPromptSubmit/Stop land late). The turn's effective_start must reach
+    // back to its earliest child so the child nests within it.
+    const FT = "00112233445566778899aabbccddeeff";
+    const ROOT = "00112233445566aa";
+    const TURN = "00112233445566bb"; // opens late
+    const TOOL = "00112233445566cc"; // starts before the turn
+    const TOOL_START = "1700004000000000000";
+    const TURN_START = "1700004500000000000"; // 500s AFTER its tool
+    await SELF.fetch("https://x/v1/traces", {
+      method: "POST",
+      headers: { Authorization: BEARER, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        resourceSpans: [
+          {
+            resource: { attributes: [{ key: "gently.harness", value: { stringValue: "codex" } }] },
+            scopeSpans: [
+              {
+                spans: [
+                  { traceId: FT, spanId: ROOT, name: "session", kind: 1, startTimeUnixNano: "1700004000000000000", endTimeUnixNano: "1700004000000000000", status: { code: 0 } },
+                  { traceId: FT, spanId: TURN, parentSpanId: ROOT, name: "turn:6", kind: 1, startTimeUnixNano: TURN_START, endTimeUnixNano: "1700004600000000000", status: { code: 1 } },
+                  { traceId: FT, spanId: TOOL, parentSpanId: TURN, name: "Bash", kind: 3, startTimeUnixNano: TOOL_START, endTimeUnixNano: "1700004550000000000", status: { code: 1 } },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    });
+    const res = await SELF.fetch(`https://x/v1/query?op=trace&trace_id=${FT}`, {
+      headers: { Authorization: BEARER },
+    });
+    const rows = await res.json<Array<{ span_id: string; effective_start_unix_nano: string }>>();
+    const turn = rows.find((r) => r.span_id === TURN)!;
+    const root = rows.find((r) => r.span_id === ROOT)!;
+    expect(turn.effective_start_unix_nano).toBe(TOOL_START); // reaches back to its earliest child
+    expect(root.effective_start_unix_nano).toBe(TOOL_START); // session root = trace min
+  });
+
   it("op=traces returns aggregated trace with correct span_count", async () => {
     const res = await SELF.fetch("https://x/v1/query?op=traces", {
       headers: { Authorization: BEARER },

@@ -17,17 +17,18 @@ if not spans:
     print("no spans"); sys.exit(1)
 by_id = {s["span_id"]: s for s in spans}
 def n(x): return int(x) if x not in (None, "") else None
-# Prefer the collector-derived display end from available observations. This
-# is not proof of complete capture or completion. Fall back to the stored end
-# when the collector omits the derived field.
+# Prefer collector-derived display bounds from available observations. Their
+# exact aggregation depends on the collector version; they do not prove complete
+# capture or completion. Fall back to raw bounds when derived bounds are absent.
+def eff_start(s): return n(s.get("effective_start_unix_nano")) or n(s["start_unix_nano"])
 def eff_end(s): return n(s.get("effective_end_unix_nano")) or n(s.get("end_unix_nano"))
-t0 = min(n(s["start_unix_nano"]) for s in spans)
-tmax = max((eff_end(s) or n(s["start_unix_nano"])) for s in spans)
+t0 = min(eff_start(s) for s in spans)
+tmax = max((eff_end(s) or eff_start(s)) for s in spans)
 total = max(tmax - t0, 1)
 def dur_ms(s):
     e = eff_end(s)
-    return ((e - n(s["start_unix_nano"])) / 1e6) if e else 0.0
-def off_ms(s): return (n(s["start_unix_nano"]) - t0) / 1e6
+    return ((e - eff_start(s)) / 1e6) if e else 0.0
+def off_ms(s): return (eff_start(s) - t0) / 1e6
 kids, roots = {}, []
 for s in spans:
     p = s.get("parent_span_id")
@@ -60,8 +61,8 @@ violations = []
 for s in spans:
     p = by_id.get(s.get("parent_span_id"))
     if not p: continue
-    cs, ce = n(s["start_unix_nano"]), eff_end(s) or n(s["start_unix_nano"])
-    ps, pe = n(p["start_unix_nano"]), eff_end(p) or n(p["start_unix_nano"])
+    cs, ce = eff_start(s), eff_end(s) or eff_start(s)
+    ps, pe = eff_start(p), eff_end(p) or eff_start(p)
     # An unclosed/provisional parent (zero- or negative-width: end <= start, e.g.
     # a Codex session root with no SessionEnd, or a crashed Claude session) has no
     # meaningful upper bound - only check the lower bound against it.

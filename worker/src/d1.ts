@@ -189,33 +189,41 @@ export interface SpanRow {
   attrs_json: string | null;
   resource_json: string | null;
   ingested_unix_nano: string;
-  // Derived (not stored): the greatest end across this span and all its
-  // transitive descendants - see `trace()`.
+  // Derived display bounds from the observations selected by `trace()`.
+  // Their aggregation is not proof of complete capture or actual completion.
+  effective_start_unix_nano: string;
   effective_end_unix_nano: string;
 }
 
 export async function trace(env: Env, trace_id: string): Promise<SpanRow[]> {
   const result = await env.DB.prepare(
     `WITH agg AS (
-       SELECT MAX(CAST(COALESCE(end_unix_nano, start_unix_nano) AS INTEGER)) AS trace_max
+       SELECT MAX(CAST(COALESCE(end_unix_nano, start_unix_nano) AS INTEGER)) AS trace_max,
+              MIN(CAST(start_unix_nano AS INTEGER)) AS trace_min
        FROM spans WHERE trace_id = ?1
      ),
-     child_max AS (
+     child_bounds AS (
        SELECT parent_span_id AS pid,
-              MAX(CAST(COALESCE(end_unix_nano, start_unix_nano) AS INTEGER)) AS m
+              MAX(CAST(COALESCE(end_unix_nano, start_unix_nano) AS INTEGER)) AS cmax,
+              MIN(CAST(start_unix_nano AS INTEGER)) AS cmin
        FROM spans
        WHERE trace_id = ?1 AND parent_span_id IS NOT NULL
        GROUP BY parent_span_id
      )
      SELECT s.*,
             CAST(CASE
+              WHEN s.parent_span_id IS NULL THEN agg.trace_min
+              ELSE MIN(CAST(s.start_unix_nano AS INTEGER),
+                       COALESCE(cb.cmin, CAST(s.start_unix_nano AS INTEGER)))
+            END AS TEXT) AS effective_start_unix_nano,
+            CAST(CASE
               WHEN s.end_unix_nano IS NOT NULL AND s.end_unix_nano <> s.start_unix_nano
                 THEN CAST(s.end_unix_nano AS INTEGER)
               WHEN s.parent_span_id IS NULL
                 THEN agg.trace_max
-              ELSE COALESCE(cm.m, CAST(s.start_unix_nano AS INTEGER))
+              ELSE COALESCE(cb.cmax, CAST(s.start_unix_nano AS INTEGER))
             END AS TEXT) AS effective_end_unix_nano
-     FROM spans s CROSS JOIN agg LEFT JOIN child_max cm ON cm.pid = s.span_id
+     FROM spans s CROSS JOIN agg LEFT JOIN child_bounds cb ON cb.pid = s.span_id
      WHERE s.trace_id = ?1
      ORDER BY s.start_unix_nano ASC`,
   )
