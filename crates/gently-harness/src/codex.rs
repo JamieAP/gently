@@ -1,14 +1,29 @@
 //! Codex CLI hook adapter.
 //!
-//! Codex 0.135.0 exposes a Claude-Code-style hooks system (stdin JSON, the same
-//! payload field names) - a superset of Claude's events. We model the lifecycle
-//! events that map onto spans and let everything else (`PermissionRequest`,
-//! `PreCompact`, `PostCompact`, …) fall through to [`SpanOp::Mark`] via the
-//! unknown-event default, keeping the adapter forward-compatible. Codex has no
-//! `SessionEnd`, `StopFailure`, or `PostToolUseFailure` hook, so the session root
-//! is never explicitly closed and turn/tool status is always `Ok` (documented in
-//! the design spec). No raw prompt or tool content is placed in a span - only a
-//! digest and byte length.
+//! Codex (verified against 0.139.0) exposes a Claude-Code-style hooks system
+//! (stdin JSON, the same payload field names) - a superset of Claude's events.
+//! We model the lifecycle events that map onto spans and let everything else
+//! (`PermissionRequest`, `PreCompact`, `PostCompact`, …) fall through to
+//! [`SpanOp::Mark`] via the unknown-event default, keeping the adapter
+//! forward-compatible. No raw prompt or tool content is placed in a span - only
+//! a digest and byte length.
+//!
+//! Three gaps are structural in Codex's hook surface, confirmed open upstream as
+//! of 0.139, not adapter limitations:
+//! - **No `SessionEnd`/session-exit event** (openai/codex#20603, closed without
+//!   one), so the session root is never closed in-band. Its effective end is
+//!   derived collector-side from child activity; locally the provisional row is
+//!   reaped on a TTL. We do *not* infer a close from a later `SessionStart` -
+//!   sessions interleave on one host, so that is no signal.
+//! - **`Stop` does not fire for an Esc-interrupted turn** (openai/codex#22858,
+//!   open), so an aborted turn never closes; handled the same way.
+//! - **No `StopFailure`/`PostToolUseFailure` event and no `exit_code` in the
+//!   PostToolUse payload** (only `tool_response`), so turn/tool status is always
+//!   recorded `Ok` - Codex tool failures are unobservable via hooks. Treat the
+//!   Codex error rate as unmeasured, not zero.
+//!
+//! The common `model` field (≥0.136) and SessionStart `source` are captured by
+//! [`common_attrs`](crate::hooks) so a model breakdown is queryable from a span.
 
 use crate::hooks::{common_attrs, mark, push_first_str_digest, push_value_digest, str_field};
 use crate::{Harness, HarnessError, Parsed, SpanOp};
@@ -294,5 +309,40 @@ mod tests {
     #[test]
     fn missing_event_name_errors() {
         assert!(Codex.parse(&json!({"session_id":"s"})).is_err());
+    }
+
+    #[test]
+    fn captures_model_and_source_from_payload() {
+        // SessionStart carries both `model` and `source`.
+        let parsed = Codex
+            .parse(&json!({"hook_event_name":"SessionStart","session_id":"s",
+                "model":"gpt-5.5","source":"resume"}))
+            .unwrap();
+        let attrs = format!("{:?}", parsed.ops);
+        assert!(attrs.contains("gently.model"));
+        assert!(attrs.contains("gpt-5.5"));
+        assert!(attrs.contains("gently.source"));
+        assert!(attrs.contains("resume"));
+
+        // A turn-scoped event carries `model` but no `source`.
+        let parsed = Codex
+            .parse(&json!({"hook_event_name":"UserPromptSubmit","session_id":"s",
+                "turn_id":"t1","model":"gpt-5.5-codex"}))
+            .unwrap();
+        let attrs = format!("{:?}", parsed.ops);
+        assert!(attrs.contains("gently.model"));
+        assert!(attrs.contains("gpt-5.5-codex"));
+        assert!(!attrs.contains("gently.source"));
+    }
+
+    #[test]
+    fn captures_agent_transcript_path_on_subagent_stop() {
+        let parsed = Codex
+            .parse(&json!({"hook_event_name":"SubagentStop","session_id":"s",
+                "agent_id":"ag1","agent_transcript_path":"/tmp/ag1.jsonl"}))
+            .unwrap();
+        let attrs = format!("{:?}", parsed.ops);
+        assert!(attrs.contains("gently.agent_transcript_path"));
+        assert!(attrs.contains("/tmp/ag1.jsonl"));
     }
 }

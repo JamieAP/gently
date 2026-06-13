@@ -223,4 +223,36 @@ mod tests {
     fn missing_event_name_errors() {
         assert!(ClaudeCode.parse(&json!({"session_id":"s"})).is_err());
     }
+
+    #[test]
+    fn captures_session_source_when_present() {
+        // Claude's SessionStart carries `source` but no `model` field.
+        let parsed = ClaudeCode
+            .parse(&json!({"hook_event_name":"SessionStart","session_id":"s","source":"startup"}))
+            .unwrap();
+        let attrs = format!("{:?}", parsed.ops);
+        assert!(attrs.contains("gently.source"));
+        assert!(attrs.contains("startup"));
+        assert!(!attrs.contains("gently.model"));
+    }
+
+    #[test]
+    fn captures_effort_and_session_end_reason() {
+        // `effort` rides on tool/turn events as an object `{"level": ...}`.
+        let parsed = ClaudeCode
+            .parse(&json!({"hook_event_name":"PreToolUse","session_id":"s",
+                "tool_name":"Bash","tool_use_id":"t1","tool_input":{},"effort":{"level":"high"}}))
+            .unwrap();
+        let ops = format!("{:?}", parsed.ops);
+        assert!(ops.contains("gently.effort"));
+        assert!(ops.contains("high"));
+
+        // `reason` rides on SessionEnd.
+        let parsed = ClaudeCode
+            .parse(&json!({"hook_event_name":"SessionEnd","session_id":"s","reason":"clear"}))
+            .unwrap();
+        let attrs = format!("{:?}", parsed.ops);
+        assert!(attrs.contains("gently.reason"));
+        assert!(attrs.contains("clear"));
+    }
 }
