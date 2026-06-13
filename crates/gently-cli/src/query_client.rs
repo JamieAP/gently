@@ -46,6 +46,12 @@ pub struct SpanRow {
     /// `gently.tool_name`, digests, …). `None` if omitted.
     #[serde(default)]
     pub attrs_json: Option<String>,
+    /// Collector-derived display end from this span and available aggregate
+    /// observations. It does not prove capture completeness or completion.
+    /// `None` from an older collector that predates the derivation; fall back to
+    /// `end_unix_nano`. Passed through to MCP `get_trace` consumers.
+    #[serde(default)]
+    pub effective_end_unix_nano: Option<String>,
 }
 
 impl SpanRow {

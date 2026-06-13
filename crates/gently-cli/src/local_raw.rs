@@ -162,6 +162,7 @@ mod tests {
             tool_use_id: Some("tu".into()),
             resource_json: None,
             attrs_json: Some(serde_json::to_string(&attrs).unwrap()),
+            effective_end_unix_nano: None,
         }
     }
 
