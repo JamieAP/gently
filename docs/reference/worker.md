@@ -10,9 +10,9 @@ All require `Authorization: Bearer <GENTLY_TOKEN>` → 401 otherwise.
 
 | Method · path | Purpose |
 |---|---|
-| `POST /v1/traces` | OTLP/JSON ingest. Flattens spans, upserts into D1 (`INSERT OR REPLACE` on `span_id` → idempotent). Echoes the negotiated `httpProtocol`. |
+| `POST /v1/traces` | OTLP/JSON ingest. Flattens spans, upserts into D1 with an **idempotent-monotonic** merge on `span_id` (envelope bounds: `MIN(start)`/`MAX(end)`, content from the latest-ending report, with incoming metadata winning equal-end ties). Echoes the negotiated `httpProtocol`. |
 | `GET /v1/query?op=traces` | traces/sessions aggregated by `trace_id`: `trace_id`, `session_id`, `harness`, `start`, `last_activity`, `span_count`, `error_count`. Filters: `session_id`, `harness`, `since`, `until`, `limit`, `order` (`start_desc`, `start_asc`, `last_activity`, `last_activity_desc`, `last_activity_asc`). |
-| `GET /v1/query?op=trace&trace_id=` | all spans for a trace, ordered by start. |
+| `GET /v1/query?op=trace&trace_id=` | all spans for a trace, ordered by start; each row also carries derived `effective_start_unix_nano` / `effective_end_unix_nano` (observed trace-wide or direct-child aggregate bounds, with existing non-provisional non-root ends retained; not proof of completeness - see [Trace model](../concepts/trace-model.md#effective-bounds)). |
 | `GET /v1/query?op=spans&…` | filtered spans (`trace_id`, `session_id`, `harness`, `tool_name`, `name`, `status`, `kind`, `since`, `until`, `limit`, `order`). |
 | `GET /v1/query?op=stats` | per-tool counts, error counts, average duration. |
 | `GET /v1/whoami` | returns the negotiated protocol (e.g. `{"httpProtocol":"HTTP/3"}`) - used to confirm QUIC on the wire. |

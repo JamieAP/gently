@@ -24,16 +24,28 @@ left behind.
 
 The drain classifies every failure:
 
-* **Retryable** - collector unreachable, timeout, or 5xx. The run retries in-place
-  with **exponential backoff** (250 ms → 500 → 1 s); beyond that it exits and the
-  next hook retries. Rows stay queued; nothing is lost.
-* **Rejected (4xx)** - the payload is bad and will never succeed. The drain
-  **bisects** the batch to isolate the offending span and moves it to a
-  `quarantine` table, so one poison span can't wedge the queue. Good spans in the
-  same batch are still delivered.
+* **Retryable** - collector unreachable, timeout, 5xx, **or a recoverable 4xx
+  (`401`/`403`/`408`/`429`)**. Auth and rate-limit rejections aren't the payload's
+  fault: a stale token or a throttle clears, so the spans stay queued and drain
+  once it does. The run retries in-place with **exponential backoff** (250 ms →
+  500 → 1 s); beyond that it exits and the next hook retries. Nothing is lost.
+  
+* **Rejected (poison)** - a genuinely unprocessable 4xx (`400`/`413`/`422`): the
+  same bytes will never succeed. The drain **bisects** the batch to isolate the
+  offending span and moves it to a `quarantine` table, so one poison span can't
+  wedge the queue. Good spans in the same batch are still delivered.
 
-Delivery is idempotent (`INSERT OR REPLACE` on `span_id`), so a retry that
-actually succeeded upstream but lost the response is harmless.
+### Idempotent, order-independent ingest
+
+The hook layer is a distributed, retrying, multi-process emitter with no
+delivery-order guarantee - the same `span_id` is reported provisionally on open,
+again on close, and (for the session root) again on every resume. The collector
+ingests **monotonically**: a span's stored extent is the *envelope* of all its
+reports (`MIN(start)`, `MAX(end)`) and its content comes from the most-finalized
+report (the one that ends latest). This is commutative - replays and out-of-order
+delivery converge to the same row - so a retried provisional can never revert a
+finalized span, and a resume can never push the session root's start past its own
+history.
 
 ## Durability & crash behavior
 
@@ -41,7 +53,10 @@ actually succeeded upstream but lost the response is harmless.
 * A killed exporter loses nothing - rows aren't removed until acknowledged.
 * In-flight (open) spans persist in `state.db`; provisional emit means an
   interrupted session/turn/subagent still appears (see
-  [Trace model](trace-model.md)).
+  [Trace model](trace-model.md)). A span whose close never fires (Codex has no
+  `SessionEnd`; an Esc-interrupted turn fires no `Stop`) would otherwise linger,
+  so a **TTL reaper** drops local `open_spans` rows older than a day on each hook
+  - purely local bookkeeping; the provisional span already lives in the collector.
 * WAL + `busy_timeout` lets many concurrent hook processes (parallel tools,
   multiple sessions) write without lock errors.
 

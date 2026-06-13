@@ -11,9 +11,11 @@ exits 0. You don't run this by hand - `gently init` wires it into the harness.
 ## `gently export`
 
 Drains the local outbox to the collector. A `flock` singleton: if another
-exporter holds the lock it exits immediately. Retries retryable failures with
-exponential backoff; quarantines 4xx-rejected spans; records health. Normally
-spawned by the hook, but safe to run manually to force a flush.
+exporter holds the lock it exits immediately. Retries retryable failures
+(unreachable, timeout, 5xx, and recoverable auth/throttle `401`/`403`/`408`/`429`)
+with exponential backoff; quarantines only genuinely unprocessable 4xx
+(`400`/`413`/`422`); records health. Normally spawned by the hook, but safe to run
+manually to force a flush.
 
 ## `gently status`
 
