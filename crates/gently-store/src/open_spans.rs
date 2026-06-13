@@ -103,14 +103,18 @@ impl Store {
         Ok(n as u64)
     }
 
-    /// Stable per-session ordinal (1-based) for a harness-provided turn id.
-    /// Assigns the next ordinal on first sight of a `turn_id`; idempotent
-    /// thereafter. Lets a harness that supplies its own turn ids (Codex's
-    /// `turn_id`) key turn spans by that stable id while keeping clean
-    /// `turn:1`/`turn:2` display names. Assignment is atomic under SQLite's
-    /// write lock, so concurrent hook processes never collide.
-    pub fn turn_ordinal(&self, session_id: &str, turn_id: &str) -> Result<u64> {
-        self.conn.execute(
+    /// Stable per-session ordinal (1-based) for a harness-provided turn id, plus
+    /// whether this call is the **first sight** of that `turn_id`. Assigns the
+    /// next ordinal on first sight; idempotent thereafter. Lets a harness that
+    /// supplies its own turn ids (Codex's `turn_id`) key turn spans by that
+    /// stable id while keeping clean `turn:1`/`turn:2` display names. Assignment
+    /// is atomic under SQLite's write lock, so concurrent hook processes never
+    /// collide. The first-sight flag lets the applier lazily emit a turn span the
+    /// first time a turn is referenced by ANY event - Codex starts turns (tasks)
+    /// that fire no `UserPromptSubmit` hook, so a tool can be the first to name a
+    /// turn, and its parent turn span must exist or the tool dangles.
+    pub fn turn_ordinal(&self, session_id: &str, turn_id: &str) -> Result<(u64, bool)> {
+        let inserted = self.conn.execute(
             "INSERT INTO turn_ordinals (session_id, turn_id, ordinal)
              VALUES (?1, ?2,
                (SELECT COALESCE(MAX(ordinal), 0) + 1 FROM turn_ordinals WHERE session_id = ?1))
@@ -122,7 +126,7 @@ impl Store {
             rusqlite::params![session_id, turn_id],
             |r| r.get(0),
         )?;
-        Ok(n as u64)
+        Ok((n as u64, inserted > 0))
     }
 
     /// The current turn index for a session (0 if no turn has started - tool
@@ -213,14 +217,18 @@ mod tests {
     #[test]
     fn turn_ordinal_assigns_stable_per_session_ordinals() {
         let (_d, s) = store();
-        assert_eq!(s.turn_ordinal("sess", "tid-a").unwrap(), 1);
-        assert_eq!(s.turn_ordinal("sess", "tid-b").unwrap(), 2);
+        assert_eq!(s.turn_ordinal("sess", "tid-a").unwrap(), (1, true));
+        assert_eq!(s.turn_ordinal("sess", "tid-b").unwrap(), (2, true));
         assert_eq!(
             s.turn_ordinal("sess", "tid-a").unwrap(),
-            1,
-            "idempotent for same turn_id"
+            (1, false),
+            "idempotent for same turn_id; not first sight"
         );
-        assert_eq!(s.turn_ordinal("sess", "tid-c").unwrap(), 3);
-        assert_eq!(s.turn_ordinal("other", "tid-a").unwrap(), 1, "per-session");
+        assert_eq!(s.turn_ordinal("sess", "tid-c").unwrap(), (3, true));
+        assert_eq!(
+            s.turn_ordinal("other", "tid-a").unwrap(),
+            (1, true),
+            "per-session"
+        );
     }
 }

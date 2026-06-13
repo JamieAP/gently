@@ -53,7 +53,7 @@ pub fn apply(
                 )?);
             }
             SpanOp::OpenTurn { attrs } => {
-                let (key, name) = resolve_turn(store, session, parsed.turn_id.as_deref(), true)?;
+                let (key, name, _) = resolve_turn(store, session, parsed.turn_id.as_deref(), true)?;
                 let parent = SpanId::derive(session, "session");
                 // Provisional turn so an interrupted turn (no Stop) still appears;
                 // CloseTurn finalizes it via the same deterministic id.
@@ -70,7 +70,7 @@ pub fn apply(
                 )?);
             }
             SpanOp::CloseTurn { status, attrs } => {
-                let (key, name) = resolve_turn(store, session, parsed.turn_id.as_deref(), false)?;
+                let (key, name, _) = resolve_turn(store, session, parsed.turn_id.as_deref(), false)?;
                 emitted.push(close(
                     store,
                     session,
@@ -90,8 +90,12 @@ pub fn apply(
                 attrs,
             } => {
                 let key = tool_key(tool_use_id.as_deref(), tool_name);
-                let (turn_lkey, _) =
+                let (turn_lkey, turn_name, first_sight) =
                     resolve_turn(store, session, parsed.turn_id.as_deref(), false)?;
+                ensure_turn_span(
+                    store, session, trace_id, &turn_lkey, &turn_name, now_nanos, first_sight,
+                    &mut emitted,
+                )?;
                 let parent = SpanId::derive(session, &turn_lkey);
                 store.open_span(&open(
                     &key,
@@ -133,8 +137,12 @@ pub fn apply(
                 let parent = match parent_tool_use_id {
                     Some(tu) => SpanId::derive(session, &format!("tool:{tu}")),
                     None => {
-                        let (turn_lkey, _) =
+                        let (turn_lkey, turn_name, first_sight) =
                             resolve_turn(store, session, parsed.turn_id.as_deref(), false)?;
+                        ensure_turn_span(
+                            store, session, trace_id, &turn_lkey, &turn_name, now_nanos,
+                            first_sight, &mut emitted,
+                        )?;
                         SpanId::derive(session, &turn_lkey)
                     }
                 };
@@ -172,8 +180,12 @@ pub fn apply(
                 )?);
             }
             SpanOp::Mark { name, attrs } => {
-                let (turn_lkey, _) =
+                let (turn_lkey, turn_name, first_sight) =
                     resolve_turn(store, session, parsed.turn_id.as_deref(), false)?;
+                ensure_turn_span(
+                    store, session, trace_id, &turn_lkey, &turn_name, now_nanos, first_sight,
+                    &mut emitted,
+                )?;
                 let parent = SpanId::derive(session, &turn_lkey);
                 let key = format!("mark:{name}:{now_nanos}");
                 emitted.push(Span {
@@ -208,21 +220,62 @@ fn resolve_turn(
     session: &str,
     turn_id: Option<&str>,
     opening: bool,
-) -> Result<(String, String), gently_store::StoreError> {
+) -> Result<(String, String, bool), gently_store::StoreError> {
     match turn_id {
         Some(tid) => {
-            let ordinal = store.turn_ordinal(session, tid)?;
-            Ok((format!("turn:{tid}"), format!("turn:{ordinal}")))
+            let (ordinal, first_sight) = store.turn_ordinal(session, tid)?;
+            Ok((format!("turn:{tid}"), format!("turn:{ordinal}"), first_sight))
         }
         None => {
+            // Claude's counter turns are always opened explicitly by
+            // `UserPromptSubmit`, which fires reliably - so there is no
+            // first-sight-via-a-tool case to back-fill here.
             let n = if opening {
                 store.next_turn_index(session)?
             } else {
                 store.current_turn(session)?
             };
-            Ok((turn_key(n), turn_key(n)))
+            Ok((turn_key(n), turn_key(n), false))
         }
     }
+}
+
+/// Lazily emit a provisional turn span the first time a turn is *referenced* by a
+/// tool/agent/mark, not only when `UserPromptSubmit` opens it. Codex auto-starts
+/// continuation turns (a new `task_started` right after the previous
+/// `task_complete`, with no user input) that fire no `UserPromptSubmit` hook - so
+/// without this, every tool under such a turn parents to a `turn:<id>` span that
+/// never exists and dangles. The span is marked `TurnInferred`; the collector
+/// may derive display bounds from available child observations. Those bounds
+/// do not prove capture completeness or actual turn completion.
+#[allow(clippy::too_many_arguments)]
+fn ensure_turn_span(
+    store: &Store,
+    session: &str,
+    trace_id: TraceId,
+    turn_lkey: &str,
+    turn_name: &str,
+    now_nanos: u64,
+    first_sight: bool,
+    emitted: &mut Vec<Span>,
+) -> Result<(), gently_store::StoreError> {
+    if !first_sight {
+        return Ok(());
+    }
+    let parent = SpanId::derive(session, "session");
+    let attrs: Attrs = vec![("gently.event".to_string(), "TurnInferred".to_string())];
+    emitted.push(open_provisional(
+        store,
+        session,
+        trace_id,
+        turn_lkey,
+        Some(parent),
+        turn_name,
+        SpanKind::Internal,
+        now_nanos,
+        &attrs,
+    )?);
+    Ok(())
 }
 
 /// Merge `base` with `overrides`, keeping keys unique. An overriding key
@@ -644,6 +697,56 @@ mod tests {
         assert_eq!(stop[0].start_unix_nano, 200);
         assert_eq!(stop[0].end_unix_nano, 900);
         assert_eq!(stop[0].status, Status::Ok);
+    }
+
+    #[test]
+    fn codex_tool_in_auto_turn_without_prompt_synthesizes_turn_span() {
+        let (_d, s) = store();
+        let h = Codex;
+        // An auto-continuation turn fires NO UserPromptSubmit; a tool is the first
+        // event to name it. Without back-fill the tool would parent to a turn span
+        // that never exists (the dangling-parent bug).
+        let pre = apply(
+            &s,
+            &h.parse(&json!({"hook_event_name":"PreToolUse","session_id":"cx",
+                "turn_id":"auto1","tool_name":"Bash","tool_use_id":"t1","tool_input":{}}))
+                .unwrap(),
+            100,
+        )
+        .unwrap();
+        assert_eq!(pre.len(), 1, "first-sight tool back-fills its turn span");
+        assert_eq!(pre[0].name, "turn:1");
+        assert_eq!(pre[0].span_id, SpanId::derive("cx", "turn:auto1"));
+        assert_eq!(
+            pre[0].parent_span_id,
+            Some(SpanId::derive("cx", "session")),
+            "inferred turn parents to the session root"
+        );
+
+        // The tool closes and parents to the now-existing turn - not a dangling id.
+        let post = apply(
+            &s,
+            &h.parse(&json!({"hook_event_name":"PostToolUse","session_id":"cx",
+                "turn_id":"auto1","tool_name":"Bash","tool_use_id":"t1","tool_response":{}}))
+                .unwrap(),
+            200,
+        )
+        .unwrap();
+        assert_eq!(
+            post[0].parent_span_id,
+            Some(SpanId::derive("cx", "turn:auto1"))
+        );
+
+        // A second tool in the same turn does NOT re-emit the turn span.
+        let pre2 = apply(
+            &s,
+            &h.parse(&json!({"hook_event_name":"PreToolUse","session_id":"cx",
+                "turn_id":"auto1","tool_name":"Read","tool_use_id":"t2","tool_input":{}}))
+                .unwrap(),
+            300,
+        )
+        .unwrap();
+        assert!(pre2.is_empty(), "turn already exists; no duplicate turn span");
     }
 
     #[test]
