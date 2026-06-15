@@ -530,7 +530,70 @@ describe("GET /v1/query", () => {
     // trace-scoped attrs lifted from the resource, not the span
     expect(found?.session_id).toBe("sess-abc");
     expect(found?.harness).toBe("claude-code");
-    // One span has status=2 (error)
+    // The only status=2 span here is the turn (a StopFailure), which has no
+    // tool_name - error_count counts failed TOOL calls only, so it is 0.
+    expect(found?.error_count).toBe(0);
+  });
+
+  it("op=traces error_count counts failed tool calls, not StopFailure turns", async () => {
+    // A turn that aborts (StopFailure) and a tool call that fails both carry
+    // status=2. Only the tool failure is an "error" for the summary count.
+    const traceId = "cccccccccccccccccccccccccccccccc";
+    const sess = "sess-errcount";
+    const fixture = {
+      resourceSpans: [
+        {
+          resource: {
+            attributes: [
+              { key: "service.name", value: { stringValue: "gently" } },
+              { key: "gently.session_id", value: { stringValue: sess } },
+              { key: "gently.harness", value: { stringValue: "claude-code" } },
+            ],
+          },
+          scopeSpans: [
+            {
+              spans: [
+                {
+                  traceId,
+                  spanId: "c0000000000000a1",
+                  name: "tool:bash",
+                  kind: 1,
+                  startTimeUnixNano: "1700000010000000000",
+                  endTimeUnixNano: "1700000011000000000",
+                  attributes: [
+                    { key: "gently.tool_name", value: { stringValue: "Bash" } },
+                  ],
+                  status: { code: 2 }, // failed tool call → counts
+                },
+                {
+                  traceId,
+                  spanId: "c0000000000000a2",
+                  name: "turn:7",
+                  kind: 0,
+                  startTimeUnixNano: "1700000012000000000",
+                  endTimeUnixNano: "1700000013000000000",
+                  attributes: [],
+                  status: { code: 2 }, // StopFailure turn → must NOT count
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    await SELF.fetch("https://x/v1/traces", {
+      method: "POST",
+      headers: { Authorization: BEARER, "Content-Type": "application/json" },
+      body: JSON.stringify(fixture),
+    });
+
+    const res = await SELF.fetch(`https://x/v1/query?op=traces&session_id=${sess}`, {
+      headers: { Authorization: BEARER },
+    });
+    expect(res.status).toBe(200);
+    const rows = await res.json<Array<{ trace_id: string; error_count: number }>>();
+    const found = rows.find((r) => r.trace_id === traceId);
     expect(found?.error_count).toBe(1);
   });
 

@@ -161,7 +161,12 @@ export async function traces(
             MIN(start_unix_nano) AS start,
             MAX(COALESCE(end_unix_nano, start_unix_nano)) AS last_activity,
             COUNT(*) AS span_count,
-            SUM(status = 2) AS error_count
+            -- error_count is failed TOOL calls only. Turn spans carry status=2 on
+            -- StopFailure (an aborted/interrupted turn - common in long autonomous
+            -- loops) and the session root can too; counting those would drown the
+            -- tool-failure signal. The status stays on those spans for rendering;
+            -- it just doesn't count here. tool_name IS NOT NULL ⇒ it's a tool span.
+            SUM(status = 2 AND tool_name IS NOT NULL) AS error_count
      FROM spans
      ${where}
      GROUP BY trace_id
