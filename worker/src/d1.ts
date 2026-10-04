@@ -200,6 +200,11 @@ export interface SpanRow {
   effective_end_unix_nano: string;
 }
 
+// Derived display bounds: parentless records use trace-wide min/max; other
+// records use own/direct-child minimum start and retain non-provisional ends,
+// otherwise using direct-child maximum end or their own start. Two GROUP BYs,
+// no recursion. These observations do not prove capture completeness or actual
+// completion. Raw bounds remain unchanged; TEXT avoids JS integer rounding.
 export async function trace(env: Env, trace_id: string): Promise<SpanRow[]> {
   const result = await env.DB.prepare(
     `WITH agg AS (

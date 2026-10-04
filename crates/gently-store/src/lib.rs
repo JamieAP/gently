@@ -14,6 +14,7 @@ mod health;
 mod open_spans;
 mod outbox;
 mod raw_values;
+pub mod private_fs;
 
 pub use health::Health;
 pub use open_spans::OpenSpan;
@@ -26,6 +27,8 @@ pub const OUTBOX_CAP: usize = 10_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    #[error("private state file: {0}")]
+    Io(#[from] std::io::Error),
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
 }
@@ -41,11 +44,22 @@ impl Store {
     /// Open (creating if needed) the state db at `path`, enabling WAL and the
     /// busy timeout, and ensuring the schema exists.
     pub fn open(path: &Path) -> Result<Self> {
+        // Precreate and harden the database before SQLite creates WAL sidecars.
+        // Do not change the caller's parent directory (it may be a shared /tmp).
+        drop(private_fs::open_private_file(path, false)?);
+        let sidecars: Vec<std::path::PathBuf> = ["-wal", "-shm", "-journal"].iter()
+            .map(|suffix| {
+                let mut name = path.as_os_str().to_os_string();
+                name.push(suffix);
+                std::path::PathBuf::from(name)
+            }).collect();
+        for sidecar in &sidecars { private_fs::harden_existing_file(sidecar)?; }
         let conn = rusqlite::Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        for sidecar in &sidecars { private_fs::harden_existing_file(sidecar)?; }
         Ok(Self { conn })
     }
 }
@@ -102,6 +116,39 @@ CREATE TABLE IF NOT EXISTS health (
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn database_path_does_not_follow_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("unrelated.db");
+        let _existing = Store::open(&target).unwrap();
+        let link = dir.path().join("state.db");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(Store::open(&link).is_err(), "state path followed a symlink");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_and_wal_sidecars_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let store = Store::open(&path).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let file = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+            if file.exists() {
+                std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+        }
+        let reopened = Store::open(&path).unwrap();
+        reopened.raw_value_put("fixture", "private fixture content").unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let file = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+            assert_eq!(std::fs::metadata(file).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        drop(store);
+    }
 
     #[test]
     fn concurrent_writers_do_not_lock_error() {

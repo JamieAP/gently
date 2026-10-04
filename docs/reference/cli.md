@@ -57,11 +57,16 @@ Runs the stdio MCP server (see [Querying & MCP](../guides/querying-and-mcp.md)).
 Invoked by the harness, not by hand. MCP query tools accept an optional local
 `jq` filter and expose `response_fields` / `span_attr_keys` discovery tools.
 
-## `gently init --claude`
+## `gently init --claude` / `gently init --codex`
 
 Idempotently installs the integration: hook entries in
 `~/.claude/settings.json`, the MCP server in `~/.claude.json`, and a scaffolded
-`~/.gently/config.toml`. Re-running adds nothing duplicate.
+`~/.gently/config.toml`. Codex uses `~/.codex/config.toml` and requires trusting
+installed hooks inside Codex. Re-running adds no duplicate hooks.
+
+MCP raw-value resolution is disabled unless `--resolve-local-raw-values` is
+provided. Re-running init without it removes the installed opt-in. This option
+can expose local prompt/tool/assistant content to the agent and its provider.
 
 ---
 

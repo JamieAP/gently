@@ -46,16 +46,22 @@ For the essentials and the state location:
 
 | Path | Contents |
 |---|---|
-| `config.toml` | collector URL + token |
+| `config.toml` | collector URL + token (`0600`) |
 | `state.db` | the SQLite outbox, open spans, turn counters, local SHA-to-raw values, health, quarantine |
 | `export.log` / `hook.log` | diagnostics (rotated at 5 MB) |
 | `export.lock` | exporter singleton lock |
-| `raw/*.jsonl` | raw hook payloads - only when `GENTLY_DEBUG` is set (any value) |
+| `raw/<harness>/*.jsonl` | raw hook payloads - only when `GENTLY_DEBUG` is set (any value) |
 
 > Point `GENTLY_STATE_DIR` at a tmpfs (e.g. `/dev/shm`) to keep local state off
 > persistent disk, at the cost of losing buffered-but-unsent spans on reboot.
 
 ## Token handling
 
-The token is a shared bearer secret. Keep `config.toml` at `0600`. It is never logged, and never placed in `wrangler.toml` - on the Worker
-it's a Cloudflare secret (`wrangler secret put GENTLY_TOKEN`).
+The token is a shared bearer secret. On Unix, init and config loading restrict `config.toml` to `0600` and the state
+directory to `0700`. SQLite/sidecars, logs, locks, and debug files also use `0600`.
+Other platforms require an owner-only native ACL. Store the Worker token with
+`wrangler secret put GENTLY_TOKEN`; keep it out of `wrangler.toml`.
+
+Selected raw values are stored locally even when resolution is disabled. MCP
+installation enables resolution only with `--resolve-local-raw-values`; those
+results can be shared with an agent provider. See [Security & privacy](../concepts/security-and-privacy.md).

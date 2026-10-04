@@ -2,43 +2,43 @@
 description: Distributed tracing for coding agents.
 ---
 
-# Introduction
+# Gently documentation
 
-A coding agent is a distributed system you can't see into: prompts fan out to
-tools, tools spawn subagents, work happens across processes that live for
-milliseconds. **gently** makes that legible.
+Gently records Claude Code and Codex sessions as OpenTelemetry traces. Hooks store
+spans in a local SQLite outbox, a detached exporter sends them to a Cloudflare
+Worker backed by D1, and CLI or MCP queries let you inspect the recorded activity.
 
-It hooks a coding harness, turns the session lifecycle - every prompt, tool call,
-and subagent - into OpenTelemetry spans, ships them over QUIC to a Cloudflare edge
-Worker backed by D1, and lets you query your own traces from the CLI or from
-*inside the agent itself* over MCP.
+## Getting started
 
-```
-  Claude Code
-      │  hooks (every tool call)
-      ▼
-  gently hook ──► ~/.gently/state.db        local state write,
-      │            (WAL outbox, durable)     never touches the network
-      │
-      └─ spawns ─► gently export ──QUIC/HTTP3──► gently-collector (Worker) ──► D1
-                     (detached)    h2 fallback        bearer auth          (SQLite)
-                                                            ▲
-   gently traces│trace│spans│stats│status ── /v1/query ─────┤
-   gently mcp  (stdio MCP, exposed to the agent) ───────────┘
-```
+1. Follow the [quick start](getting-started/quickstart.md) to deploy a collector
+   and install the integration.
+2. Set the collector URL and token using the
+   [configuration guide](getting-started/configuration.md).
+3. Use [CLI and MCP queries](guides/querying-and-mcp.md) to inspect traces.
 
-## Why it's interesting
+Claude Code and Codex integrations are included. Install with
+`gently init --claude` or `gently init --codex`; Codex hooks must also be trusted
+inside Codex.
 
-* **Deterministic ids** - spans reconstruct into a tree across separate, ephemeral
-  hook processes, with no shared state and idempotent ingest.
-* **The hot path is sacred** - the hook writes one local SQLite row and returns; all network/QUIC work happens in a detached, disposable exporter.
-* **Just a hook, no daemon** - nothing long-lived to install or babysit; each
-  exporter is a throwaway worker and the next hook is its supervisor.
+## How it works
 
-## Scope
+The [architecture guide](concepts/architecture.md) describes the hook, local store,
+exporter, and collector. The [trace model](concepts/trace-model.md) explains how
+session, turn, tool, and subagent spans relate, including provisional spans and
+updates with the same span ID.
 
-v1 wires **Claude Code**. The hook layer is a `Harness` trait with a `ClaudeCode`
-adapter, so Codex and Cursor slot in as new adapters without touching the core.
+## Privacy and access
 
-> Start with the [Quick start](getting-started/quickstart.md), or read
-> [Architecture](concepts/architecture.md) for how it fits together.
+Normal exports contain digests and metadata, including local paths and host
+information. Selected raw values remain in local plaintext storage. Resolving
+those values through CLI or MCP is opt-in; raw MCP results may enter the calling
+agent's model-provider context. The collector's shared bearer token grants
+access to all traces.
+
+Read [security and privacy](concepts/security-and-privacy.md) for the full data
+flow, permissions, debug-capture behaviour, and retention limits.
+
+## License
+
+Gently is [MIT licensed](../LICENSE). Dependencies retain their own licenses and
+notices.

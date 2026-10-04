@@ -6,6 +6,7 @@
 //! this one. All human-facing output goes to stderr (stdout stays clean).
 
 use crate::config::Config;
+use gently_store::private_fs::{ensure_private_dir, harden_existing_file, write_private_file};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -26,7 +27,7 @@ const MODELED_EVENTS: &[&str] = &[
     "SubagentStop",
 ];
 
-pub fn run_claude() -> Result<()> {
+pub fn run_claude(resolve_local_raw_values: bool) -> Result<()> {
     let cfg = Config::load()?;
     cfg.ensure_state_dir()?;
     let home = dirs::home_dir().context("cannot determine home directory")?;
@@ -34,7 +35,7 @@ pub fn run_claude() -> Result<()> {
 
     scaffold_config(&cfg)?;
     let added_hooks = install_hooks(&home, &exe)?;
-    install_mcp(&home, &exe)?;
+    install_mcp(&home, &exe, resolve_local_raw_values)?;
 
     eprintln!("gently: installed {added_hooks} hook event(s) into ~/.claude/settings.json");
     eprintln!("gently: registered MCP server 'gently' in ~/.claude.json");
@@ -70,7 +71,7 @@ fn scaffold_config(cfg: &Config) -> Result<()> {
         # export_batch = 512          # spans coalesced into one export request\n\
         # export_timeout_secs = 15    # per-request export timeout\n\
         # query_timeout_secs = 30     # per-request query / MCP timeout\n";
-    std::fs::write(&path, template).with_context(|| format!("writing {}", path.display()))?;
+    write_private_file(&path, template).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -101,7 +102,7 @@ fn install_hooks(home: &Path, exe: &Path) -> Result<usize> {
     Ok(added)
 }
 
-fn install_mcp(home: &Path, exe: &Path) -> Result<()> {
+fn install_mcp(home: &Path, exe: &Path, resolve_local_raw_values: bool) -> Result<()> {
     let path = home.join(".claude.json");
     let mut config = read_json(&path)?;
     let servers = config
@@ -112,15 +113,13 @@ fn install_mcp(home: &Path, exe: &Path) -> Result<()> {
     let servers = servers
         .as_object_mut()
         .context("mcpServers is not an object")?;
-    servers.insert(
-        "gently".to_string(),
-        json!({
-            "type": "stdio",
-            "command": exe.to_string_lossy(),
-            "args": ["mcp"],
-            "env": {"GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES": "1"}
-        }),
-    );
+    let mut server = json!({
+        "type": "stdio", "command": exe.to_string_lossy(), "args": ["mcp"]
+    });
+    if resolve_local_raw_values {
+        server["env"] = json!({"GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES": "1"});
+    }
+    servers.insert("gently".to_string(), server);
     write_json(&path, &config)
 }
 
@@ -140,6 +139,7 @@ fn hooks_contains_command(arr: &[Value], command: &str) -> bool {
 }
 
 fn read_json(path: &Path) -> Result<Value> {
+    harden_existing_file(path)?;
     match std::fs::read_to_string(path) {
         Ok(s) if !s.trim().is_empty() => {
             serde_json::from_str(&s).with_context(|| format!("parsing {}", path.display()))
@@ -150,12 +150,15 @@ fn read_json(path: &Path) -> Result<Value> {
 
 fn write_json(path: &Path, value: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
+        // The home directory is not a harness-owned state directory.
+        if parent.file_name().is_some_and(|name| name == ".claude" || name == ".codex") {
+            ensure_private_dir(parent)?;
+        }
     }
     let body = serde_json::to_string_pretty(value)?;
     // Write to a temp sibling then rename for an atomic update.
     let tmp: PathBuf = path.with_extension("gently-tmp");
-    std::fs::write(&tmp, body).with_context(|| format!("writing {}", tmp.display()))?;
+    write_private_file(&tmp, body).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))?;
     Ok(())
 }
@@ -182,7 +185,7 @@ const CODEX_MODELED_EVENTS: &[&str] = &[
     "SubagentStop",
 ];
 
-pub fn run_codex() -> Result<()> {
+pub fn run_codex(resolve_local_raw_values: bool) -> Result<()> {
     let cfg = Config::load()?;
     cfg.ensure_state_dir()?;
     let home = dirs::home_dir().context("cannot determine home directory")?;
@@ -194,7 +197,7 @@ pub fn run_codex() -> Result<()> {
     let mut doc = read_toml_doc(&path)?;
     let command = format!("{} hook --harness codex", shell_quote(&exe));
     let added = merge_codex_hooks(&mut doc, &command);
-    ensure_codex_mcp(&mut doc, &exe.to_string_lossy());
+    ensure_codex_mcp(&mut doc, &exe.to_string_lossy(), resolve_local_raw_values);
     ensure_features_hooks(&mut doc);
     write_toml_doc(&path, &doc)?;
 
@@ -276,7 +279,7 @@ fn group_has_command(group: &Table, command: &str) -> bool {
 
 /// Register `[mcp_servers.gently]` with the gently binary, replacing any prior
 /// entry of the same name (the command may have moved).
-fn ensure_codex_mcp(doc: &mut DocumentMut, exe: &str) {
+fn ensure_codex_mcp(doc: &mut DocumentMut, exe: &str, resolve_local_raw_values: bool) {
     let servers = doc
         .entry("mcp_servers")
         .or_insert_with(|| Item::Table(Table::new()))
@@ -288,9 +291,11 @@ fn ensure_codex_mcp(doc: &mut DocumentMut, exe: &str) {
     let mut args = Array::new();
     args.push("mcp");
     server["args"] = value(args);
-    let mut env = Table::new();
-    env["GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES"] = value("1");
-    server.insert("env", Item::Table(env));
+    if resolve_local_raw_values {
+        let mut env = Table::new();
+        env["GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES"] = value("1");
+        server.insert("env", Item::Table(env));
+    }
     servers.insert("gently", Item::Table(server));
 }
 
@@ -306,6 +311,7 @@ fn ensure_features_hooks(doc: &mut DocumentMut) {
 
 /// Read a TOML document for in-place editing, or start a fresh one if absent.
 fn read_toml_doc(path: &Path) -> Result<DocumentMut> {
+    harden_existing_file(path)?;
     match std::fs::read_to_string(path) {
         Ok(s) if !s.trim().is_empty() => s
             .parse::<DocumentMut>()
@@ -317,10 +323,13 @@ fn read_toml_doc(path: &Path) -> Result<DocumentMut> {
 /// Atomically write a TOML document (temp sibling + rename), preserving format.
 fn write_toml_doc(path: &Path, doc: &DocumentMut) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
+        // The home directory is not a harness-owned state directory.
+        if parent.file_name().is_some_and(|name| name == ".claude" || name == ".codex") {
+            ensure_private_dir(parent)?;
+        }
     }
     let tmp: PathBuf = path.with_extension("gently-tmp");
-    std::fs::write(&tmp, doc.to_string()).with_context(|| format!("writing {}", tmp.display()))?;
+    write_private_file(&tmp, doc.to_string()).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))?;
     Ok(())
 }
@@ -343,7 +352,7 @@ trust_level = "trusted"
     fn merge_preserves_existing_keys_comments_and_adds_hooks_and_mcp() {
         let mut doc: toml_edit::DocumentMut = EXISTING.parse().unwrap();
         let added = merge_codex_hooks(&mut doc, "/usr/local/bin/gently hook --harness codex");
-        ensure_codex_mcp(&mut doc, "/usr/local/bin/gently");
+        ensure_codex_mcp(&mut doc, "/usr/local/bin/gently", false);
         ensure_features_hooks(&mut doc);
         let out = doc.to_string();
 
@@ -358,8 +367,7 @@ trust_level = "trusted"
         assert!(out.contains("gently hook --harness codex"));
         assert!(out.contains("[mcp_servers.gently]"));
         assert!(out.contains("args = [\"mcp\"]"));
-        assert!(out.contains("[mcp_servers.gently.env]"));
-        assert!(out.contains("GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES = \"1\""));
+        assert!(!out.contains("GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES"));
         assert_eq!(added, CODEX_MODELED_EVENTS.len());
 
         let _: toml::Value = toml::from_str(&out).unwrap();

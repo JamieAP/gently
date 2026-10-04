@@ -17,8 +17,10 @@ gently status                             # local exporter health + queue depth
 
 By default, query JSON contains only the collector's digest attributes. Set
 `GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES=1` on the CLI or MCP server process to add
-matching local-only raw attributes such as `gently.tool_input`,
+matching locally stored raw attributes such as `gently.tool_input`,
 `gently.tool_response`, `gently.prompt`, and `gently.assistant`.
+Selected raw values are captured locally by the hook even without resolution.
+Sharing resolved output with an agent can send that content to its provider.
 
 ### Waterfall
 
@@ -34,7 +36,10 @@ gently trace <trace_id> --json | python3 scripts/waterfall.py
 
 `gently mcp` is a stdio MCP server exposing the same surface as tools the agent
 can call to introspect its own runs. `gently init` registers it in
-`~/.claude.json`; verify with `claude mcp get gently`.
+`~/.claude.json`; `gently init --codex` registers it in Codex config instead.
+Raw resolution stays off unless you add `--resolve-local-raw-values`. Ordinary
+reinstallation removes an earlier installed raw-resolution setting.
+Verify the Claude registration with `claude mcp get gently`.
 
 | Tool | Args | Returns |
 |---|---|---|

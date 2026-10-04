@@ -12,11 +12,14 @@ const LOG_CAP_BYTES: u64 = 5 * 1024 * 1024;
 /// Initialise a file-backed tracing subscriber at `path`, rotating first if the
 /// existing file exceeds the cap. Best-effort: logging never fails the caller.
 pub fn init_file_log(path: &Path) {
+    // Harden both current and retained logs before rotation or append.
+    if gently_store::private_fs::harden_existing_file(path).is_err() { return; }
+    if let Some(name) = path.file_name() {
+        let rotated = path.with_file_name(format!("{}.1", name.to_string_lossy()));
+        if gently_store::private_fs::harden_existing_file(&rotated).is_err() { return; }
+    }
     rotate_if_large(path, LOG_CAP_BYTES);
-    if let Ok(file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+    if let Ok(file) = gently_store::private_fs::open_private_file(path, true)
     {
         let _ = tracing_subscriber::fmt()
             .with_writer(std::sync::Mutex::new(file))

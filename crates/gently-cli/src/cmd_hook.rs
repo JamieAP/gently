@@ -123,18 +123,18 @@ fn capture_raw(cfg: &Config, harness: HarnessKind, value: &serde_json::Value, ra
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
     let dir = cfg.state_dir.join("raw").join(hname);
-    if std::fs::create_dir_all(&dir).is_err() {
+    if gently_store::private_fs::ensure_private_dir(&cfg.state_dir.join("raw")).is_err()
+        || gently_store::private_fs::ensure_private_dir(&dir).is_err() {
         return;
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join(format!("{event}.jsonl")))
+    // Hook event names are input; prevent them from escaping the raw directory.
+    if !event.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') { return; }
+    if let Ok(mut f) = gently_store::private_fs::open_private_file(&dir.join(format!("{event}.jsonl")), true)
     {
         let _ = writeln!(f, "{}", raw.trim());
     }
     if let Ok(env_json) = serde_json::to_string_pretty(&redacted_env()) {
-        let _ = std::fs::write(dir.join("env.json"), env_json);
+        let _ = gently_store::private_fs::write_private_file(&dir.join("env.json"), env_json);
     }
 }
 
@@ -175,11 +175,7 @@ fn maybe_spawn_export(cfg: &Config, force: bool) {
 /// immediately releasing is a cheap local file op; a held lock means "running".
 fn exporter_running(cfg: &Config) -> bool {
     use fs4::fs_std::FileExt;
-    let Ok(file) = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(cfg.state_dir.join("export.lock"))
+    let Ok(file) = gently_store::private_fs::open_private_file(&cfg.state_dir.join("export.lock"), false)
     else {
         return false; // can't tell → don't suppress the spawn
     };

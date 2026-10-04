@@ -63,8 +63,10 @@ impl Config {
                 .join(".gently"),
         };
 
+        gently_store::private_fs::ensure_private_dir(&state_dir)?;
         let file: FileConfig = {
             let path = state_dir.join("config.toml");
+            gently_store::private_fs::harden_existing_file(&path)?;
             match std::fs::read_to_string(&path) {
                 Ok(s) => {
                     toml::from_str(&s).with_context(|| format!("parsing {}", path.display()))?
@@ -99,7 +101,7 @@ impl Config {
 
     /// Ensure the state directory exists.
     pub fn ensure_state_dir(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.state_dir)
+        gently_store::private_fs::ensure_private_dir(&self.state_dir)
             .with_context(|| format!("creating {}", self.state_dir.display()))?;
         Ok(())
     }

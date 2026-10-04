@@ -4,7 +4,7 @@ gently is a four-stage pipeline plus a query path. The two SQLite databases are
 not alternatives - they're different jobs.
 
 ```
-  Claude Code ──hook stdin JSON──► gently hook        (local hook path)
+  Claude Code ──hook stdin JSON──► gently hook        (hot path)
                                      │ 1. parse event
                                      │ 2. update local state.db (WAL)
                                      │ 3. enqueue completed spans → outbox
@@ -35,12 +35,14 @@ not alternatives - they're different jobs.
 
 `gently hook` runs on *every* tool call, so it must be invisible:
 
-* Writes one row to local SQLite (WAL).
+* Writes one row to local SQLite (WAL), then returns without network work.
 * Builds **no** network client and opens **no** connection.
 * Spawns the exporter **detached** (new process group, stdio to `/dev/null`) and
   returns immediately.
 * **Never writes stdout** (the harness parses hook stdout as control output) and
   **always exits 0** - a panic is caught and logged, never surfaced.
+
+Network work lives in the detached exporter, off the hook's hot path.
 
 ## Two databases, two jobs
 

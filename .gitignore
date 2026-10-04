@@ -7,3 +7,13 @@ node_modules
 
 # honkit/gitbook build output
 docs/_book/
+
+.dev.vars.*
+.env
+.env.*
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+/raw/
+/state/

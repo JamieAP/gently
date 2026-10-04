@@ -1,175 +1,196 @@
-<div align="center">
-
 # gently
 
-**Distributed tracing for coding agents.**
+OpenTelemetry traces for Claude Code and Codex.
 
-Turn the lifecycle of a Claude Code session - every prompt, tool call, and subagent -
-into OpenTelemetry spans, ship them over QUIC to a Cloudflare edge worker, and query
-your own traces from the CLI or from *inside the agent itself* over MCP.
+[Quick start](#quick-start) · [MCP](#mcp) · [Documentation](docs/README.md) · [Contributing](CONTRIBUTING.md)
 
-</div>
+Gently records coding-agent activity as linked spans, so you can follow a
+session through its turns, tool calls, and subagents. Inspect traces from the
+command line or let an agent query them through MCP.
 
----
+The Rust CLI captures hook events into a local SQLite outbox and exports
+OTLP/JSON to a collector you run. The included collector is a Cloudflare Worker
+backed by D1; it can run on Cloudflare or locally with Wrangler.
 
-A coding agent is a distributed system you can't see into: prompts fan out to tools,
-tools spawn subagents, work happens across processes that live for milliseconds.
-gently makes that legible. It hooks the harness, reconstructs the causal tree, and
-gives you a waterfall of what the agent actually did - and how long it took.
-
-```
-  Claude Code
-      │  hooks (every tool call)
-      ▼
-  gently hook ──► ~/.gently/state.db        local state write,
-      │            (WAL outbox, durable)     never touches the network
-      │
-      └─ spawns ─► gently export ──QUIC/HTTP3──► gently-collector (Worker) ──► D1
-                     (detached)    h2 fallback        bearer auth          (SQLite)
-                                                            ▲
-   gently traces│trace│spans│stats ───── GET /v1/query ─────┤
-   gently mcp  (stdio MCP, exposed to the agent) ───────────┘
+```text
+Claude Code / Codex hooks -> local SQLite outbox -> Worker -> D1
+                                                   ^
+                                              CLI and MCP
 ```
 
-v1 wires **Claude Code**. The hook layer is a `Harness` trait with a `ClaudeCode`
-adapter, so Codex and Cursor slot in as new adapters without touching the core.
+## Example trace
 
----
+A synthetic session rendered by `scripts/waterfall.py`:
 
-## Design
+```text
+      dur st  span                      │timeline →                                              │
+───────── ─  ──────────────────────────┼────────────────────────────────────────────────────────┤
+  1000.0ms ✓  session                   │████████████████████████████████████████████████████████│
+   900.0ms ✓    turn:1                  │   ██████████████████████████████████████████████████   │
+    20.0ms ✓      Read                  │    █                                                   │
+   200.0ms ✓      Bash                  │        ███████████                                     │
+   450.0ms ✓      agent:1               │                      █████████████████████████         │
+   300.0ms ✓        Bash                │                         █████████████████              │
+```
 
-The interesting decisions, and why:
+## What you can inspect
 
-- **Deterministic ids.** `trace_id = blake3(session_id)`, `span_id =
-  blake3(session_id, key)`. A child computes its parent's id without the parent
-  existing yet and without any local state - so the tree reconstructs across
-  separate, short-lived hook processes, and ingest is idempotent.
-- **Self-contained spans.** No span depends on a parent being present. A session
-  that dies without `SessionEnd` still renders; the backend assembles the tree from
-  `(trace_id, parent_span_id)` alone. Sessions, turns and subagents emit a
-  *provisional* span on open so an interrupted one survives a crash, finalized on
-  close via idempotent replace.
-- **The hot path is sacred.** `gently hook` runs on *every* tool call. It writes one
-  row to a local SQLite WAL and spawns the exporter detached - no network,
-  no QUIC client, no blocking, always exit 0, never a byte on stdout (which the
-  harness would parse as control output). 
-- **Durable & self-healing, no daemon.** Completed spans queue in a local outbox;
-  a `flock`'d, detached exporter - spawned *by the hook itself* - drains it over
-  QUIC. There's nothing long-lived to manage: each `gently export` is a disposable
-  worker, and the next hook is its supervisor. A down collector just grows the
-  queue; the run retries with exponential backoff, and idempotent ingest makes
-  retries free. A span the collector *rejects* (4xx) is isolated by bisection and
-  **quarantined**, so one poison span can't wedge the queue. The exporter's outcome
-  is recorded in the local store and surfaced by `gently status` - observability
-  without a daemon. (Export is triggered on every hook; terminal events always
-  flush, others throttle if an exporter is already running.)
+- Session and turn structure, including parent-child relationships between tools
+  and subagents.
+- Tool durations, completion status, and trace timelines.
+- Recent activity and per-tool statistics, with filters and JSON output.
+
+See [data and privacy](#data-and-privacy) before enabling capture.
 
 ## Quick start
 
-**1 - Deploy the collector** (Cloudflare account required):
+You need Rust and Cargo, Node.js and npm, and a Cloudflare account authenticated
+with Wrangler. Start from a source checkout:
 
-```bash
+```sh
+git clone https://github.com/JamieAP/gently.git
+cd gently
+```
+
+### 1. Deploy a collector
+
+```sh
 cd worker
-npm install
-wrangler d1 create gently                 # paste database_id into wrangler.toml
-wrangler d1 execute gently --remote --file schema.sql
-wrangler secret put GENTLY_TOKEN          # a shared bearer token
-wrangler deploy                           # → https://gently-collector.<acct>.workers.dev
+npm ci
+npx wrangler d1 create gently
 ```
 
-**2 - Install the agent integration:**
+Copy the returned database ID into `wrangler.toml`, then initialize the database,
+set a shared bearer token, and deploy:
 
-```bash
-cargo install --path crates/gently-cli    # installs `gently`
-gently init --claude                       # hooks + MCP server + ~/.gently/config.toml
+```sh
+npx wrangler d1 execute gently --remote --file schema.sql
+npx wrangler secret put GENTLY_TOKEN
+npx wrangler deploy
+cd ..
 ```
 
-Set your collector in `~/.gently/config.toml` (or `GENTLY_COLLECTOR_URL` /
-`GENTLY_TOKEN`), then restart your session. Spans flow on every tool call.
+For a local collector, initialize D1 with `--local`, configure the Worker's local
+`GENTLY_TOKEN`, and run `npx wrangler dev` from `worker/`. Use
+`http://127.0.0.1:8787` as the collector URL. See the
+[setup guide](docs/getting-started/quickstart.md) for details.
 
-`config.toml` needs only `collector_url` + `token`; everything else has a sane
-default (shown here, commented in the scaffold). `collector_url` is the one knob
-that picks the store - point it at a `*.workers.dev` (CF D1, the default) or a
-local `wrangler dev` (`http://127.0.0.1:8787`); both export *and* queries follow it.
+### 2. Install the hooks
+
+```sh
+cargo install --path crates/gently-cli
+gently init --claude
+# For Codex instead: gently init --codex
+```
+
+Init installs the hooks and MCP server and creates `~/.gently/config.toml` if it
+is missing. Set the collector URL and the same bearer token there:
 
 ```toml
 collector_url = "https://gently-collector.<account>.workers.dev"
-token         = "…"
-# prefer_quic = true        # prefer HTTP/3, fall back to HTTP/2
-# outbox_cap  = 10000       # buffered spans before oldest dropped
-# export_batch = 512        # spans per export request
-# export_timeout_secs = 15
-# query_timeout_secs  = 30
+token = "replace-with-your-collector-token"
 ```
 
-**3 - Query** - from the shell, or as MCP tools the agent can call on itself:
+Restart your agent session after configuring it. Codex hooks must also be
+trusted inside Codex. `GENTLY_COLLECTOR_URL` and `GENTLY_TOKEN` override the config
+values. See [configuration](docs/getting-started/configuration.md) for queue,
+transport, timeout, and state-directory options.
 
-```bash
-gently traces                 # recent sessions
-gently trace <id>             # the span tree
-gently spans --tool-name Bash # filter
-gently stats                  # per-tool rollups
-gently status                 # local exporter health + queue depth
-gently trace <id> --json | python3 scripts/waterfall.py   # render a waterfall
+### 3. Query a session
+
+Run a task in the configured agent, then inspect its captured activity:
+
+```sh
+gently traces
+gently trace <trace_id>
+gently spans --tool-name Bash
+gently stats
+gently status
 ```
 
-MCP tools: `list_traces`, `get_trace`, `search_spans`, `trace_stats`.
+Replace `<trace_id>` with an ID from `gently traces`. Trace queries read from the
+collector; `gently status` reports local queue and exporter health.
 
-## The trace model
+To render a trace timeline from the checkout:
 
-OTLP/JSON over HTTP/3 (HTTP/2 fallback). One trace per session; spans named
-`session`, `turn:N`, the tool name (`Bash`/`Read`/…), or `agent:<id>`.
+```sh
+gently trace <trace_id> --json | python3 scripts/waterfall.py
+```
 
-| layer | carries |
-|---|---|
-| **resource** (per session) | `service.name`, `gently.harness`, `gently.session_id`, `gently.cwd`, `host.name`, `os.type`, `gently.version` |
-| **span** | deterministic `traceId`/`spanId`/`parentSpanId`, `name`, `kind` (Internal/Client), `start`/`endTimeUnixNano` (string-encoded), `status` |
-| **span attrs** (`gently.*`) | `event`, `tool_name`, `tool_use_id`, `permission_mode`, and `…sha256` + `…bytes` digests of input/response/prompt |
+## MCP
 
-The Worker flattens these into a D1 `spans` table (trace-scoped attrs lifted from the
-resource), keyed on `span_id` with `INSERT OR REPLACE` for idempotency.
+The MCP server is built into the CLI as `gently mcp`. Both init commands above
+register it with the chosen agent. Restart the agent to load the registration;
+for Claude Code, check it with `claude mcp get gently`.
 
-### OpenTelemetry: compliant wire, two deliberate deviations
+| Tool | Purpose |
+| --- | --- |
+| `list_traces` | Find sessions and traces |
+| `get_trace` | Read a trace's spans |
+| `search_spans` | Filter recorded spans |
+| `trace_stats` | Summarize tool usage |
+| `response_fields` | Inspect available response fields |
+| `span_attr_keys` | Discover recorded attribute keys |
 
-The bytes are valid OTLP/JSON. But two patterns are intentionally non-idiomatic and
-work only because gently owns its collector - **don't point the exporter at a generic
-backend (Tempo/Jaeger/Honeycomb) without accounting for them**:
+The server uses stdio and its tools are read-only. Queries return digest
+attributes by default. See [querying and MCP](docs/guides/querying-and-mcp.md) for
+arguments, ordering, and local `jq` filters.
 
-1. **Deterministic ids** where OTel recommends random - the price of stateless
-   reconstruction and idempotency.
-2. **Provisional-then-final double emit** of the same `span_id`, where standard OTel
-   emits each span once at end. It relies on the collector doing last-write-wins by
-   `span_id`; a backend that doesn't upsert would show duplicates. The payoff is
-   crash-durable in-flight spans, which the stable OTel model doesn't offer.
+## Data and privacy
 
-To target a standard backend: emit on close only (losing crash durability), or ensure
-the backend dedups by `span_id`.
+Normal exports contain digests and byte lengths rather than raw prompt, command,
+file, or tool-output values. They also include identifying metadata such as
+working directories, host information, tool names, timings, and session IDs.
+Digests are fingerprints, not encryption.
 
-## Layout
+Selected raw prompt, tool, and assistant values are stored locally in SQLite,
+even when raw resolution is disabled. This content is plaintext and has no
+automatic retention limit. To let MCP queries resolve matching local raw values,
+explicitly install with `--resolve-local-raw-values`; those results may enter the
+calling agent's model-provider context. Reinstalling without that option removes
+the registered opt-in.
 
-| crate / dir | responsibility |
-|---|---|
-| `gently-core` | deterministic ids, span type, OTLP/JSON encoding (no I/O) |
-| `gently-store` | `~/.gently/state.db`: open-span tracking + outbox (WAL) |
-| `gently-harness` | `Harness` trait + `ClaudeCode` adapter + the stateful applier |
-| `gently-export` | `Transport` trait, QUIC (reqwest-http3) + HTTP/2, outbox drain |
-| `gently-cli` | the `gently` binary: `hook` · `export` · `traces`/`trace`/`spans`/`stats` · `status` · `mcp` · `init` |
-| `worker/` | `gently-collector` Cloudflare Worker (TypeScript, D1) |
-| `scripts/waterfall.py` | ASCII waterfall + structural-integrity checker |
+The collector's shared bearer token grants access to all traces. The collector
+provides no tenant separation or automatic retention. Protect both the collector
+and local state, and read [security and privacy](docs/concepts/security-and-privacy.md)
+for file permissions, exported fields, and debug-capture behaviour.
+
+## Architecture and documentation
+
+One trace represents a session. Turns, tools, and subagents form its span tree.
+Hooks write locally; a detached exporter drains the outbox with retry and backoff.
+The default queue cap is 10,000 spans, after which the oldest queued spans are
+dropped.
+
+Session, turn, and subagent spans are updated as they open and close. The Worker
+replaces records with the same span ID. Exporting to another OpenTelemetry
+backend requires handling these updates; CLI and MCP queries also depend on the
+Worker's query API.
+
+- [Documentation index](docs/README.md)
+- [Architecture](docs/concepts/architecture.md)
+- [Trace model](docs/concepts/trace-model.md)
+- [Configuration](docs/getting-started/configuration.md)
+- [Querying and MCP](docs/guides/querying-and-mcp.md)
+- [Security and privacy](docs/concepts/security-and-privacy.md)
 
 ## Development
 
-```bash
-cargo test                                 # all crates
+The Rust workspace is in `crates/`, the collector in `worker/`, and trace-rendering
+helpers in `scripts/`.
+
+```sh
+cargo test
 cargo clippy --all-targets -- -D warnings
-cd worker && npm test                      # Worker (vitest + Miniflare)
+cd worker
+npm ci
+npm test
 ```
 
-The Claude Code hook schema is verified empirically, not assumed: run with
-`GENTLY_DEBUG=1` and inspect `~/.gently/raw/<Event>.jsonl`. The adapter is tolerant -
-only `session_id` and `hook_event_name` are required; any unmodeled event becomes a
-marker span.
+For hook-schema diagnosis, see the
+[debug-capture documentation](docs/concepts/security-and-privacy.md). Debug
+capture writes additional raw data and should be enabled deliberately.
 
----
+## License
 
-<div align="center"><sub>The best Rust reads like Erlang. Components die; the trace survives.</sub></div>
+[MIT](LICENSE). Dependencies retain their own licenses and notices.

@@ -29,7 +29,6 @@ The drain classifies every failure:
   fault: a stale token or a throttle clears, so the spans stay queued and drain
   once it does. The run retries in-place with **exponential backoff** (250 ms →
   500 → 1 s); beyond that it exits and the next hook retries. Nothing is lost.
-  
 * **Rejected (poison)** - a genuinely unprocessable 4xx (`400`/`413`/`422`): the
   same bytes will never succeed. The drain **bisects** the batch to isolate the
   offending span and moves it to a `quarantine` table, so one poison span can't

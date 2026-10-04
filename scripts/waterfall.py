@@ -44,7 +44,7 @@ print(f"{'dur':>9} {'st':>1}  span{'':<22}│{'timeline →':<{W}}│")
 print("─" * 9 + " ─  " + "─" * 26 + "┼" + "─" * W + "┤")
 def walk(s, depth):
     label = ("  " * depth) + s["name"]
-    print(f"{dur_ms(s):8.1f}m {STATUS.get(s['status'],'?')}  {label:<26.26}│{bar(s):<{W}}│")
+    print(f"{dur_ms(s):8.1f}ms {STATUS.get(s['status'],'?')}  {label:<26.26}│{bar(s):<{W}}│")
     for c in sorted(kids.get(s["span_id"], []), key=lambda x: n(x["start_unix_nano"])):
         walk(c, depth + 1)
 for r in sorted(roots, key=lambda x: n(x["start_unix_nano"])):

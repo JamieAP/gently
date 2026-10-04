@@ -28,11 +28,7 @@ pub fn run() -> Result<()> {
     crate::logging::init_file_log(&cfg.state_dir.join("export.log"));
 
     let lock_path = cfg.state_dir.join("export.lock");
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
+    let lock = gently_store::private_fs::open_private_file(&lock_path, false)
         .with_context(|| format!("opening {}", lock_path.display()))?;
 
     match lock.try_lock_exclusive() {

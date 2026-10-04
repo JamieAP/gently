@@ -1,54 +1,61 @@
 # Security & privacy
 
-## What's stored - digests, not content
+## Exported metadata and local raw content
 
-Spans carry:
+Normal exports contain span IDs, names, timings, status, tool names/use IDs,
+permission mode, and truncated SHA-256 digests plus byte lengths of prompt and
+tool values. Raw prompt, command, file, and tool output values are excluded from
+the export outbox. Digests are fingerprints rather than encryption and can be
+guessed for low-entropy content.
 
-* structural metadata - span/trace ids, names, timings, status, `kind`;
-* `tool_name`, `tool_use_id`, `permission_mode`;
-* **sha-256 digests** (first 8 bytes) plus byte lengths of tool inputs/responses
-  and prompts.
+Exports intentionally identify the working directory, hostname, operating system,
+session and agent IDs, harness/version, and sometimes model, session source,
+effort level, close reason, agent type, and agent transcript path. This metadata
+can reveal projects, local paths, activity patterns, and the tools/models used.
+Only export traces to a collector you control and are allowed to use.
 
-So a trace reveals *which* tools ran, *when*, *how big* the I/O was, and *whether*
-it errored.
+Selected raw prompts, tool inputs/responses, and assistant messages are stored
+locally in `~/.gently/state.db`, keyed by digest. They can include credentials or
+confidential source material from a session. This storage is enabled in the hook
+and has no automatic retention limit; protecting or deleting local state is an
+operator responsibility.
 
-What *is* identifiable, by design: the working directory (`gently.cwd`),
-hostname, OS, and session ids. Be aware traces show which projects/paths you ran
-in.
+CLI/MCP queries return collector digest attributes by default. Explicitly set
+`GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES=1` on a query process to add matching local
+raw attributes. `gently init --claude` and `gently init --codex` leave this disabled.
+The `--resolve-local-raw-values` install option enables it for the registered MCP
+server; re-running init without the option removes that setting. If MCP is used
+inside an agent, resolved values may enter that agent's model-provider context.
 
-Debug mode: `GENTLY_DEBUG=1` writes **full raw payloads** to
-`~/.gently/raw/*.jsonl` for schema verification. It's off by default and local
-only.
+Setting `GENTLY_DEBUG` to any value additionally saves full hook payloads to
+`~/.gently/raw/<harness>/<Event>.jsonl` and an environment snapshot at
+`raw/<harness>/env.json`. Environment keys containing KEY, TOKEN, SECRET,
+PASSWORD, AUTH, or CREDENTIAL are masked; this name-based list cannot identify
+all sensitive values. Debug capture is disabled by default and has no retention
+limit. Disable it after diagnosis and review/delete captured files as needed.
 
-The hook also keeps selected raw prompt, tool input/response, and assistant
-message values in local SQLite keyed by their digest. These values are never
-placed in the export outbox or sent to the Worker. Set
-`GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES=1` on `gently trace`, `gently spans`, or
-`gently mcp` to enrich returned span attributes from that local table.
+## Local files
 
-## Transport & authentication
+On Unix, gently creates or restricts application/harness state directories to
+`0700` and config, SQLite/database sidecars, raw capture, logs, locks, and updated
+harness config files to `0600`. Existing files opened through these paths are
+restricted before use; final-path symlinks are rejected. Unix helpers also refuse
+files owned by another user or with multiple hardlinks before changing their
+permissions or contents. Local content is
+plaintext, and backups made before restriction are not changed. These controls
+do not protect against the same user, privileged processes, or an agent allowed
+to read the files. On other platforms the native inherited ACL applies; configure
+an owner-only ACL separately because Unix modes are not enforced there.
 
-* **In transit:** TLS 1.3 over HTTP/3 (QUIC) or HTTP/2.
-* **Endpoint auth:** every route (`/v1/traces`, `/v1/query`, `/v1/whoami`)
-  requires `Authorization: Bearer <GENTLY_TOKEN>`, compared in (near) constant
-  time; missing/wrong → 401. No unauthenticated route.
-* The token is a **single shared bearer secret** stored as a Cloudflare secret on
-  the Worker and locally. It is never logged or placed in `wrangler.toml`.
+## Transport and access
 
-## Data at rest (D1)
+Remote collectors should use HTTPS. HTTP is available for local development.
+The Worker requires `Authorization: Bearer <GENTLY_TOKEN>` on its routes; the
+single shared token grants access to all traces. Configure it as a Cloudflare
+secret and in your private local config/environment, not in `wrangler.toml`.
+The repository contains a placeholder D1 database identifier to replace when
+you create your own database.
 
-Cloudflare D1 is managed SQLite, encrypted at rest on Cloudflare's infrastructure.
-It is not directly internet-exposed - reachable only through the bearer-gated
-Worker, or via your own Cloudflare account.
-
-## Honest limits
-
-This is a personal/dev-grade tool, not hardened multi-tenant infrastructure:
-
-* one shared token - anyone holding it can read and write all traces;
-* the Worker is a public `*.workers.dev` endpoint protected only by that token
-  (no IP allowlist, mTLS, Cloudflare Access, or rate limiting by default);
-* no retention/TTL - data accumulates until you clean it.
-
-If you need more, front the Worker with Cloudflare Access, add a retention sweep,
-or redact `cwd` to a digest.
+The collector relies on Cloudflare's service controls for data at rest. This
+project does not implement tenant separation, an IP allowlist, mTLS, or automatic
+retention. The public Worker endpoint is protected by the shared bearer token.

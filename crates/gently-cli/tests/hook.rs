@@ -85,3 +85,30 @@ fn sha(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
+
+#[cfg(unix)]
+#[test]
+fn debug_capture_protects_existing_payload_and_environment_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let raw = dir.path().join("raw/claude");
+    std::fs::create_dir_all(&raw).unwrap();
+    for p in [dir.path().join("raw"), raw.clone()] {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    for p in [raw.join("UserPromptSubmit.jsonl"), raw.join("env.json")] {
+        std::fs::write(&p, "{}").unwrap();
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    Command::cargo_bin("gently").unwrap()
+        .arg("hook").env("GENTLY_STATE_DIR", dir.path()).env("GENTLY_DEBUG", "1")
+        .env_remove("GENTLY_COLLECTOR_URL").env_remove("GENTLY_TOKEN")
+        .write_stdin(r#"{"hook_event_name":"UserPromptSubmit","session_id":"privacy-test","prompt":"private fixture"}"#)
+        .assert().success();
+    for p in [dir.path().join("raw"), raw.clone()] {
+        assert_eq!(std::fs::metadata(p).unwrap().permissions().mode() & 0o777, 0o700);
+    }
+    for p in [raw.join("UserPromptSubmit.jsonl"), raw.join("env.json")] {
+        assert_eq!(std::fs::metadata(p).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+}
