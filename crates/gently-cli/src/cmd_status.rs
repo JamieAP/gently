@@ -18,16 +18,39 @@ pub fn run() -> Result<()> {
     let pending = store.outbox_len()?;
     let quarantined = store.quarantine_len()?;
     let h = store.health_snapshot()?;
+    let raw = store.raw_objects_stats(&cfg.tenant_id)?;
+    // Status remains useful for invalid configuration, but must not echo URL
+    // userinfo, paths or query strings that might contain private values.
+    let collector = if cfg.collector_url.is_empty() {
+        "-".to_string()
+    } else {
+        reqwest::Url::parse(&cfg.collector_url)
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_else(|_| "invalid URL".into())
+    };
 
     let mut t = Table::new();
     t.set_header(vec!["field", "value"]);
-    t.add_row(vec![
-        Cell::new("collector_url"),
-        Cell::new(&cfg.collector_url),
-    ]);
+    t.add_row(vec![Cell::new("collector_url"), Cell::new(collector)]);
     t.add_row(vec![Cell::new("prefer_quic"), Cell::new(cfg.prefer_quic)]);
     t.add_row(vec![Cell::new("pending (outbox)"), Cell::new(pending)]);
     t.add_row(vec![Cell::new("quarantined"), Cell::new(quarantined)]);
+    t.add_row(vec![Cell::new("tenant_id"), Cell::new(&cfg.tenant_id)]);
+    t.add_row(vec![Cell::new("device_id"), Cell::new(&cfg.device_id)]);
+    t.add_row(vec![Cell::new("raw_objects"), Cell::new(raw.objects)]);
+    t.add_row(vec![Cell::new("raw_bytes"), Cell::new(raw.bytes)]);
+    t.add_row(vec![
+        Cell::new("raw_pending"),
+        Cell::new(raw.pending_objects),
+    ]);
+    t.add_row(vec![
+        Cell::new("raw_pending_bytes"),
+        Cell::new(raw.pending_bytes),
+    ]);
+    t.add_row(vec![
+        Cell::new("raw_budget_bytes"),
+        Cell::new(gently_store::RAW_OBJECT_CAP_BYTES),
+    ]);
     t.add_row(vec![
         Cell::new("consecutive_failures"),
         Cell::new(h.consecutive_failures),

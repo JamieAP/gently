@@ -11,9 +11,9 @@ use crate::config::Config;
 use crate::local_raw;
 use crate::HarnessKind;
 use gently_core::{OtlpRequest, Resource};
-use gently_harness::{apply, ClaudeCode, Codex, Harness};
+use gently_harness::{apply, ClaudeCode, Codex, Harness, Parsed};
 use gently_store::Store;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// How long a provisional open span lingers before the reaper drops its local
@@ -27,8 +27,10 @@ pub fn run(harness: HarnessKind) {
     // Catch every panic so a bug in our span logic cannot ever break the
     // harness session. The result is logged and discarded; exit stays 0.
     let _ = std::panic::catch_unwind(|| {
-        if let Err(e) = process(harness) {
-            tracing::error!(error = %e, "hook processing failed");
+        if process(harness).is_err() {
+            // Parsing/encryption errors may incorporate attacker-controlled
+            // input. Only a fixed diagnostic can reach a persistent log.
+            tracing::error!("hook processing failed; check configuration and recipient policy");
         }
     });
 }
@@ -36,41 +38,47 @@ pub fn run(harness: HarnessKind) {
 fn process(harness: HarnessKind) -> anyhow::Result<()> {
     let cfg = Config::load()?;
     cfg.ensure_state_dir()?;
-    crate::logging::init_file_log(&cfg.state_dir.join("hook.log"));
+    crate::logging::init_file_log(&cfg.runtime_dir().join("hook.log"));
 
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw)?;
     let value: serde_json::Value = serde_json::from_str(&raw)?;
 
-    if cfg.capture_raw_values && std::env::var("GENTLY_DEBUG").as_deref() == Ok("1") {
-        capture_raw(&cfg, harness, &value, &raw);
-    }
-
     let store = Store::open(&cfg.state_db())?;
-    if cfg.capture_raw_values {
-        if let Err(e) = local_raw::capture_hook_values(&store, &value) {
-            tracing::warn!(error = %e, "local raw value capture failed");
-        }
-    }
 
     let adapter: &dyn Harness = match harness {
         HarnessKind::Claude => &ClaudeCode,
         HarnessKind::Codex => &Codex,
     };
-    let parsed = adapter.parse(&value)?;
+    let mut parsed = adapter.parse(&value)?;
+    let mut metadata_parsed = parsed.clone();
+    local_raw::metadata_only(&mut metadata_parsed);
+    let prepared_raw = match local_raw::prepare(&cfg, &value, &mut parsed, adapter.name()) {
+        Ok(prepared) => prepared,
+        Err(_) => {
+            tracing::warn!("encrypted raw capture unavailable; preserving length-only telemetry");
+            None
+        }
+    };
     // `tmux_pane` is filled from `$TMUX_PANE` inside `Resource::new`; the
     // transcript path rides in from the payload so a pane→session query also
     // yields the exact session file.
     let resource = Resource::new(&parsed.session_id, adapter.name(), &parsed.cwd)
         .with_transcript_path(parsed.transcript_path.as_deref().unwrap_or_default());
 
-    let spans = apply(&store, &parsed, now_nanos())?;
-
-    // One durable envelope per hook avoids repeated resource JSON and SQLite
-    // writes for inferred parents, markers and completed spans from one event.
-    if !spans.is_empty() {
-        let req = OtlpRequest::single(&resource, spans);
-        store.outbox_enqueue(&serde_json::to_string(&req)?)?;
+    let capturing = prepared_raw.is_some();
+    let result = store.transaction::<_, anyhow::Error>(|store| {
+        enqueue_event(store, &cfg, &parsed, &resource, prepared_raw)
+    });
+    if capturing && result.is_err() {
+        // The ciphertext transaction has rolled back every lifecycle write and
+        // ref. An oversized payload or expired policy must not lose telemetry.
+        tracing::warn!("encrypted raw capture unavailable; preserving length-only telemetry");
+        store.transaction::<_, anyhow::Error>(|store| {
+            enqueue_event(store, &cfg, &metadata_parsed, &resource, None)
+        })?;
+    } else {
+        result?;
     }
 
     // Reap provisional spans after crashes, older harness releases or missing
@@ -93,6 +101,40 @@ fn process(harness: HarnessKind) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn enqueue_event(
+    store: &Store,
+    cfg: &Config,
+    parsed: &Parsed,
+    resource: &Resource,
+    prepared_raw: Option<local_raw::PreparedRaw>,
+) -> anyhow::Result<()> {
+    let spans = apply(store, parsed, now_nanos())?;
+    if let Some(prepared_raw) = prepared_raw {
+        store.raw_object_put(&prepared_raw.seal_for_spans(store, &spans)?)?;
+    }
+    // One durable envelope per hook commits with ciphertext and lifecycle state.
+    if !spans.is_empty() {
+        let mut req = OtlpRequest::single(resource, spans);
+        for (key, value) in [
+            ("gently.tenant_id", &cfg.tenant_id),
+            ("gently.device_id", &cfg.device_id),
+        ] {
+            req.resource_spans[0]
+                .resource
+                .attributes
+                .push(gently_core::otlp::KeyValue {
+                    key: key.into(),
+                    value: gently_core::otlp::AnyValue {
+                        string_value: Some(value.clone()),
+                        int_value: None,
+                    },
+                });
+        }
+        store.outbox_enqueue(&serde_json::to_string(&req)?)?;
+    }
+    Ok(())
+}
+
 /// Terminal events flush the exporter unconditionally so the last spans always
 /// ship. Codex interrupts close a turn without claiming success or failure.
 fn is_terminal_event(harness: HarnessKind, event: &str) -> bool {
@@ -107,37 +149,6 @@ fn now_nanos() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
-}
-
-/// Append a payload only when both content retention and debug capture are
-/// explicitly enabled. Never inspect or persist the process environment.
-fn capture_raw(cfg: &Config, harness: HarnessKind, value: &serde_json::Value, raw: &str) {
-    let hname = match harness {
-        HarnessKind::Claude => "claude",
-        HarnessKind::Codex => "codex",
-    };
-    let event = value
-        .get("hook_event_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let dir = cfg.state_dir.join("raw").join(hname);
-    if gently_store::private_fs::ensure_private_dir(&cfg.state_dir.join("raw")).is_err()
-        || gently_store::private_fs::ensure_private_dir(&dir).is_err()
-    {
-        return;
-    }
-    // Hook event names are input; prevent them from escaping the raw directory.
-    if !event
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    {
-        return;
-    }
-    if let Ok(mut f) =
-        gently_store::private_fs::open_private_file(&dir.join(format!("{event}.jsonl")), true)
-    {
-        let _ = writeln!(f, "{}", raw.trim());
-    }
 }
 
 /// Spawn the detached exporter, unless throttled.
@@ -166,7 +177,7 @@ fn maybe_spawn_export(cfg: &Config, force: bool) {
 fn exporter_running(cfg: &Config) -> bool {
     use fs4::fs_std::FileExt;
     let Ok(file) =
-        gently_store::private_fs::open_private_file(&cfg.state_dir.join("export.lock"), false)
+        gently_store::private_fs::open_private_file(&cfg.runtime_dir().join("export.lock"), false)
     else {
         return false; // can't tell → don't suppress the spawn
     };

@@ -29,23 +29,22 @@ class LauncherTests(unittest.TestCase):
         self.home = self.root / "home"
         self.home.mkdir()
         self.env = {"HOME": str(self.home), "PATH": f"{self.bin}:/usr/bin:/bin",
-                    "FIXTURE_DIR": str(self.root), "WRANGLER_WRITE_LOGS": "true"}
-        self.executable("agent-secrets", 'import os, sys\nfrom pathlib import Path\n'
-            'assert sys.argv[1:4] == ["run", "default", "--"]\n'
-            'Path(os.environ["FIXTURE_DIR"], "unlocked").touch()\n'
-            'os.environ["GENTLY_TOKEN"] = "synthetic-fixture-only"\n'
-            'os.execv(sys.argv[4], sys.argv[4:])\n')
+                    "FIXTURE_DIR": str(self.root), "WRANGLER_WRITE_LOGS": "true",
+                    "GENTLY_TOKEN": "synthetic-fixture-only",
+                    "GENTLY_TENANT_ID": "personal", "GENTLY_DEVICE_ID": "fixture-host"}
         self.executable("gently", 'import os, sys, time\nfrom pathlib import Path\n'
             'assert sys.argv[1:] == ["export", "--watch"]\n'
             'assert os.environ.get("GENTLY_TOKEN") == "synthetic-fixture-only"\n'
             'assert os.environ["GENTLY_COLLECTOR_URL"] == "http://127.0.0.1:8787"\n'
             'Path(os.environ["FIXTURE_DIR"], "watch.pid").write_text(str(os.getpid()))\n'
             'time.sleep(60)\n')
-        self.executable("node", 'import os, sys, time\nfrom pathlib import Path\n'
+        self.executable("node", 'import json, os, sys, time\nfrom pathlib import Path\n'
             'assert os.environ["WRANGLER_WRITE_LOGS"] == "false"\n'
             'assert os.environ["WRANGLER_SEND_METRICS"] == "false"\n'
             'assert os.environ["WRANGLER_LOG"] == "log"\n'
-            'assert os.environ.get("GENTLY_TOKEN") == "synthetic-fixture-only"\n'
+            'assert "GENTLY_TOKEN" not in os.environ\n'
+            'hosts = json.loads(os.environ["GENTLY_HOSTS"])\n'
+            'assert hosts == [{"token": "synthetic-fixture-only", "tenant_id": "personal", "device_id": "fixture-host", "capabilities": ["ingest", "read"]}]\n'
             'assert Path.cwd().resolve() == Path(sys.argv[1]).parents[3].resolve()\n'
             'assert sys.argv[2:4] == ["dev", "--config"]\n'
             'assert sys.argv[5:] == ["--local", "--ip", "127.0.0.1", "--port", "8787", "--env-file", "/dev/null"]\n'
@@ -97,17 +96,26 @@ class LauncherTests(unittest.TestCase):
         self.assertIn("Install collector dependencies", result.stderr)
         self.assertFalse((self.root / "unlocked").exists())
 
-    def test_missing_helper_is_actionable(self):
-        (self.bin / "agent-secrets").unlink()
+    def test_missing_token_is_provider_neutral(self):
+        self.env.pop("GENTLY_TOKEN")
         result = self.launch(self.repo / "scripts/collector-local", 1)
-        self.assertIn("Install the agent-secrets helper", result.stderr)
+        self.assertIn("GENTLY_TOKEN", result.stderr)
+        self.assertNotIn("agent-secrets", result.stderr)
+        self.assertFalse((self.root / "watch.pid").exists())
 
-    def test_attach_launcher_unlocks_only_exporter(self):
+    def test_preflight_checks_dependencies_without_credentials_or_services(self):
+        self.env.pop("GENTLY_TOKEN")
+        result = subprocess.run([str(self.repo / "scripts/collector-local"), "--check"],
+            cwd=self.root, env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.root / "watch.pid").exists())
+        self.assertFalse((self.root / "collector.pid").exists())
+
+    def test_attach_launcher_runs_only_exporter(self):
         self.executable("gently", 'import os, sys\n'
             'assert sys.argv[1:] == ["export", "--watch"]\n'
             'assert os.environ.get("GENTLY_TOKEN") == "synthetic-fixture-only"\n')
         self.launch(self.repo / "scripts/export-local")
-        self.assertTrue((self.root / "unlocked").exists())
         self.assertFalse((self.root / "collector.pid").exists())
 
 

@@ -1,10 +1,10 @@
-# Local collector only. The bearer token is inherited from agent-secrets.
+# Local collector only. Host authorization is supplied by the launch environment.
 name = "gently-collector-local"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
 
 [secrets]
-required = ["GENTLY_TOKEN"]
+required = ["GENTLY_HOSTS"]
 
 [[d1_databases]]
 binding = "DB"

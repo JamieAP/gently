@@ -1,11 +1,9 @@
 //! Configuration resolution: `~/.gently/config.toml` overlaid by environment.
 //!
-//! Two essentials - `collector_url` + `token` - point at the collector (a
-//! Cloudflare Worker backed by D1, or a local `wrangler dev`); both the exporter
-//! and the query/MCP paths use them. The rest are operational tunables with sane
-//! defaults, so a minimal config (just url + token) Just Works. The hook path
-//! needs only `state_dir`, so its requirements are validated lazily
-//! ([`Config::require_collector`]) and a hook never fails for lack of a collector.
+//! Collector location and tenant/device preferences live in config.toml.
+//! Authentication is inherited through GENTLY_TOKEN from a secret provider;
+//! configuration never serializes that credential. The hook remains usable
+//! offline and captures metadata without a collector token.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -19,11 +17,11 @@ const DEFAULT_EXPORT_TIMEOUT_SECS: u64 = 15;
 const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 30;
 
 /// Resolved runtime configuration.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     /// Collector base URL (the Worker; `/v1/traces` and `/v1/query` are appended).
     pub collector_url: String,
-    /// Shared bearer token for the collector.
+    /// Inherited per-host bearer token for the collector.
     pub token: String,
     /// Local state directory (outbox db, logs, raw captures).
     pub state_dir: PathBuf,
@@ -39,20 +37,33 @@ pub struct Config {
     pub query_timeout_secs: u64,
     /// Retain full prompt/tool values locally; disabled unless explicitly enabled.
     pub capture_raw_values: bool,
+    pub tenant_id: String,
+    pub device_id: String,
+    pub sync_raw_values: bool,
+    pub resolve_raw_values: bool,
+    pub raw_manifest: Option<PathBuf>,
+    pub raw_trust: Option<PathBuf>,
+    pub raw_identity: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileConfig {
     #[serde(default)]
     collector_url: String,
-    #[serde(default)]
-    token: String,
     prefer_quic: Option<bool>,
     outbox_cap: Option<usize>,
     export_batch: Option<usize>,
     export_timeout_secs: Option<u64>,
     query_timeout_secs: Option<u64>,
     capture_raw_values: Option<bool>,
+    tenant_id: Option<String>,
+    device_id: Option<String>,
+    sync_raw_values: Option<bool>,
+    resolve_raw_values: Option<bool>,
+    raw_manifest: Option<PathBuf>,
+    raw_trust: Option<PathBuf>,
+    raw_identity: Option<PathBuf>,
 }
 
 impl Config {
@@ -72,23 +83,32 @@ impl Config {
             gently_store::private_fs::harden_existing_file(&path)?;
             match std::fs::read_to_string(&path) {
                 Ok(s) => {
-                    toml::from_str(&s).with_context(|| format!("parsing {}", path.display()))?
+                    toml::from_str(&s).map_err(|_| anyhow::anyhow!("invalid configuration; check documented fields and values (credentials must be inherited)"))?
                 }
-                Err(_) => FileConfig::default(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => FileConfig::default(),
+                Err(_) => anyhow::bail!("cannot read Gently configuration"),
             }
         };
 
-        let capture_raw_values = match std::env::var("GENTLY_CAPTURE_RAW_VALUES").as_deref() {
-            Ok("1" | "true") => true,
-            Ok("0" | "false") => false,
-            Ok(_) => anyhow::bail!("GENTLY_CAPTURE_RAW_VALUES must be 1, 0, true or false"),
-            Err(_) => file.capture_raw_values.unwrap_or(false),
-        };
+        let capture_raw_values = env_bool("GENTLY_CAPTURE_RAW_VALUES", file.capture_raw_values)?;
         Ok(Self {
             collector_url: env_or("GENTLY_COLLECTOR_URL", file.collector_url),
-            token: env_or("GENTLY_TOKEN", file.token),
+            token: std::env::var("GENTLY_TOKEN").unwrap_or_default(),
             state_dir,
             capture_raw_values,
+            tenant_id: env_or(
+                "GENTLY_TENANT_ID",
+                file.tenant_id.unwrap_or_else(|| "personal".into()),
+            ),
+            device_id: env_or(
+                "GENTLY_DEVICE_ID",
+                file.device_id.unwrap_or_else(|| "local".into()),
+            ),
+            sync_raw_values: env_bool("GENTLY_SYNC_RAW_VALUES", file.sync_raw_values)?,
+            resolve_raw_values: env_bool("GENTLY_RESOLVE_RAW_VALUES", file.resolve_raw_values)?,
+            raw_manifest: env_path("GENTLY_RAW_MANIFEST", file.raw_manifest),
+            raw_trust: env_path("GENTLY_RAW_TRUST", file.raw_trust),
+            raw_identity: env_path("GENTLY_RAW_IDENTITY", file.raw_identity),
             prefer_quic: file.prefer_quic.unwrap_or(DEFAULT_PREFER_QUIC),
             outbox_cap: file.outbox_cap.unwrap_or(gently_store::OUTBOX_CAP),
             export_batch: file.export_batch.unwrap_or(DEFAULT_EXPORT_BATCH),
@@ -106,13 +126,31 @@ impl Config {
 
     /// Path to the local state database.
     pub fn state_db(&self) -> PathBuf {
-        self.state_dir.join("state.db")
+        self.runtime_dir().join("state.db")
+    }
+
+    pub fn runtime_dir(&self) -> PathBuf {
+        self.state_dir
+            .join("tenants")
+            .join(&self.tenant_id)
+            .join("devices")
+            .join(&self.device_id)
     }
 
     /// Ensure the state directory exists.
     pub fn ensure_state_dir(&self) -> Result<()> {
+        anyhow::ensure!(
+            valid_id(&self.tenant_id) && valid_id(&self.device_id),
+            "invalid tenant or device identifier"
+        );
         gently_store::private_fs::ensure_private_dir(&self.state_dir)
             .with_context(|| format!("creating {}", self.state_dir.display()))?;
+        let tenants = self.state_dir.join("tenants");
+        let tenant = tenants.join(&self.tenant_id);
+        let devices = tenant.join("devices");
+        for path in [&tenants, &tenant, &devices, &self.runtime_dir()] {
+            gently_store::private_fs::ensure_private_dir(path)?;
+        }
         Ok(())
     }
 
@@ -124,10 +162,48 @@ impl Config {
         );
         anyhow::ensure!(
             !self.token.is_empty(),
-            "token is not configured (inherit GENTLY_TOKEN from agent-secrets)"
+            "token is not configured (supply GENTLY_TOKEN through your secret provider)"
         );
+        anyhow::ensure!(
+            valid_id(&self.tenant_id) && valid_id(&self.device_id),
+            "tenant_id and device_id must be 1–64 ASCII letters, digits, underscores or hyphens"
+        );
+        let url = reqwest::Url::parse(&self.collector_url)
+            .map_err(|_| anyhow::anyhow!("invalid collector URL"))?;
+        let loopback = url.host_str().is_some_and(|host| {
+            host == "localhost"
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        });
+        anyhow::ensure!((url.scheme() == "https" || (url.scheme() == "http" && loopback)) && url.host_str().is_some() && url.username().is_empty() && url.password().is_none() && url.query().is_none() && url.fragment().is_none(), "collector URL must use HTTPS or loopback HTTP and contain no credentials, query or fragment");
         Ok(())
     }
+}
+
+fn valid_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+fn env_bool(key: &str, fallback: Option<bool>) -> Result<bool> {
+    match std::env::var(key).as_deref() {
+        Ok("1" | "true") => Ok(true),
+        Ok("0" | "false") => Ok(false),
+        Ok(_) => anyhow::bail!("{key} must be 1, 0, true or false"),
+        Err(_) => Ok(fallback.unwrap_or(false)),
+    }
+}
+
+fn env_path(key: &str, fallback: Option<PathBuf>) -> Option<PathBuf> {
+    std::env::var_os(key)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or(fallback)
 }
 
 fn env_or(key: &str, fallback: String) -> String {
@@ -147,11 +223,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn persisted_collector_tokens_are_rejected() {
+        assert!(toml::from_str::<FileConfig>("token = 'synthetic-fixture'").is_err());
+    }
+
+    #[test]
     fn defaults_apply_when_unset() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("config.toml"),
-            "collector_url = \"https://x.workers.dev\"\ntoken = \"t\"\n",
+            "collector_url = \"https://x.workers.dev\"\n",
         )
         .unwrap();
         // GENTLY_STATE_DIR is process-global; set it just for this resolution.
@@ -162,6 +243,8 @@ mod tests {
         assert_eq!(cfg.collector_url, "https://x.workers.dev");
         assert!(cfg.prefer_quic);
         assert!(!cfg.capture_raw_values);
+        assert!(!cfg.sync_raw_values);
+        assert!(!cfg.resolve_raw_values);
         assert_eq!(cfg.outbox_cap, gently_store::OUTBOX_CAP);
         assert_eq!(cfg.export_batch, DEFAULT_EXPORT_BATCH);
         assert_eq!(cfg.export_timeout_secs, DEFAULT_EXPORT_TIMEOUT_SECS);

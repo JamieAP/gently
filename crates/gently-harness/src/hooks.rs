@@ -1,12 +1,11 @@
 //! Leaf helpers shared by the stdin-JSON hook adapters (Claude Code, Codex).
 //!
 //! Codex's hook protocol is a near-clone of Claude's - same stdin-JSON shape and
-//! field names - so field extraction, content digesting, the common attribute
+//! field names - so field extraction, content length recording, the common attribute
 //! set, and the unknown-event marker are identical and live here. The per-harness
 //! event vocabularies differ, so each adapter keeps its own `parse` match.
 
 use crate::Attrs;
-use sha2::{Digest, Sha256};
 
 /// Attributes present on every hook event: the event name plus optional model,
 /// session source, permission mode and agent type when the payload carries them.
@@ -35,7 +34,7 @@ pub(crate) fn common_attrs(raw: &serde_json::Value, event: &str) -> Attrs {
         attrs.push(("gently.effort".into(), level.to_string()));
     }
     // Other events may use freeform reasons containing command or user text.
-    // Preserve only known lifecycle enums; hash arbitrary text.
+    // Preserve only known lifecycle enums; measure arbitrary text.
     if let Some(reason) = str_field(raw, "reason") {
         if event == "SessionEnd"
             && matches!(
@@ -51,7 +50,7 @@ pub(crate) fn common_attrs(raw: &serde_json::Value, event: &str) -> Attrs {
         {
             attrs.push(("gently.reason".into(), reason));
         } else {
-            push_digest(&mut attrs, "gently.reason", reason.as_bytes());
+            push_length(&mut attrs, "gently.reason", reason.as_bytes());
         }
     }
     // SubagentStop carries `agent_transcript_path` - the path to the subagent's
@@ -65,7 +64,7 @@ pub(crate) fn common_attrs(raw: &serde_json::Value, event: &str) -> Attrs {
     if let Some(at) = str_field(raw, "agent_type") {
         attrs.push(("gently.agent_type".into(), at));
     }
-    push_first_str_digest(
+    push_first_str_length(
         &mut attrs,
         "gently.assistant",
         raw,
@@ -82,14 +81,14 @@ pub(crate) fn u64_field(raw: &serde_json::Value, key: &str) -> Option<u64> {
     raw.get(key).and_then(serde_json::Value::as_u64)
 }
 
-/// Append a `<key>.sha256` (first 16 hex chars) and `<key>.bytes` attribute for
-/// an arbitrary JSON value, never the value itself.
-pub(crate) fn push_value_digest(attrs: &mut Attrs, key: &str, value: &serde_json::Value) {
+/// Append a `<key>.bytes` attribute for an arbitrary JSON value.
+/// Content fingerprints permit guesses and are never recorded.
+pub(crate) fn push_value_length(attrs: &mut Attrs, key: &str, value: &serde_json::Value) {
     let bytes = serde_json::to_vec(value).unwrap_or_default();
-    push_digest(attrs, key, &bytes);
+    push_length(attrs, key, &bytes);
 }
 
-pub(crate) fn push_first_str_digest(
+pub(crate) fn push_first_str_length(
     attrs: &mut Attrs,
     key: &str,
     raw: &serde_json::Value,
@@ -97,17 +96,14 @@ pub(crate) fn push_first_str_digest(
 ) -> bool {
     for field in fields {
         if let Some(value) = str_field(raw, field) {
-            push_digest(attrs, key, value.as_bytes());
+            push_length(attrs, key, value.as_bytes());
             return true;
         }
     }
     false
 }
 
-pub(crate) fn push_digest(attrs: &mut Attrs, key: &str, bytes: &[u8]) {
-    let digest = Sha256::digest(bytes);
-    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
-    attrs.push((format!("{key}.sha256"), hex));
+pub(crate) fn push_length(attrs: &mut Attrs, key: &str, bytes: &[u8]) {
     attrs.push((format!("{key}.bytes"), bytes.len().to_string()));
 }
 
@@ -115,12 +111,12 @@ pub(crate) fn push_digest(attrs: &mut Attrs, key: &str, bytes: &[u8]) {
 mod tests {
     use super::*;
     #[test]
-    fn freeform_permission_reason_is_digested() {
+    fn freeform_permission_reason_has_only_a_length() {
         let attrs = common_attrs(
             &serde_json::json!({"reason":"secret command content"}),
             "PermissionDenied",
         );
-        assert!(attrs.iter().any(|(k, _)| k == "gently.reason.sha256"));
+        assert!(attrs.iter().any(|(k, _)| k == "gently.reason.bytes"));
         assert!(!attrs
             .iter()
             .any(|(_, v)| v.contains("secret command content")));

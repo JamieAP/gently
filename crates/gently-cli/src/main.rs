@@ -6,7 +6,9 @@ mod cmd_hook;
 mod cmd_init;
 mod cmd_mcp;
 mod cmd_query;
+mod cmd_raw;
 mod cmd_status;
+mod collector;
 mod config;
 mod local_raw;
 mod logging;
@@ -51,6 +53,11 @@ enum Command {
         #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=60))]
         interval_secs: u64,
     },
+    /// Manage encrypted raw-value reader enrollment and public trust policy.
+    Raw {
+        #[command(subcommand)]
+        command: cmd_raw::RawCommand,
+    },
     /// Show local exporter health and queue depth.
     Status,
     /// Run the MCP stdio server exposing trace queries.
@@ -63,9 +70,9 @@ enum Command {
         /// Install into Codex (`~/.codex/config.toml`).
         #[arg(long, default_value_t = false)]
         codex: bool,
-        /// Allow MCP queries to return locally stored raw prompt/tool values.
+        /// Allow MCP queries to decrypt raw prompt/tool values on this reader.
         #[arg(long, default_value_t = false)]
-        resolve_local_raw_values: bool,
+        resolve_raw_values: bool,
     },
     /// List recent traces.
     Traces {
@@ -166,17 +173,18 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
                 cmd_export::run()
             }
         }
+        Command::Raw { command } => cmd_raw::run(command),
         Command::Status => cmd_status::run(),
         Command::Mcp => cmd_mcp::run(),
         Command::Init {
             claude: _,
             codex,
-            resolve_local_raw_values,
+            resolve_raw_values,
         } => {
             if codex {
-                cmd_init::run_codex(resolve_local_raw_values)
+                cmd_init::run_codex(resolve_raw_values)
             } else {
-                cmd_init::run_claude(resolve_local_raw_values)
+                cmd_init::run_claude(resolve_raw_values)
             }
         }
         Command::Traces {

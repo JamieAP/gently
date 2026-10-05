@@ -17,3 +17,6 @@ docs/_book/
 *.db-journal
 /raw/
 /state/
+
+# Python launcher test caches
+__pycache__/

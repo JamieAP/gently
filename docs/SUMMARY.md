@@ -18,6 +18,7 @@
 ## Guides
 
 * [Querying and MCP](guides/querying-and-mcp.md)
+* [Encrypted raw values](guides/encrypted-raw-values.md)
 * [Troubleshooting](guides/troubleshooting.md)
 
 ## Reference

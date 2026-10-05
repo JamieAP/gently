@@ -166,7 +166,7 @@ available attribute names.
 ### Local `jq` filters
 
 The `jq` argument is evaluated by the embedded Rust `jaq` implementation after
-the response is fetched and after optional local raw-value resolution. It is
+the response is fetched and after optional reader-side raw-value resolution. It is
 never sent to the Worker and does not reduce the collector query's row limit.
 It needs no installed `jq` executable and is not a shell command. Environment
 access through `env` is unavailable; full compatibility with every standalone
@@ -179,20 +179,29 @@ compile, or execution errors return a tool-call error.
 
 ## Raw values
 
-Normal Gently exports use content digests and byte lengths, while still exposing
-metadata such as paths and host information. Raw capture is disabled by default.
-Selected raw values can be stored locally by enabling `capture_raw_values = true`
-or `GENTLY_CAPTURE_RAW_VALUES=1` on the hook process. This storage is plaintext
-and has no automatic retention limit.
+Normal exports contain metadata and byte lengths, with optional random
+`.raw_ref` pointers. Capture, ciphertext cloud sync and reader resolution are
+separate opt-ins, disabled by default. No public raw-content hashes are emitted.
 
-Resolution is a separate opt-in. Set `GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES=1` on
-a CLI query process, or install MCP with `--resolve-local-raw-values`, to add
-matching locally stored values to returned span attributes. It does not fetch
-raw content from the Worker, enable capture, or reconstruct values absent from
-the local store. Resolution matches truncated digest keys; it is not proof of
-content identity.
+Follow [encrypted raw enrollment](encrypted-raw-values.md) before enabling
+`capture_raw_values` on hooks. Capture uses only signed, locally pinned public
+recipient policy. Exporters can sync ciphertext without a reader identity.
 
-Reinstalling without the flag removes the MCP registration's resolution opt-in.
-Disabling capture does not delete values already stored. Resolved MCP output may
-enter the calling agent's model-provider context. Read
-[security and privacy](../concepts/security-and-privacy.md) before opting in.
+An enrolled reader sets `resolve_raw_values = true` or
+`GENTLY_RESOLVE_RAW_VALUES=1` and `raw_identity`/`GENTLY_RAW_IDENTITY`. It uses
+local ciphertext first, fetching absent objects through the tenant-authorized
+collector when necessary. Resolution explicitly unlocks the identity, verifies
+encrypted context and field-to-span bindings, and adds raw attributes only to
+the in-memory result. It does not enable capture or cloud sync.
+
+Software identities need an attached private terminal for passphrase entry.
+A GUI MCP process without a terminal cannot unlock one; start its reader process
+interactively or use an enrolled Mac hardware reader. No passphrase environment
+variable or background unlock broker is provided.
+
+Install MCP with `--resolve-raw-values` to set its registration opt-in.
+Reinstalling without that flag removes the registration setting; independent
+configuration/environment settings can still enable it. Decrypted output can
+enter the calling agent's model-provider context. Retained ciphertext remains
+after capture is disabled, and new readers cannot automatically decrypt older
+objects. See [security and privacy](../concepts/security-and-privacy.md).

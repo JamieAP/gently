@@ -9,7 +9,7 @@ Use `gently --help` or `gently <command> --help` for command syntax;
 | Command | Collector URL and token required? |
 | --- | --- |
 | `hook` | No. Events queue locally without credentials. |
-| `init`, `status` | No. These use local configuration and files. |
+| `init`, `status`, `raw` | No. These use local configuration and files. |
 | `waterfall` | No. Reads stdin without loading configuration or local state. |
 | `export`, `traces`, `trace`, `spans`, `stats`, `whoami`, `mcp` | Yes. |
 
@@ -41,11 +41,35 @@ collector URL. It preserves an existing config and avoids duplicate hook
 commands. Restart the agent after installation. Codex hooks must be trusted
 inside Codex through `/hooks` before they fire.
 
-`--resolve-local-raw-values` opts the installed MCP server into returning
-previously captured local prompt, tool, or assistant values. Running init again
+`--resolve-raw-values` opts the installed MCP server into returning
+decrypted, referenced prompt, tool or assistant values. Running init again
 without that flag removes the installed resolution setting. This flag does not
 enable capture. Read [raw values](../guides/querying-and-mcp.md#raw-values)
 before enabling it.
+
+## `gently raw`
+
+Manage encrypted reader identities and signed public enrollment:
+
+```text
+gently raw identity --out PATH
+gently raw owner-key --recipient AGE_PUBLIC_RECIPIENT [--recipient AGE_PUBLIC_RECOVERY_RECIPIENT] --out PATH
+gently raw sign --manifest UNSIGNED_JSON --owner-key OWNER_AGE --identity READER_IDENTITY --out SIGNED_JSON
+gently raw trust --manifest SIGNED_JSON --owner-public OWNER_PUBLIC_KEY_BASE64 --out TRUST_JSON
+```
+
+`identity` obtains a passphrase through a private terminal prompt, writes an
+encrypted software identity and prints its public recipient. `owner-key`
+encrypts a new signing key to approved public recipients and prints the public
+verification key. `sign` explicitly unlocks a reader to access the encrypted
+owner key. `trust` verifies policy against an independently checked public
+owner root and refuses root replacement, minimum-epoch rollback or a different
+manifest at the pinned epoch. Software reading and signing require an attached
+private terminal for passphrase entry. Commands
+never print private keys or passphrases. Software keys are not hardware bound.
+
+See [device enrollment](../guides/encrypted-raw-values.md) for setup, native Mac
+readers, recovery and the separate capture/sync/resolution opt-ins.
 
 ## `gently hook`
 
@@ -69,11 +93,13 @@ gently export
 gently export --watch --interval-secs 2
 ```
 
-Without `--watch`, drain the queued envelopes and exit. Watch mode continues
+Without `--watch`, drain the queued envelopes and exit. With
+`sync_raw_values` enabled, also upload retained ciphertext; no reader key is
+needed. Watch mode continues
 polling for new events. `--interval-secs` defaults to `2` and accepts `1` through
 `60`; it controls watch polling, not request timeout. Stop the watcher with Ctrl+C.
 
-A lock permits one exporter per state directory. A one-shot export exits
+A lock permits one exporter per tenant/device runtime directory. A one-shot export exits
 successfully if the lock is already held; a second watcher returns an error.
 The process needs an available collector token and never unlocks a secret store
 itself. A foreground launcher can unlock once and pass the token to the watcher,
@@ -187,7 +213,7 @@ gently whoami --pane '%42' --json
 
 Find the newest captured span whose `gently.tmux_pane` resource attribute
 matches the pane. This is a collector query, not a local process or tmux lookup.
-It searches the most recent 1,000 spans across the collector, so a stale match
+It searches the most recent 1,000 spans in the configured tenant, so a stale match
 can remain and an older match can fall outside the search window.
 
 Default output is just the matching session ID, or nothing when no session ID

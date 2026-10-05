@@ -10,7 +10,8 @@ problem, the intended behavior and how to verify the change.
 | `crates/gently-cli` | CLI commands, installation, queries, MCP and waterfall rendering. |
 | `crates/gently-harness` | Claude Code and Codex hook adapters. |
 | `crates/gently-core` | Span/envelope types and identifiers. |
-| `crates/gently-store` | Local SQLite state, outbox, raw values and file permissions. |
+| `crates/gently-store` | Local SQLite state, outbox, immutable ciphertext and file permissions. |
+| `crates/gently-raw` | Age encryption, signed recipient policy, reader identities and contextual binding. |
 | `crates/gently-export` | Export transports, delivery and retry behavior. |
 | `worker` | Cloudflare Worker, D1 schema and query API. |
 | `scripts` | Local collector/export launchers and their tests. |
@@ -34,6 +35,7 @@ For Worker changes:
 cd worker
 npm ci
 npm test
+npm run typecheck
 cd ..
 ```
 
@@ -68,8 +70,10 @@ See [Security and privacy](docs/concepts/security-and-privacy.md).
 Keep unrelated formatting, dependency and runtime changes separate. If a hook
 mapping changes, update its fixture and [reference](docs/reference/hooks.md).
 If a CLI or query interface changes, update help, examples and the relevant
-reference. Preserve digest-only defaults and separate raw-capture/resolution
-opt-ins.
+reference. Preserve metadata-only defaults, separate encrypted capture/sync/
+resolution opt-ins, tenant/device boundaries and keyless capture/export. Never
+use real private keys or credentials in tests. Pre-public schema changes require
+explicit reset of disposable state; do not add plaintext migration paths.
 
 ## License
 

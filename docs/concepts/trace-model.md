@@ -111,7 +111,7 @@ an `ok` status proves the task's result is correct.
 
 Resources include the harness, session ID, working directory, transcript path,
 host, operating system and Gently version. Span attributes include event/tool
-IDs, context and model metadata when supplied, plus digests and byte lengths
+IDs, context and model metadata when supplied, plus opaque references and byte lengths
 for selected content fields. These fields can identify projects and activity.
 See [Security and privacy](security-and-privacy.md) for exported data, local raw
 capture and query resolution.

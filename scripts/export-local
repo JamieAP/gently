@@ -3,11 +3,21 @@
 set -eu
 gently_bin=$(command -v gently || true)
 if [ -z "$gently_bin" ]; then gently_bin=$HOME/.cargo/bin/gently; fi
-secret_helper=$(command -v agent-secrets || true)
-if [ -z "$secret_helper" ]; then secret_helper=$HOME/.local/bin/agent-secrets; fi
-if [ ! -x "$gently_bin" ] || [ ! -x "$secret_helper" ]; then
-  printf '%s\n' 'Install gently and agent-secrets before starting the exporter.' >&2
+if [ ! -x "$gently_bin" ]; then
+  printf '%s\n' 'Install gently before starting the exporter.' >&2
+  exit 1
+fi
+case ${1-} in
+  '') ;;
+  --check) [ "$#" -eq 1 ] && exit 0 ;;
+  *) printf '%s\n' 'Usage: export-local [--check]' >&2; exit 2 ;;
+esac
+[ "$#" -eq 0 ] || { printf '%s\n' 'Usage: export-local [--check]' >&2; exit 2; }
+if [ -z "${GENTLY_TOKEN-}" ]; then
+  printf '%s\n' 'Supply GENTLY_TOKEN through your secret provider before starting the exporter.' >&2
   exit 1
 fi
 export GENTLY_COLLECTOR_URL=http://127.0.0.1:8787
-exec "$secret_helper" run default -- "$gently_bin" export --watch
+export GENTLY_TENANT_ID=${GENTLY_TENANT_ID:-personal}
+export GENTLY_DEVICE_ID=${GENTLY_DEVICE_ID:-local}
+exec "$gently_bin" export --watch

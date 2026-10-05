@@ -5,7 +5,7 @@
     "target": "ES2022",
     "lib": ["ES2022"],
     "moduleResolution": "bundler",
-    "types": ["@cloudflare/workers-types"],
+    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-pool-workers", "vite/client"],
     "skipLibCheck": true,
     "isolatedModules": true,
     "verbatimModuleSyntax": true

@@ -36,7 +36,7 @@ fn init_installs_hooks_mcp_and_config_idempotently() {
         serde_json::from_str(&std::fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
     assert_eq!(claude_json["mcpServers"]["gently"]["args"][0], "mcp");
     assert!(
-        claude_json["mcpServers"]["gently"]["env"]["GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES"].is_null(),
+        claude_json["mcpServers"]["gently"]["env"]["GENTLY_RESOLVE_RAW_VALUES"].is_null(),
         "ordinary installation must not expose raw prompt/tool values over MCP"
     );
 
@@ -59,7 +59,7 @@ fn raw_mcp_resolution_requires_an_explicit_install_option() {
     let dir = tempfile::tempdir().unwrap();
     Command::cargo_bin("gently")
         .unwrap()
-        .args(["init", "--claude", "--resolve-local-raw-values"])
+        .args(["init", "--claude", "--resolve-raw-values"])
         .env("HOME", dir.path())
         .env("GENTLY_STATE_DIR", dir.path().join(".gently"))
         .assert()
@@ -68,14 +68,14 @@ fn raw_mcp_resolution_requires_an_explicit_install_option() {
         serde_json::from_str(&std::fs::read_to_string(dir.path().join(".claude.json")).unwrap())
             .unwrap();
     assert_eq!(
-        config["mcpServers"]["gently"]["env"]["GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES"],
+        config["mcpServers"]["gently"]["env"]["GENTLY_RESOLVE_RAW_VALUES"],
         "1"
     );
     init(dir.path());
     let config: Value =
         serde_json::from_str(&std::fs::read_to_string(dir.path().join(".claude.json")).unwrap())
             .unwrap();
-    assert!(config["mcpServers"]["gently"]["env"]["GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES"].is_null());
+    assert!(config["mcpServers"]["gently"]["env"]["GENTLY_RESOLVE_RAW_VALUES"].is_null());
 }
 
 #[cfg(unix)]
@@ -87,7 +87,7 @@ fn installation_protects_existing_state_and_config_files() {
     std::fs::create_dir(&state).unwrap();
     std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
     let config = state.join("config.toml");
-    std::fs::write(&config, "token = 'fixture-token'\n").unwrap();
+    std::fs::write(&config, "tenant_id = 'personal'\n").unwrap();
     std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
     init(dir.path());
     assert_eq!(
@@ -115,7 +115,7 @@ fn codex_install_raw_resolution_is_explicit_and_reversible() {
         let mut command = Command::cargo_bin("gently").unwrap();
         command.args(["init", "--codex"]);
         if resolve {
-            command.arg("--resolve-local-raw-values");
+            command.arg("--resolve-raw-values");
         }
         command
             .env("HOME", dir.path())
@@ -129,7 +129,7 @@ fn codex_install_raw_resolution_is_explicit_and_reversible() {
     assert!(initial["mcp_servers"]["gently"].get("env").is_none());
     let opted_in = run(true);
     assert_eq!(
-        opted_in["mcp_servers"]["gently"]["env"]["GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES"].as_str(),
+        opted_in["mcp_servers"]["gently"]["env"]["GENTLY_RESOLVE_RAW_VALUES"].as_str(),
         Some("1")
     );
     let reset = run(false);
@@ -345,7 +345,7 @@ fn init_never_rewrites_existing_gently_config() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join(".gently")).unwrap();
     let path = dir.path().join(".gently/config.toml");
-    let original = "# user preferences\ncollector_url = 'http://127.0.0.1:8787'\ntoken = 'synthetic-legacy-token'\nprefer_quic = false\n";
+    let original = "# user preferences\ncollector_url = 'http://127.0.0.1:8787'\ntenant_id = 'personal'\nprefer_quic = false\n";
     std::fs::write(&path, original).unwrap();
     run_init(dir.path(), "--claude");
     run_init(dir.path(), "--codex");
@@ -420,44 +420,11 @@ fn hook_command_quotes_shell_metacharacters_in_binary_path() {
             output.stdout.is_empty(),
             "hook must stay advisory with no control output"
         );
-        assert!(home.path().join(".gently/state.db").exists());
+        assert!(home
+            .path()
+            .join(".gently/tenants/personal/devices/local/state.db")
+            .exists());
     }
-}
-
-#[test]
-fn refresh_requotes_legacy_gently_hooks_without_duplicate_handlers() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path();
-    let exe = assert_cmd::cargo::cargo_bin("gently")
-        .to_string_lossy()
-        .to_string();
-    std::fs::create_dir(home.join(".claude")).unwrap();
-    let settings = serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": format!("{exe} hook"), "timeout": 9}]}]}});
-    std::fs::write(home.join(".claude/settings.json"), settings.to_string()).unwrap();
-    std::fs::create_dir(home.join(".codex")).unwrap();
-    let old = format!("[[hooks.PreToolUse]]\nmatcher = 'Bash'\n[[hooks.PreToolUse.hooks]]\ntype = 'command'\ncommand = '{exe} hook --harness codex'\ntimeout = 9\n");
-    std::fs::write(home.join(".codex/config.toml"), old).unwrap();
-    run_init(home, "--claude");
-    run_init(home, "--codex");
-    let settings: Value =
-        serde_json::from_str(&std::fs::read_to_string(home.join(".claude/settings.json")).unwrap())
-            .unwrap();
-    let groups = settings["hooks"]["PreToolUse"].as_array().unwrap();
-    assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0]["hooks"][0]["timeout"], 9);
-    assert!(groups[0]["hooks"][0]["command"]
-        .as_str()
-        .unwrap()
-        .starts_with('\''));
-    let config: toml::Value =
-        toml::from_str(&std::fs::read_to_string(home.join(".codex/config.toml")).unwrap()).unwrap();
-    let groups = config["hooks"]["PreToolUse"].as_array().unwrap();
-    assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0]["hooks"][0]["timeout"].as_integer(), Some(9));
-    assert!(groups[0]["hooks"][0]["command"]
-        .as_str()
-        .unwrap()
-        .starts_with('\''));
 }
 
 #[test]
@@ -467,7 +434,7 @@ fn codex_inline_preferences_keep_user_env_and_clear_only_raw_opt_in() {
     let path = dir.path().join(".codex/config.toml");
     std::fs::write(&path, r#"features = { multi_agent = true }
 [mcp_servers]
-gently = { command = "old-gently", args = ["mcp"], enabled = false, env = { USER_OPTION = "enabled", GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES = "1" } }
+gently = { command = "old-gently", args = ["mcp"], enabled = false, env = { USER_OPTION = "enabled", GENTLY_RESOLVE_RAW_VALUES = "1" } }
 "#).unwrap();
     run_init(dir.path(), "--codex");
     let parse = || toml::from_str::<toml::Value>(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -483,11 +450,11 @@ gently = { command = "old-gently", args = ["mcp"], enabled = false, env = { USER
         Some("enabled")
     );
     assert!(config["mcp_servers"]["gently"]["env"]
-        .get("GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES")
+        .get("GENTLY_RESOLVE_RAW_VALUES")
         .is_none());
     Command::cargo_bin("gently")
         .unwrap()
-        .args(["init", "--codex", "--resolve-local-raw-values"])
+        .args(["init", "--codex", "--resolve-raw-values"])
         .env("HOME", dir.path())
         .env("GENTLY_STATE_DIR", dir.path().join(".gently"))
         .env_remove("GENTLY_TOKEN")
@@ -500,11 +467,11 @@ gently = { command = "old-gently", args = ["mcp"], enabled = false, env = { USER
         Some("enabled")
     );
     assert_eq!(
-        config["mcp_servers"]["gently"]["env"]["GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES"].as_str(),
+        config["mcp_servers"]["gently"]["env"]["GENTLY_RESOLVE_RAW_VALUES"].as_str(),
         Some("1")
     );
     run_init(dir.path(), "--codex");
     assert!(parse()["mcp_servers"]["gently"]["env"]
-        .get("GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES")
+        .get("GENTLY_RESOLVE_RAW_VALUES")
         .is_none());
 }

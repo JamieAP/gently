@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+gently-raw = { path = "../gently-raw" }
 rusqlite.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

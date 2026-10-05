@@ -4,7 +4,8 @@
 //! provisional spans. Failed retryable sends leave rows queued for a later drain.
 //! A drain trims oldest rows above the configured cap before attempting delivery,
 //! so an outage can cause data loss. Queueing and delivery do not prove capture
-//! completeness. Repeated span IDs replace prior values in the Worker.
+//! completeness. Delivery uses the Worker's tenant/span upsert with immutable
+//! source-device ownership.
 
 mod http2;
 mod prefer;
@@ -19,7 +20,7 @@ use gently_store::Store;
 
 // Bound aggregation memory and wire batches. An individual larger envelope is
 // still sent alone so the collector decides whether it is acceptable.
-const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
+const MAX_BATCH_BYTES: usize = 1024 * 1024;
 
 struct PendingEnvelope {
     id: i64,
@@ -38,7 +39,7 @@ pub enum ExportError {
     #[error("collector authentication failed (HTTP {0}); spans remain queued; relaunch exporter with the collector token")]
     Authentication(u16),
     /// Poison: collector reached and rejected the request as genuinely
-    /// unprocessable (e.g. 400/413/422) - the same bytes will never succeed, so
+    /// unprocessable (e.g. 400/409/413/422) - the same bytes will never succeed, so
     /// the offending envelope is quarantined rather than retried forever.
     /// Its full bytes are retained, including any otherwise-valid sibling spans.
     #[error("collector rejected request (HTTP {0})")]
@@ -73,7 +74,7 @@ pub trait Transport {
 /// Returns the number of spans successfully delivered. Trims the outbox to
 /// `cap` first, logging any drops. Queue length can exceed the cap between
 /// drains. Coalesces up to `batch_size` envelopes per wire request, with a
-/// 4 MiB aggregation limit. A larger individual envelope is sent alone.
+/// 1 MiB aggregation limit. A larger individual envelope is sent alone.
 pub async fn drain<T: Transport>(
     store: &Store,
     transport: &T,
@@ -277,7 +278,7 @@ mod tests {
     #[tokio::test]
     async fn aggregated_payload_is_split_before_exceeding_wire_byte_limit() {
         let (_directory, store) = store();
-        let large_name = "synthetic".repeat(280_000);
+        let large_name = "synthetic".repeat(80_000);
         enqueue_span(&store, &large_name);
         enqueue_span(&store, &large_name);
         let transport = ByteRecorder {
@@ -286,7 +287,7 @@ mod tests {
         };
         assert_eq!(drain(&store, &transport, 10_000, 512).await.unwrap(), 2);
         assert_eq!(transport.calls.load(Ordering::SeqCst), 2);
-        assert!(transport.largest_body.load(Ordering::SeqCst) <= 4 * 1024 * 1024);
+        assert!(transport.largest_body.load(Ordering::SeqCst) <= 1024 * 1024);
         assert_eq!(store.outbox_len().unwrap(), 0);
     }
 

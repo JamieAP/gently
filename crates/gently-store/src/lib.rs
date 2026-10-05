@@ -1,5 +1,6 @@
 //! Local durable state for the hook pipeline: a single SQLite database
-//! (`~/.gently/state.db`) holding two things -
+//! (`~/.gently/state.db`) holding lifecycle state, telemetry envelopes and
+//! opaque encrypted raw objects. Raw plaintext is never a database value.
 //!
 //! - `open_spans`: spans awaiting their closing hook event (a turn awaiting
 //!   `Stop`, a tool call awaiting `PostToolUse`), and
@@ -14,16 +15,19 @@ mod health;
 mod open_spans;
 mod outbox;
 pub mod private_fs;
-mod raw_values;
+mod raw_objects;
 
 pub use health::Health;
 pub use open_spans::OpenSpan;
+pub use raw_objects::RawObjectStats;
 
 use std::path::Path;
 
 /// Hard cap on buffered outbox rows; older rows are dropped beyond this so a
 /// long collector outage cannot grow the db without bound.
 pub const OUTBOX_CAP: usize = 10_000;
+/// Encrypted object JSON budget per tenant/device database. Never evicts rows.
+pub const RAW_OBJECT_CAP_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -31,6 +35,14 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("incompatible development state schema; stop Gently and explicitly reset its state database before continuing")]
+    IncompatibleSchema,
+    #[error("invalid encrypted raw object")]
+    InvalidRawObject,
+    #[error("encrypted raw reference already names a different object")]
+    RawObjectConflict,
+    #[error("encrypted raw store byte budget reached; existing ciphertext is retained")]
+    RawCapacity,
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -59,16 +71,74 @@ impl Store {
             private_fs::harden_existing_file(sidecar)?;
         }
         let conn = rusqlite::Connection::open(path)?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        let tables: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            [],
+            |r| r.get(0),
+        )?;
+        if version != SCHEMA_VERSION && (version != 0 || tables != 0) {
+            return Err(StoreError::IncompatibleSchema);
+        }
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         for sidecar in &sidecars {
             private_fs::harden_existing_file(sidecar)?;
         }
         Ok(Self { conn })
     }
+
+    /// Commit an event's lifecycle changes, encrypted raw object and telemetry
+    /// envelope together. Any failure rolls every write back.
+    pub fn transaction<T, E>(
+        &self,
+        f: impl FnOnce(&Self) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<StoreError>,
+    {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(StoreError::from)?;
+        let result = f(self)?;
+        tx.commit().map_err(StoreError::from)?;
+        Ok(result)
+    }
+
+    /// Pending span identities and attributes, used to authenticate raw fields
+    /// captured at an opening event to the span later completed by a close.
+    pub fn open_span_attributes(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT span_id, attrs_json FROM open_spans")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Limit encryption binding work to the opening spans bearing this random
+    /// ref, instead of deserializing every live session on each hook.
+    pub fn open_span_attributes_with_reference(
+        &self,
+        raw_ref: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT span_id, attrs_json FROM open_spans WHERE instr(attrs_json, ?1) > 0",
+        )?;
+        let rows = stmt
+            .query_map([raw_ref], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
 }
+
+const SCHEMA_VERSION: i64 = 1;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS open_spans (
@@ -105,11 +175,15 @@ CREATE TABLE IF NOT EXISTS quarantine (
   reason TEXT NOT NULL,
   quarantined_unix_nano INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS raw_values (
-  sha256 TEXT NOT NULL PRIMARY KEY,
-  value TEXT NOT NULL,
-  created_unix_nano INTEGER NOT NULL
+CREATE TABLE IF NOT EXISTS raw_objects (
+  tenant_id TEXT NOT NULL,
+  raw_ref TEXT NOT NULL,
+  object_json TEXT NOT NULL,
+  created_unix_nano INTEGER NOT NULL,
+  synced INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (tenant_id, raw_ref)
 );
+CREATE INDEX IF NOT EXISTS raw_objects_pending ON raw_objects (tenant_id, synced, created_unix_nano);
 CREATE TABLE IF NOT EXISTS health (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   last_attempt_unix_nano INTEGER,
@@ -122,6 +196,33 @@ CREATE TABLE IF NOT EXISTS health (
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_plaintext_schema_requires_an_explicit_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE raw_values (sha256 TEXT PRIMARY KEY, value TEXT, created_unix_nano INTEGER);").unwrap();
+        drop(conn);
+        assert!(
+            Store::open(&path).is_err(),
+            "a plaintext development schema must not be silently reused"
+        );
+    }
+
+    #[test]
+    fn failed_event_transaction_rolls_back_lifecycle_and_outbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).unwrap();
+        let result: Result<()> = store.transaction(|store| {
+            store.next_turn_index("fixture")?;
+            store.outbox_enqueue("synthetic envelope")?;
+            Err(StoreError::InvalidRawObject)
+        });
+        assert!(result.is_err());
+        assert_eq!(store.current_turn("fixture").unwrap(), 0);
+        assert_eq!(store.outbox_len().unwrap(), 0);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -148,9 +249,7 @@ mod tests {
             }
         }
         let reopened = Store::open(&path).unwrap();
-        reopened
-            .raw_value_put("fixture", "private fixture content")
-            .unwrap();
+        reopened.outbox_enqueue("synthetic envelope").unwrap();
         for suffix in ["", "-wal", "-shm"] {
             let file = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
             assert_eq!(

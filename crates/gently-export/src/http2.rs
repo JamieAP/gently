@@ -17,17 +17,32 @@ pub struct Http2Transport {
 impl Http2Transport {
     /// Build a transport targeting `collector_url` (the base URL; `/v1/traces`
     /// is appended) authenticated with `token`.
-    pub fn new(collector_url: &str, token: impl Into<String>, timeout_secs: u64) -> Self {
-        let endpoint = format!("{}/v1/traces", collector_url.trim_end_matches('/'));
+    pub fn new(
+        collector_url: &str,
+        token: impl Into<String>,
+        tenant_id: &str,
+        timeout_secs: u64,
+    ) -> Result<Self, ExportError> {
+        let endpoint = tenant_endpoint(collector_url, tenant_id)?;
         let client = client_builder(collector_url, timeout_secs)
             .build()
             .expect("reqwest client builds with default rustls config");
-        Self {
+        Ok(Self {
             endpoint,
             token: token.into(),
             client,
-        }
+        })
     }
+}
+
+pub(crate) fn tenant_endpoint(collector_url: &str, tenant_id: &str) -> Result<String, ExportError> {
+    let mut url = reqwest::Url::parse(&format!(
+        "{}/v1/traces",
+        collector_url.trim_end_matches('/')
+    ))
+    .map_err(|_| ExportError::Unavailable("invalid collector URL".into()))?;
+    url.query_pairs_mut().append_pair("tenant_id", tenant_id);
+    Ok(url.into())
 }
 
 impl Transport for Http2Transport {
@@ -102,7 +117,10 @@ pub(crate) fn classify(status: reqwest::StatusCode) -> Result<(), ExportError> {
         )))
     } else if matches!(
         status,
-        StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNPROCESSABLE_ENTITY
+        StatusCode::BAD_REQUEST
+            | StatusCode::CONFLICT
+            | StatusCode::PAYLOAD_TOO_LARGE
+            | StatusCode::UNPROCESSABLE_ENTITY
     ) {
         // Genuine poison: malformed / too large / unprocessable. Retrying the
         // same bytes can never succeed, so quarantine instead of looping.
@@ -119,6 +137,24 @@ mod tests {
     use super::classify;
     use crate::ExportError;
     use reqwest::StatusCode;
+
+    #[test]
+    fn trace_endpoint_is_tenant_scoped() {
+        let transport =
+            super::Http2Transport::new("http://127.0.0.1:8787", "fixture", "personal", 1).unwrap();
+        assert_eq!(
+            transport.endpoint,
+            "http://127.0.0.1:8787/v1/traces?tenant_id=personal"
+        );
+    }
+
+    #[test]
+    fn immutable_span_identity_conflict_is_a_payload_rejection() {
+        assert!(matches!(
+            classify(StatusCode::CONFLICT),
+            Err(ExportError::Rejected(409))
+        ));
+    }
 
     #[test]
     fn success_is_ok() {
@@ -185,7 +221,7 @@ mod tests {
                 }
             }
         });
-        let transport = Http2Transport::new(&origin_url, "synthetic-auth", 1);
+        let transport = Http2Transport::new(&origin_url, "synthetic-auth", "personal", 1).unwrap();
         assert!(transport
             .send(b"synthetic trace payload".to_vec())
             .await
@@ -223,11 +259,7 @@ mod tests {
 
     #[test]
     fn endpoint_configuration_errors_keep_valid_payloads_queued() {
-        for status in [
-            StatusCode::NOT_FOUND,
-            StatusCode::METHOD_NOT_ALLOWED,
-            StatusCode::CONFLICT,
-        ] {
+        for status in [StatusCode::NOT_FOUND, StatusCode::METHOD_NOT_ALLOWED] {
             let error = classify(status).unwrap_err();
             assert!(matches!(error, ExportError::Unavailable(_)));
             assert!(error.retryable());
