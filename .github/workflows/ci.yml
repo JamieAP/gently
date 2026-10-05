@@ -15,6 +15,10 @@ concurrency:
 
 jobs:
   validate:
+    # Outside submissions are data for owner review, not permission to run code.
+    # Repository-level approval for ALL external contributors is also required:
+    # a PR can propose changes to this workflow and remove a job-level guard.
+    if: github.repository == 'JamieAP/gently' && github.actor == 'JamieAP' && (github.event_name != 'pull_request' || (github.event.pull_request.user.login == 'JamieAP' && github.event.pull_request.head.repo.full_name == 'JamieAP/gently'))
     strategy:
       fail-fast: false
       matrix:
@@ -26,6 +30,8 @@ jobs:
       WRANGLER_WRITE_LOGS: "false"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install stable Rust tools
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
@@ -33,8 +39,6 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
-          cache: npm
-          cache-dependency-path: worker/package-lock.json
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
@@ -53,5 +57,10 @@ jobs:
           npm run typecheck
       - name: Launcher regression tests
         run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: Documentation dependency and build validation
+        run: |
+          npm ci --prefix docs --ignore-scripts
+          npm test --prefix docs
+          npm run --prefix docs build
       - name: Real CLI, encrypted readers, Wrangler and D1 acceptance
         run: python3 scripts/acceptance-local.py --binary "$RUNNER_TEMP/gently-install/bin/gently"

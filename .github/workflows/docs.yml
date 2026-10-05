@@ -1,6 +1,6 @@
 name: docs
 
-# Build the honkit book under docs/ and publish it to GitHub Pages.
+# Build static documentation under docs/ and publish it to GitHub Pages.
 # Enable once in repo settings: Settings → Pages → Source: "GitHub Actions".
 
 on:
@@ -11,8 +11,6 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: pages
@@ -20,21 +18,32 @@ concurrency:
 
 jobs:
   build:
+    if: github.repository == 'JamieAP/gently' && github.ref == 'refs/heads/main' && github.actor == 'JamieAP'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "20"
-      - name: Build book
-        run: npx -y honkit build docs _site
+          node-version: "22"
+      - name: Build documentation
+        run: |
+          npm ci --prefix docs --ignore-scripts
+          npm run --prefix docs build
       - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:
           path: _site
 
   deploy:
     needs: build
+    if: github.repository == 'JamieAP/gently' && github.ref == 'refs/heads/main' && github.actor == 'JamieAP'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
