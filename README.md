@@ -1,29 +1,37 @@
-# gently
+<p align="center">
+  <img src="assets/gently-mark.png" alt="Gently logo" width="80" height="80">
+</p>
 
-OpenTelemetry traces for Claude Code and Codex.
+<h1 align="center">gently</h1>
 
-[Quick start](#quick-start) · [MCP](#mcp) · [Documentation](docs/README.md) · [Contributing](CONTRIBUTING.md)
+<p align="center">
+  <strong>See your agent's work, one trace at a time.</strong><br>
+  OpenTelemetry traces for Claude Code and Codex.
+</p>
 
-Gently records coding-agent activity as linked spans, so you can follow a
-session through its turns, tool calls, and subagents. Inspect traces from the
-command line or let an agent query them through MCP.
+<p align="center">
+  <a href="#quick-start">Get started</a> ·
+  <a href="LOCAL_SETUP.md">Run locally</a> ·
+  <a href="#mcp">MCP</a> ·
+  <a href="docs/README.md">Docs</a> ·
+  <a href="CONTRIBUTING.md">Contribute</a>
+</p>
 
-The Rust CLI captures hook events into a local SQLite outbox and exports
-OTLP/JSON to a collector you run. The included collector is a Cloudflare Worker
-backed by D1; it can run on Cloudflare or locally with Wrangler.
+Gently turns coding-agent hooks into a timeline of sessions, turns, tool calls
+and subagents. Investigate a slow run, follow delegated work, or query recorded
+activity from the command line and through MCP.
 
-Hooks queue one OTLP/JSON envelope per event. When a collector token is
-available they start a detached exporter; tokenless hooks queue locally.
-`gently export --watch` drains the queue continuously, reusing connections.
-Remote export can use HTTP/3, with a TCP fallback.
+- **Capture locally.** Hooks write to a SQLite outbox, so events can queue before
+  a collector or its token is available.
+- **Follow the work.** Inspect tool durations, completion status, and the span
+  tree behind a session.
+- **Query from your agent.** Read the same traces through MCP, with filters and
+  JSON output. Raw content capture and resolution are opt-in.
 
-```text
-Claude Code / Codex hooks -> local SQLite outbox -> Worker -> D1
-                                                   ^
-                                              CLI and MCP
-```
+Run the included collector locally or on Cloudflare. It is a Worker backed by
+D1; the Rust CLI exports OTLP/JSON to it.
 
-## Example trace
+## A session at a glance
 
 A synthetic session rendered by `scripts/waterfall.py`:
 
@@ -38,14 +46,13 @@ A synthetic session rendered by `scripts/waterfall.py`:
    300.0ms ✓        Bash                │                         █████████████████              │
 ```
 
-## What you can inspect
+## Current support
 
-- Session and turn structure, including parent-child relationships between tools
-  and subagents.
-- Tool durations, completion status, and trace timelines.
-- Recent activity and per-tool statistics, with filters and JSON output.
+CLI capture and token-configured queries are available for Claude Code and
+Codex. Desktop parity is partial: authenticated desktop MCP access and
+Claude Chat/Cowork integration remain open work.
 
-See [data and privacy](#data-and-privacy) before enabling capture.
+Read [data and privacy](#data-and-privacy) before enabling capture.
 
 ## Quick start
 
@@ -167,7 +174,12 @@ for file permissions, exported fields, and debug-capture behaviour.
 ## Architecture and documentation
 
 One trace represents a session. Turns, tools, and subagents form its span tree.
-Hooks write locally; a detached exporter drains the outbox with retry and backoff.
+Hooks queue one OTLP/JSON envelope per event. With a collector token, they start
+a detached exporter; tokenless hooks queue locally. `gently export --watch`
+drains the queue continuously and reuses connections. Remote export can use
+HTTP/3, with a TCP fallback.
+
+The exporter drains the outbox with retry and backoff.
 The default queue cap is 10,000 envelopes, after which the oldest queued
 envelopes are dropped. Authentication failures stop export immediately;
 transient failures use backoff, and unprocessable envelopes can be quarantined.
@@ -176,6 +188,12 @@ Session, turn, and subagent spans are updated as they open and close. The Worker
 replaces records with the same span ID. Exporting to another OpenTelemetry
 backend requires handling these updates; CLI and MCP queries also depend on the
 Worker's query API.
+
+```text
+Claude Code / Codex hooks -> local SQLite outbox -> Worker -> D1
+                                                   ^
+                                              CLI and MCP
+```
 
 - [Documentation index](docs/README.md)
 - [Architecture](docs/concepts/architecture.md)
