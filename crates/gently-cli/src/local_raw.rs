@@ -4,9 +4,9 @@ use crate::{config::Config, query_client::SpanRow};
 use anyhow::{ensure, Context, Result};
 use gently_core::Span;
 use gently_harness::{Attrs, Parsed, SpanOp};
-use gently_raw::{
-    RawContext, RawObject, ReaderIdentities, SignedManifest, TrustPin, VerifiedManifest,
-};
+#[cfg(test)]
+use gently_raw::ReaderIdentities;
+use gently_raw::{RawContext, RawObject, RawPayload, SignedManifest, TrustPin, VerifiedManifest};
 use gently_store::Store;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -275,21 +275,34 @@ pub fn row_references(row: &SpanRow) -> Result<Vec<String>> {
 
 /// Authenticate the object context and its field-to-span binding before adding
 /// plaintext to this in-memory result. The collector never receives this row.
-pub fn resolve_row(
+#[cfg(test)]
+fn resolve_row(
     tenant_id: &str,
     row: &mut SpanRow,
     object: &RawObject,
     identities: &ReaderIdentities,
 ) -> Result<()> {
+    validate_row_context(tenant_id, row, &object.context)?;
+    let payload = gently_raw::open(object, &object.context, identities)?;
+    resolve_payload(tenant_id, row, &payload)
+}
+
+/// Check each row independently before either unlocking or using a cached
+/// authenticated payload. Its enclosing object is never trusted as row context.
+pub(crate) fn validate_row_context(
+    tenant_id: &str,
+    row: &SpanRow,
+    context: &RawContext,
+) -> Result<()> {
     ensure!(
-        row_references(row)?.contains(&object.context.raw_ref),
+        row_references(row)?.contains(&context.raw_ref),
         "raw reference does not belong to this row"
     );
     ensure!(
         row.resource_attr("gently.tenant_id").as_deref() == Some(tenant_id),
         "raw row tenant mismatch"
     );
-    let mut expected = object.context.clone();
+    let mut expected = context.clone();
     expected.tenant_id = tenant_id.into();
     expected.session_id = row
         .session_id
@@ -299,7 +312,21 @@ pub fn resolve_row(
     expected.device_id = row
         .resource_attr("gently.device_id")
         .context("raw row device is missing")?;
-    let payload = gently_raw::open(object, &expected, identities)?;
+    ensure!(
+        &expected == context,
+        "raw object context does not match this row"
+    );
+    Ok(())
+}
+
+/// Hydrate from an already authenticated, request-local payload. Context and
+/// field-to-span ownership still apply to every row that references it.
+pub(crate) fn resolve_payload(
+    tenant_id: &str,
+    row: &mut SpanRow,
+    payload: &RawPayload,
+) -> Result<()> {
+    validate_row_context(tenant_id, row, &payload.context)?;
     let blob = row
         .attrs_json
         .as_ref()
@@ -314,7 +341,7 @@ pub fn resolve_row(
             .get("value")
             .and_then(|v| v.get("stringValue"))
             .and_then(Value::as_str)
-            != Some(object.context.raw_ref.as_str())
+            != Some(payload.context.raw_ref.as_str())
         {
             continue;
         }

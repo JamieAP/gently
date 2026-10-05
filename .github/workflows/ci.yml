@@ -1,0 +1,56 @@
+name: code
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: code-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      WRANGLER_SEND_METRICS: "false"
+      WRANGLER_WRITE_LOGS: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Rust formatting, regression tests and lint
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
+      - name: Install CLI from source
+        run: cargo install --debug --locked --path crates/gently-cli --root "$RUNNER_TEMP/gently-install"
+      - name: Worker dependencies, tests and type checking
+        working-directory: worker
+        run: |
+          npm ci
+          npm test
+          npm run typecheck
+      - name: Launcher regression tests
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: Real CLI, encrypted readers, Wrangler and D1 acceptance
+        run: python3 scripts/acceptance-local.py --binary "$RUNNER_TEMP/gently-install/bin/gently"

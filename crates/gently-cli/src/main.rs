@@ -52,6 +52,9 @@ enum Command {
         /// Seconds between drains in watch mode.
         #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=60))]
         interval_secs: u64,
+        /// Retry retained ciphertext previously rejected by the collector.
+        #[arg(long)]
+        retry_raw_quarantine: bool,
     },
     /// Manage encrypted raw-value reader enrollment and public trust policy.
     Raw {
@@ -60,12 +63,20 @@ enum Command {
     },
     /// Show local exporter health and queue depth.
     Status,
+    /// Print the resolved public configuration for setup and local launchers.
+    Config {
+        #[arg(long, required_unless_present = "check", conflicts_with = "check")]
+        json: bool,
+        /// Validate public policy, configured paths and an existing state schema.
+        #[arg(long, required_unless_present = "json", conflicts_with = "json")]
+        check: bool,
+    },
     /// Run the MCP stdio server exposing trace queries.
     Mcp,
     /// Install gently's hooks and MCP server into a harness.
     Init {
         /// Install into Claude Code (`~/.claude`).
-        #[arg(long, default_value_t = true)]
+        #[arg(long, conflicts_with = "codex")]
         claude: bool,
         /// Install into Codex (`~/.codex/config.toml`).
         #[arg(long, default_value_t = false)]
@@ -166,15 +177,23 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Export {
             watch,
             interval_secs,
+            retry_raw_quarantine,
         } => {
             if watch {
-                cmd_export::watch(interval_secs)
+                cmd_export::watch(interval_secs, retry_raw_quarantine)
             } else {
-                cmd_export::run()
+                cmd_export::run(retry_raw_quarantine)
             }
         }
         Command::Raw { command } => cmd_raw::run(command),
         Command::Status => cmd_status::run(),
+        Command::Config { check, .. } => {
+            if check {
+                config::check_setup()
+            } else {
+                config::print_setup_json()
+            }
+        }
         Command::Mcp => cmd_mcp::run(),
         Command::Init {
             claude: _,

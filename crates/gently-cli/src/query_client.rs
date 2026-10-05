@@ -7,6 +7,10 @@ use crate::config::Config;
 use crate::local_raw;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::cell::OnceCell;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use zeroize::Zeroize;
 
 /// A trace as summarized by the collector's `op=traces`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -118,7 +122,45 @@ pub struct QueryClient {
     collector: crate::collector::CollectorClient,
     tenant_id: String,
     local_raw_store: Option<gently_store::Store>,
-    raw_identities: Option<gently_raw::ReaderIdentities>,
+    raw_identity_path: Option<PathBuf>,
+    raw_identities: OnceCell<gently_raw::ReaderIdentities>,
+}
+
+/// Plaintext lives only for one query, then its temporary field copies are
+/// cleared. The persistent store caches encrypted objects exclusively.
+struct CachedRawPayload(gently_raw::RawPayload);
+impl Drop for CachedRawPayload {
+    fn drop(&mut self) {
+        for value in self.0.fields.values_mut() {
+            value.zeroize();
+        }
+    }
+}
+
+const MAX_RAW_QUERY_BYTES: usize = 8 * 1024 * 1024;
+fn account_raw_query_bytes(bytes: &mut usize, added: usize) -> Result<()> {
+    *bytes = bytes
+        .checked_add(added)
+        .filter(|total| *total <= MAX_RAW_QUERY_BYTES)
+        .context("raw resolution exceeds the 8 MiB budget; narrow your query")?;
+    Ok(())
+}
+
+fn hydrate_cached_payload(
+    tenant_id: &str,
+    row: &mut SpanRow,
+    payload: &gently_raw::RawPayload,
+    bytes: &mut usize,
+) -> Result<()> {
+    let previous = row.attrs_json.as_deref().map_or(0, str::len);
+    local_raw::resolve_payload(tenant_id, row, payload)?;
+    let expanded = row.attrs_json.as_deref().map_or(0, str::len);
+    if expanded >= previous {
+        account_raw_query_bytes(bytes, expanded - previous)?;
+    } else {
+        *bytes -= previous - expanded;
+    }
+    Ok(())
 }
 
 impl QueryClient {
@@ -138,22 +180,29 @@ impl QueryClient {
                 cfg.query_timeout_secs,
             )?,
             tenant_id: cfg.tenant_id.clone(),
-            raw_identities: if cfg.resolve_raw_values {
-                let path = cfg
-                    .raw_identity
-                    .as_deref()
-                    .context("raw resolution requires an explicit reader identity")?;
-                gently_store::private_fs::harden_existing_file(path)?;
-                Some(gently_raw::load_identities(path)?)
-            } else {
-                None
-            },
+            raw_identity_path: cfg.raw_identity.clone(),
+            raw_identities: OnceCell::new(),
             local_raw_store,
         })
     }
 
     async fn get<T: for<'de> Deserialize<'de>>(&self, params: &[(&str, String)]) -> Result<T> {
         self.collector.query(params).await
+    }
+
+    fn reader_identities(&self) -> Result<&gently_raw::ReaderIdentities> {
+        if self.raw_identities.get().is_none() {
+            let path = self
+                .raw_identity_path
+                .as_deref()
+                .context("raw resolution requires an explicit reader identity")?;
+            gently_store::private_fs::harden_existing_file(path)?;
+            let identities = gently_raw::load_identities(path)?;
+            let _ = self.raw_identities.set(identities);
+        }
+        self.raw_identities
+            .get()
+            .context("reader identity unavailable")
     }
 
     pub async fn traces(&self, f: &TraceFilters) -> Result<Vec<TraceSummary>> {
@@ -232,6 +281,24 @@ impl QueryClient {
     }
 
     async fn resolve_raw_values(&self, rows: &mut [SpanRow]) -> Result<()> {
+        self.resolve_raw_values_with_reader(rows, |object| {
+            Ok(gently_raw::open(
+                object,
+                &object.context,
+                self.reader_identities()?,
+            )?)
+        })
+        .await
+    }
+
+    async fn resolve_raw_values_with_reader<F>(
+        &self,
+        rows: &mut [SpanRow],
+        mut decrypt: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&gently_raw::RawObject) -> Result<gently_raw::RawPayload>,
+    {
         for row in rows.iter() {
             for blob in [row.attrs_json.as_deref(), row.resource_json.as_deref()]
                 .into_iter()
@@ -240,20 +307,41 @@ impl QueryClient {
                 validate_public_attributes(blob)?;
             }
         }
-        if let (Some(store), Some(identities)) = (&self.local_raw_store, &self.raw_identities) {
+        if let Some(store) = &self.local_raw_store {
+            let mut bytes = 0;
+            for row in rows.iter() {
+                account_raw_query_bytes(&mut bytes, row.attrs_json.as_deref().map_or(0, str::len))?;
+                account_raw_query_bytes(
+                    &mut bytes,
+                    row.resource_json.as_deref().map_or(0, str::len),
+                )?;
+            }
+            let mut payloads: BTreeMap<String, Option<CachedRawPayload>> = BTreeMap::new();
             for row in rows {
                 for reference in local_raw::row_references(row)? {
+                    if let Some(cached) = payloads.get(&reference) {
+                        if let Some(payload) = cached {
+                            hydrate_cached_payload(&self.tenant_id, row, &payload.0, &mut bytes)?;
+                        }
+                        continue;
+                    }
                     let object = match store.raw_object_get(&self.tenant_id, &reference)? {
                         Some(object) => Some(object),
                         None => self.collector.fetch_raw(&reference).await?,
                     };
                     if let Some(object) = object {
-                        local_raw::resolve_row(&self.tenant_id, row, &object, identities)?;
+                        local_raw::validate_row_context(&self.tenant_id, row, &object.context)?;
+                        account_raw_query_bytes(&mut bytes, object.ciphertext_b64.len())?;
+                        let payload = CachedRawPayload(decrypt(&object)?);
+                        hydrate_cached_payload(&self.tenant_id, row, &payload.0, &mut bytes)?;
                         match store.raw_object_cache(&object) {
                             Ok(()) => {},
                             Err(gently_store::StoreError::RawCapacity) => tracing::warn!("encrypted raw cache byte budget reached; returning verified in-memory result"),
                             Err(error) => return Err(error.into()),
                         }
+                        payloads.insert(reference, Some(payload));
+                    } else {
+                        payloads.insert(reference, None);
                     }
                 }
             }
@@ -360,7 +448,8 @@ mod raw_guard_tests {
             .unwrap(),
             tenant_id: "personal".into(),
             local_raw_store: None,
-            raw_identities: None,
+            raw_identity_path: None,
+            raw_identities: OnceCell::new(),
         }
     }
 
@@ -368,6 +457,220 @@ mod raw_guard_tests {
         serde_json::from_value(json!({"span_id":"0123456789abcdef","trace_id":"trace","parent_span_id":null,"name":"turn","kind":1,
             "start_unix_nano":"1","end_unix_nano":"2","status":1,"session_id":"session","harness":"codex","tool_name":null,"tool_use_id":null,
             "resource_json":null,"attrs_json":null})).unwrap()
+    }
+
+    #[tokio::test]
+    async fn shared_raw_ref_decrypts_once_per_request_and_rechecks_each_span_binding() {
+        use gently_raw::{
+            DeviceIdentity, Manifest, OwnerKey, RawContext, ReaderIdentities, Recipient, TrustPin,
+            VerifiedManifest,
+        };
+        use std::collections::BTreeMap;
+        let dir = tempfile::tempdir().unwrap();
+        let store = gently_store::Store::open(&dir.path().join("state.db")).unwrap();
+        let identity = DeviceIdentity::generate();
+        let owner = OwnerKey::generate();
+        let manifest = Manifest {
+            version: 1,
+            tenant_id: "personal".into(),
+            key_epoch: 1,
+            expires_unix_secs: 4_102_444_800,
+            readers: vec![Recipient {
+                device_id: "reader".into(),
+                key_id: "key".into(),
+                recipient: identity.to_public().to_string(),
+            }],
+        };
+        let pin = TrustPin {
+            tenant_id: "personal".into(),
+            owner_verify_key_b64: owner.verification_key_b64(),
+            min_epoch: 1,
+            manifest_digest: gently_raw::manifest_digest(&manifest).unwrap(),
+        };
+        let verified =
+            VerifiedManifest::verify(&gently_raw::sign_manifest(manifest, &owner).unwrap(), &pin)
+                .unwrap();
+        let context = RawContext {
+            tenant_id: "personal".into(),
+            device_id: "writer".into(),
+            key_epoch: 1,
+            raw_ref: gently_raw::new_raw_ref(),
+            session_id: "session".into(),
+            harness: "codex".into(),
+            event: "UserPromptSubmit".into(),
+        };
+        let second_span = "fedcba9876543210";
+        let object = gently_raw::seal(
+            &verified,
+            context.clone(),
+            BTreeMap::from([("gently.prompt".into(), "private repeated fixture".into())]),
+            BTreeMap::from([(
+                "gently.prompt".into(),
+                vec![row().span_id, second_span.into()],
+            )]),
+        )
+        .unwrap();
+        store.raw_object_cache(&object).unwrap();
+        let identities = ReaderIdentities::from_native(vec![identity]);
+        let mut first = row();
+        first.resource_json = Some(
+            json!([
+                {"key":"gently.tenant_id","value":{"stringValue":"personal"}},
+                {"key":"gently.device_id","value":{"stringValue":"writer"}}
+            ])
+            .to_string(),
+        );
+        first.attrs_json = Some(
+            json!([{"key":"gently.prompt.raw_ref","value":{"stringValue":context.raw_ref}}])
+                .to_string(),
+        );
+        let mut second = first.clone();
+        second.span_id = second_span.into();
+        let mut client = client();
+        client.local_raw_store = Some(store);
+        let mut decryptions = 0;
+        let mut rows = vec![first.clone(), second];
+        client
+            .resolve_raw_values_with_reader(&mut rows, |object| {
+                decryptions += 1;
+                Ok(gently_raw::open(object, &object.context, &identities)?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(decryptions, 1, "one authorization for a shared ciphertext");
+        assert!(rows.iter().all(|row| row
+            .attrs_json
+            .as_ref()
+            .unwrap()
+            .contains("private repeated fixture")));
+        let mut another_request = vec![first.clone()];
+        client
+            .resolve_raw_values_with_reader(&mut another_request, |object| {
+                decryptions += 1;
+                Ok(gently_raw::open(object, &object.context, &identities)?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(decryptions, 2, "plaintext cache ends with each request");
+        for mismatch in ["span", "tenant", "device", "session", "harness", "field"] {
+            let mut unrelated = first.clone();
+            match mismatch {
+                "span" => unrelated.span_id = "0000000000000000".into(),
+                "tenant" | "device" => {
+                    unrelated.resource_json = unrelated.resource_json.map(|json| {
+                        json.replace(
+                            if mismatch == "tenant" {
+                                "personal"
+                            } else {
+                                "writer"
+                            },
+                            "different",
+                        )
+                    })
+                }
+                "session" => unrelated.session_id = Some("different".into()),
+                "harness" => unrelated.harness = Some("different".into()),
+                "field" => {
+                    unrelated.attrs_json = unrelated.attrs_json.map(|json| {
+                        json.replace("gently.prompt.raw_ref", "gently.tool_input.raw_ref")
+                    })
+                }
+                _ => unreachable!(),
+            }
+            let before = unrelated.attrs_json.clone();
+            let previous = decryptions;
+            let mut rows = vec![first.clone(), unrelated];
+            assert!(
+                client
+                    .resolve_raw_values_with_reader(&mut rows, |object| {
+                        decryptions += 1;
+                        Ok(gently_raw::open(object, &object.context, &identities)?)
+                    })
+                    .await
+                    .is_err(),
+                "cached payload bypassed {mismatch}"
+            );
+            assert_eq!(decryptions, previous + 1);
+            assert_eq!(
+                rows[1].attrs_json, before,
+                "shared ciphertext must not bypass {mismatch}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_resolution_bounds_aggregate_cached_objects_and_expanded_output() {
+        use gently_raw::{
+            DeviceIdentity, Manifest, OwnerKey, RawContext, ReaderIdentities, Recipient, TrustPin,
+            VerifiedManifest,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = gently_store::Store::open(&dir.path().join("state.db")).unwrap();
+        let identity = DeviceIdentity::generate();
+        let owner = OwnerKey::generate();
+        let manifest = Manifest {
+            version: 1,
+            tenant_id: "personal".into(),
+            key_epoch: 1,
+            expires_unix_secs: 4_102_444_800,
+            readers: vec![Recipient {
+                device_id: "reader".into(),
+                key_id: "reader-key".into(),
+                recipient: identity.to_public().to_string(),
+            }],
+        };
+        let pin = TrustPin {
+            tenant_id: "personal".into(),
+            owner_verify_key_b64: owner.verification_key_b64(),
+            min_epoch: 1,
+            manifest_digest: gently_raw::manifest_digest(&manifest).unwrap(),
+        };
+        let policy =
+            VerifiedManifest::verify(&gently_raw::sign_manifest(manifest, &owner).unwrap(), &pin)
+                .unwrap();
+        let identities = ReaderIdentities::from_native(vec![identity]);
+        let mut rows = Vec::new();
+        for _ in 0..40 {
+            let mut row = row();
+            let context = RawContext {
+                tenant_id: "personal".into(),
+                device_id: "writer".into(),
+                key_epoch: 1,
+                raw_ref: gently_raw::new_raw_ref(),
+                session_id: "session".into(),
+                harness: "codex".into(),
+                event: "UserPromptSubmit".into(),
+            };
+            let object = gently_raw::seal(
+                &policy,
+                context.clone(),
+                BTreeMap::from([("gently.prompt".into(), "x".repeat(128 * 1024))]),
+                BTreeMap::from([("gently.prompt".into(), vec![row.span_id.clone()])]),
+            )
+            .unwrap();
+            store.raw_object_cache(&object).unwrap();
+            row.resource_json = Some(
+                json!([
+                    {"key":"gently.tenant_id","value":{"stringValue":"personal"}},
+                    {"key":"gently.device_id","value":{"stringValue":"writer"}}
+                ])
+                .to_string(),
+            );
+            row.attrs_json = Some(
+                json!([{"key":"gently.prompt.raw_ref","value":{"stringValue":context.raw_ref}}])
+                    .to_string(),
+            );
+            rows.push(row);
+        }
+        let mut client = client();
+        client.local_raw_store = Some(store);
+        let error = client
+            .resolve_raw_values_with_reader(&mut rows, |object| {
+                Ok(gently_raw::open(object, &object.context, &identities)?)
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("budget; narrow your query"));
     }
 
     #[tokio::test]
@@ -514,7 +817,10 @@ mod raw_guard_tests {
         row.attrs_json = Some(serde_json::to_string(&refs).unwrap());
         let mut client = client();
         client.local_raw_store = Some(store);
-        client.raw_identities = Some(ReaderIdentities::from_native(vec![identity]));
+        assert!(client
+            .raw_identities
+            .set(ReaderIdentities::from_native(vec![identity]))
+            .is_ok());
         client
             .resolve_raw_values(std::slice::from_mut(&mut row))
             .await

@@ -15,6 +15,7 @@ impl CollectorClient {
         let url =
             reqwest::Url::parse(base).map_err(|_| anyhow::anyhow!("invalid collector URL"))?;
         let mut builder = reqwest::Client::builder()
+            .user_agent(gently_export::USER_AGENT)
             .timeout(std::time::Duration::from_secs(timeout))
             .redirect(reqwest::redirect::Policy::none());
         if url.host_str().is_some_and(|host| {
@@ -200,6 +201,20 @@ pub(crate) mod tests {
         assert!(request
             .to_lowercase()
             .contains("authorization: bearer synthetic-token"));
+    }
+    #[tokio::test]
+    async fn query_requests_identify_gently_to_the_collector() {
+        let (base, task) = server("200 OK", "[]");
+        let client = CollectorClient::new(&base, "synthetic-token", "lab", 2).unwrap();
+        let _: Vec<serde_json::Value> = client.query(&[("op", "traces".into())]).await.unwrap();
+        let request = task.join().unwrap();
+        assert!(request
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case(concat!(
+                "user-agent: gently/",
+                env!("CARGO_PKG_VERSION"),
+                " (+https://github.com/JamieAP/gently)"
+            ))));
     }
     #[tokio::test]
     async fn missing_ciphertext_remains_an_opaque_reference() {

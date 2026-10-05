@@ -7,7 +7,9 @@ decryption keys in Cloudflare.
 
 Capture, cloud sync and resolution are three independent opt-ins. Ordinary
 metadata capture requires none of them. Use a fresh development database:
-Gently rejects old plaintext raw schemas and offers no compatibility reader.
+Gently rejects earlier development schemas and offers no compatibility reader
+or migration. Preserve any data you need before explicitly choosing a fresh
+state directory. Commands never delete an incompatible database for you.
 
 ## 1. Create reader identities
 
@@ -152,8 +154,15 @@ map; the previous plaintext full-payload debug capture has been removed.
 To upload ciphertext, enable `sync_raw_values = true` for the exporter and
 supply its ingest credential. The credential's enrolled device must match the
 capture device. The exporter needs no reader identity. When sync is enabled,
-it attempts pending ciphertext before draining metadata; a ciphertext rejection
-can stop that drain. A reference does not guarantee immediate availability.
+it attempts pending ciphertext before draining metadata. A rejected object
+(HTTP 400, 409, 413 or 422) stays encrypted in quarantine while metadata and
+other raw objects continue exporting. Authentication failures preserve the
+active queues and stop export. A reference does not guarantee immediate
+availability. Inspect `gently status` for raw quarantine counts, bytes and the
+last rejection status. After investigating and correcting the collector,
+`gently export --retry-raw-quarantine` requeues retained objects without editing
+their ciphertext. A persistent immutable-object conflict will be quarantined
+again; retry does not overwrite an existing cloud object.
 
 On an enrolled reader, configure:
 
@@ -164,8 +173,11 @@ raw_identity = "/absolute/path/reader.age"
 
 Provide a read credential for that tenant, then query normally. Resolution
 uses local ciphertext first and can fetch missing objects from the collector.
-It unlocks the reader only in the explicit query process, verifies context and
-span bindings, and adds raw attributes to the in-memory result. For MCP,
+It unlocks the reader only when a query needs referenced raw ciphertext,
+verifies context and span bindings, and adds raw attributes to the in-memory
+result. Metadata trace lists, statistics and MCP initialization work without
+unlocking a reader. A request decrypts each object once and checks its bindings
+for every result row; decrypted values are never cached on disk. For MCP,
 register the opt-in with `gently init --claude --resolve-raw-values` or the
 corresponding Codex command. Decrypted MCP output may be sent to the calling
 agent's model provider. Software identities require an attached private terminal
@@ -182,8 +194,21 @@ SQLite page and WAL overhead. At capacity, new raw capture is skipped while
 metadata continues; readers can still decrypt fetched objects in memory without
 caching them. Existing objects, including pending uploads, are never evicted
 automatically. Inspect `gently status` for retained and pending object byte
-counts. Cloud quotas and retention schedules require a separate deployment
-policy.
+counts, including retained quarantine. Cloud quotas and retention schedules
+require a separate deployment policy.
+Reader resolution also bounds aggregate encoded cached ciphertext and expanded
+attribute/resource JSON to 8 MiB per request; narrow a query that exceeds it.
+This is a data-admission bound, rather than a measurement of total process memory.
+
+`gently config --json` exposes only resolved public setup fields. Local
+launchers use the same resolution as hooks and queries, including file
+tenant/device settings and environment overrides. Raw policy and identity
+paths must be absolute; `~` inside TOML is not expanded. Numeric settings are
+bounded: `export_batch` 1–4096, `outbox_cap` 1–1000000, and export/query timeouts
+1–3600 seconds. Invalid settings fail before export changes queues or health.
+Run `gently config --check` or the local launcher's `--check` before starting:
+these check public capture policy, configured reader path and an existing
+state schema without requesting credentials or unlocking an identity.
 
 ## Enrollment changes and revocation
 
@@ -202,3 +227,6 @@ writer signatures, so they do not prove origin or provide a full replay
 protocol against a malicious cloud. See
 [security and privacy](../concepts/security-and-privacy.md) for confidentiality,
 metadata exposure, retention and this provenance limit.
+
+See [validation and acceptance](encrypted-raw-validation.md) for the automated
+checks and the hardware and cloud checks needed before relying on this setup.

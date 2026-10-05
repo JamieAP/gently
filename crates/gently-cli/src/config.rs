@@ -6,7 +6,7 @@
 //! offline and captures metadata without a collector token.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Default operational tunables. `outbox_cap`'s default is the store's own
@@ -15,6 +15,91 @@ const DEFAULT_PREFER_QUIC: bool = true;
 const DEFAULT_EXPORT_BATCH: usize = 512;
 const DEFAULT_EXPORT_TIMEOUT_SECS: u64 = 15;
 const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 30;
+
+pub fn check_setup() -> Result<()> {
+    let cfg = Config::load()?;
+    if cfg.capture_raw_values {
+        let manifest_path = cfg
+            .raw_manifest
+            .as_deref()
+            .context("capture_raw_values requires raw_manifest")?;
+        let trust_path = cfg
+            .raw_trust
+            .as_deref()
+            .context("capture_raw_values requires raw_trust")?;
+        let manifest: gently_raw::SignedManifest = read_policy_json(manifest_path)?;
+        let trust: gently_raw::TrustPin = read_policy_json(trust_path)?;
+        let verified = gently_raw::VerifiedManifest::verify(&manifest, &trust).map_err(|_| {
+            anyhow::anyhow!("recipient policy or trust pin is invalid, expired or rolled back")
+        })?;
+        anyhow::ensure!(
+            verified.manifest().tenant_id == cfg.tenant_id,
+            "recipient policy tenant does not match tenant_id"
+        );
+    }
+    if cfg.resolve_raw_values {
+        let identity = cfg
+            .raw_identity
+            .as_deref()
+            .context("resolve_raw_values requires raw_identity")?;
+        // Inspect only the protected file's metadata. Setup checks never parse
+        // a private identity, invoke a plugin, or request a passphrase.
+        gently_store::private_fs::harden_existing_file(identity)
+            .context("raw_identity must be a safe regular file owned by this user")?;
+        let metadata = std::fs::symlink_metadata(identity)
+            .context("raw_identity file does not exist or cannot be inspected")?;
+        anyhow::ensure!(metadata.is_file(), "raw_identity must be a regular file");
+    }
+    cfg.ensure_state_dir()?;
+    let database = cfg.state_db();
+    if std::fs::symlink_metadata(&database).is_ok() {
+        gently_store::Store::open(&database).context(
+            "local state schema check failed; explicitly move or reset disposable application state",
+        )?;
+    }
+    eprintln!("gently: local setup checks passed");
+    Ok(())
+}
+
+fn read_policy_json<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T> {
+    use std::io::Read;
+    const MAX_POLICY_BYTES: u64 = 64 * 1024;
+    gently_store::private_fs::harden_existing_file(path)
+        .context("public recipient policy path is unsafe or unreadable")?;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .context("public recipient policy file is missing or unreadable")?
+        .take(MAX_POLICY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("cannot read public recipient policy")?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_POLICY_BYTES,
+        "public recipient policy exceeds 64 KiB"
+    );
+    serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("invalid public recipient policy JSON"))
+}
+
+pub fn print_setup_json() -> Result<()> {
+    let cfg = Config::load()?;
+    // This allowlisted view is deliberately separate from Config: adding a
+    // credential or reader field to Config cannot accidentally serialize it.
+    #[derive(Serialize)]
+    struct PublicSetup<'a> {
+        collector_url: &'a str,
+        state_dir: &'a std::path::Path,
+        tenant_id: &'a str,
+        device_id: &'a str,
+    }
+    let view = PublicSetup {
+        collector_url: &cfg.collector_url,
+        state_dir: &cfg.state_dir,
+        tenant_id: &cfg.tenant_id,
+        device_id: &cfg.device_id,
+    };
+    println!("{}", serde_json::to_string(&view)?);
+    Ok(())
+}
 
 /// Resolved runtime configuration.
 #[derive(Clone)]
@@ -77,6 +162,13 @@ impl Config {
                 .join(".gently"),
         };
 
+        let state_dir = if state_dir.is_absolute() {
+            state_dir
+        } else {
+            std::env::current_dir()
+                .context("cannot resolve relative GENTLY_STATE_DIR")?
+                .join(state_dir)
+        };
         gently_store::private_fs::ensure_private_dir(&state_dir)?;
         let file: FileConfig = {
             let path = state_dir.join("config.toml");
@@ -91,7 +183,7 @@ impl Config {
         };
 
         let capture_raw_values = env_bool("GENTLY_CAPTURE_RAW_VALUES", file.capture_raw_values)?;
-        Ok(Self {
+        let cfg = Self {
             collector_url: env_or("GENTLY_COLLECTOR_URL", file.collector_url),
             token: std::env::var("GENTLY_TOKEN").unwrap_or_default(),
             state_dir,
@@ -118,10 +210,49 @@ impl Config {
             // Env-overridable so a latency-sensitive caller (e.g. a tmux launcher
             // resolving a pane) can demand a tight fast-fail instead of the 30s
             // default that suits interactive querying.
-            query_timeout_secs: env_u64("GENTLY_QUERY_TIMEOUT_SECS")
+            query_timeout_secs: env_u64("GENTLY_QUERY_TIMEOUT_SECS")?
                 .or(file.query_timeout_secs)
                 .unwrap_or(DEFAULT_QUERY_TIMEOUT_SECS),
-        })
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            valid_id(&self.tenant_id) && valid_id(&self.device_id),
+            "tenant_id and device_id must be 1–64 ASCII letters, digits, underscores or hyphens"
+        );
+        anyhow::ensure!(
+            (1..=1_000_000).contains(&self.outbox_cap),
+            "outbox_cap must be between 1 and 1000000"
+        );
+        anyhow::ensure!(
+            (1..=4096).contains(&self.export_batch),
+            "export_batch must be between 1 and 4096"
+        );
+        anyhow::ensure!(
+            (1..=3600).contains(&self.export_timeout_secs),
+            "export_timeout_secs must be between 1 and 3600"
+        );
+        anyhow::ensure!(
+            (1..=3600).contains(&self.query_timeout_secs),
+            "query_timeout_secs (or GENTLY_QUERY_TIMEOUT_SECS) must be between 1 and 3600"
+        );
+        for (name, path) in [
+            ("raw_manifest", self.raw_manifest.as_deref()),
+            ("raw_trust", self.raw_trust.as_deref()),
+            ("raw_identity", self.raw_identity.as_deref()),
+        ] {
+            anyhow::ensure!(
+                path.is_none_or(std::path::Path::is_absolute),
+                "{name} must use an absolute path (expand ~ in your shell)"
+            );
+        }
+        if !self.collector_url.is_empty() {
+            validate_collector_url(&self.collector_url)?;
+        }
+        Ok(())
     }
 
     /// Path to the local state database.
@@ -164,22 +295,22 @@ impl Config {
             !self.token.is_empty(),
             "token is not configured (supply GENTLY_TOKEN through your secret provider)"
         );
-        anyhow::ensure!(
-            valid_id(&self.tenant_id) && valid_id(&self.device_id),
-            "tenant_id and device_id must be 1–64 ASCII letters, digits, underscores or hyphens"
-        );
-        let url = reqwest::Url::parse(&self.collector_url)
-            .map_err(|_| anyhow::anyhow!("invalid collector URL"))?;
-        let loopback = url.host_str().is_some_and(|host| {
-            host == "localhost"
-                || host
-                    .trim_matches(['[', ']'])
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        });
-        anyhow::ensure!((url.scheme() == "https" || (url.scheme() == "http" && loopback)) && url.host_str().is_some() && url.username().is_empty() && url.password().is_none() && url.query().is_none() && url.fragment().is_none(), "collector URL must use HTTPS or loopback HTTP and contain no credentials, query or fragment");
-        Ok(())
+        self.validate()
     }
+}
+
+fn validate_collector_url(collector_url: &str) -> Result<()> {
+    let url =
+        reqwest::Url::parse(collector_url).map_err(|_| anyhow::anyhow!("invalid collector URL"))?;
+    let loopback = url.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host
+                .trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    anyhow::ensure!((url.scheme() == "https" || (url.scheme() == "http" && loopback)) && url.host_str().is_some() && url.username().is_empty() && url.password().is_none() && url.query().is_none() && url.fragment().is_none(), "collector URL must use HTTPS or loopback HTTP and contain no credentials, query or fragment");
+    Ok(())
 }
 
 fn valid_id(value: &str) -> bool {
@@ -213,9 +344,17 @@ fn env_or(key: &str, fallback: String) -> String {
         .unwrap_or(fallback)
 }
 
-/// Read a `u64` from an env var, or `None` if unset/empty/unparseable.
-fn env_u64(key: &str) -> Option<u64> {
-    std::env::var(key).ok().and_then(|v| v.trim().parse().ok())
+/// An explicitly supplied duration must be usable rather than silently ignored.
+fn env_u64(key: &str) -> Result<Option<u64>> {
+    match std::env::var(key) {
+        Ok(value) => {
+            value.trim().parse().map(Some).map_err(|_| {
+                anyhow::anyhow!("{key} must be an unsigned integer between 1 and 3600")
+            })
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(_) => anyhow::bail!("{key} must be an unsigned integer between 1 and 3600"),
+    }
 }
 
 #[cfg(test)]

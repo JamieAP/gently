@@ -63,6 +63,7 @@ impl Transport for Http2Transport {
 /// Prevent redirect replay and proxy routing from escaping a local collector.
 pub(crate) fn client_builder(collector_url: &str, timeout_secs: u64) -> reqwest::ClientBuilder {
     let mut builder = reqwest::Client::builder()
+        .user_agent(crate::USER_AGENT)
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .redirect(reqwest::redirect::Policy::none());
     if is_loopback(collector_url) {
@@ -146,6 +147,45 @@ mod tests {
             transport.endpoint,
             "http://127.0.0.1:8787/v1/traces?tenant_id=personal"
         );
+    }
+
+    #[tokio::test]
+    async fn trace_requests_identify_gently_to_the_collector() {
+        use crate::{Http2Transport, Transport};
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut headers = Vec::new();
+            let mut byte = [0];
+            while !headers.ends_with(b"\r\n\r\n") {
+                assert_eq!(stream.read(&mut byte).unwrap(), 1);
+                headers.push(byte[0]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            String::from_utf8(headers).unwrap()
+        });
+        Http2Transport::new(&base, "synthetic-token", "lab", 3)
+            .unwrap()
+            .send(Vec::new())
+            .await
+            .unwrap();
+        let headers = server.join().unwrap();
+        assert!(headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case(concat!(
+                "user-agent: gently/",
+                env!("CARGO_PKG_VERSION"),
+                " (+https://github.com/JamieAP/gently)"
+            ))));
     }
 
     #[test]

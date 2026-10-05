@@ -138,7 +138,7 @@ impl Store {
     }
 }
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS open_spans (
@@ -181,6 +181,8 @@ CREATE TABLE IF NOT EXISTS raw_objects (
   object_json TEXT NOT NULL,
   created_unix_nano INTEGER NOT NULL,
   synced INTEGER NOT NULL DEFAULT 0,
+  rejected_status INTEGER,
+  rejected_unix_nano INTEGER,
   PRIMARY KEY (tenant_id, raw_ref)
 );
 CREATE INDEX IF NOT EXISTS raw_objects_pending ON raw_objects (tenant_id, synced, created_unix_nano);

@@ -48,6 +48,22 @@ pub fn run() -> Result<()> {
         Cell::new(raw.pending_bytes),
     ]);
     t.add_row(vec![
+        Cell::new("raw_quarantined"),
+        Cell::new(raw.quarantined_objects),
+    ]);
+    t.add_row(vec![
+        Cell::new("raw_quarantined_bytes"),
+        Cell::new(raw.quarantined_bytes),
+    ]);
+    t.add_row(vec![
+        Cell::new("raw_last_rejection"),
+        Cell::new(
+            raw.last_rejection_status
+                .map(|status| format!("HTTP {status}"))
+                .unwrap_or_else(|| "-".into()),
+        ),
+    ]);
+    t.add_row(vec![
         Cell::new("raw_budget_bytes"),
         Cell::new(gently_store::RAW_OBJECT_CAP_BYTES),
     ]);

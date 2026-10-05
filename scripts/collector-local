@@ -41,19 +41,17 @@ if [ ! -f "$repo_dir/worker/node_modules/wrangler/bin/wrangler.js" ]; then
   printf '%s\n' 'Install collector dependencies with npm ci in the worker directory.' >&2
   exit 1
 fi
-if [ "$check_only" = true ]; then exit 0; fi
+if [ "$check_only" = true ]; then
+  exec "$python_bin" "$repo_dir/scripts/collector-supervise.py" --check "$gently_bin"
+fi
 if [ -z "${GENTLY_TOKEN-}" ]; then
   printf '%s\n' 'Supply GENTLY_TOKEN through your secret provider before starting the collector.' >&2
   exit 1
 fi
 
-cd "$repo_dir/worker"
 export WRANGLER_SEND_METRICS=false
 # Prevent diagnostics from persisting secret bindings, even on startup failures.
 export WRANGLER_WRITE_LOGS=false
 export WRANGLER_LOG=log
-export GENTLY_COLLECTOR_URL=http://127.0.0.1:8787
-export GENTLY_TENANT_ID=${GENTLY_TENANT_ID:-personal}
-export GENTLY_DEVICE_ID=${GENTLY_DEVICE_ID:-local}
 exec "$python_bin" \
   "$repo_dir/scripts/collector-supervise.py" "$node_bin" "$gently_bin" "$repo_dir"

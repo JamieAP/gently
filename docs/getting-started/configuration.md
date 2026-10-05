@@ -26,7 +26,7 @@ repository files, command arguments and shell history.
 | Process or command | Collector token required? |
 | --- | --- |
 | `gently hook` | No. It queues locally; an inherited token permits detached export. |
-| `gently init`, `gently status`, `gently raw` | No. They operate on local configuration, state or keys. |
+| `gently init`, `gently status`, `gently config`, `gently raw` | No. They operate on local configuration, state or keys. |
 | `gently export`, `gently export --watch` | Yes, with ingest capability. |
 | `gently traces`, `trace`, `spans`, `stats`, `whoami`, MCP queries | Yes, with read capability. |
 | `gently waterfall` reading stdin | No. It does not load configuration. |
@@ -60,13 +60,13 @@ device_id = "mac-main"
 | `tenant_id` | `personal` | Namespace for capture, export and query; must match the authenticated host. |
 | `device_id` | `local` | Capture host identifier; must match the upload credential's device. |
 | `prefer_quic` | `true` | Prefer HTTP/3 export with a TCP fallback; use `false` for localhost HTTP. |
-| `outbox_cap` | `10000` | Envelope limit applied when export drains; excess oldest envelopes are dropped. |
-| `export_batch` | `512` | Queued envelopes coalesced into one export request. |
-| `export_timeout_secs` | `15` | Per-request export timeout in seconds. |
-| `query_timeout_secs` | `30` | Per-request CLI/MCP query timeout in seconds. |
+| `outbox_cap` | `10000` | 1–1000000 envelopes applied when export drains; excess oldest envelopes are dropped. |
+| `export_batch` | `512` | 1–4096 queued envelopes coalesced into one export request. |
+| `export_timeout_secs` | `15` | Per-request export timeout, 1–3600 seconds. |
+| `query_timeout_secs` | `30` | Per-request CLI/MCP query timeout, 1–3600 seconds. |
 | `capture_raw_values` | `false` | Encrypt selected raw fields before storing them locally. |
 | `sync_raw_values` | `false` | Upload retained ciphertext before draining metadata; needs no reader identity. |
-| `resolve_raw_values` | `false` | Unlock a reader identity and hydrate referenced raw fields in query results. |
+| `resolve_raw_values` | `false` | Unlock a reader only for referenced ciphertext and hydrate raw fields in query results. |
 | `raw_manifest` | unset | Owner-signed public reader enrollment manifest used by capture. |
 | `raw_trust` | unset | Locally verified tenant owner key, minimum epoch and public manifest digest used by capture. |
 | `raw_identity` | unset | Reader identity used only by explicit resolution or owner operations. |
@@ -77,6 +77,9 @@ exporter drains it. Ciphertext retention is separate from this cap: each
 tenant/device database admits at most 64 MiB of encoded ciphertext envelopes,
 excluding SQLite page/WAL overhead. Full storage skips new raw capture or
 caching without evicting existing objects. Metadata capture continues.
+Rejected raw objects remain encrypted in quarantine and do not block metadata;
+inspect `gently status` and explicitly retry with
+`gently export --retry-raw-quarantine` after correcting the collector issue.
 
 ## Environment overrides
 
@@ -93,11 +96,19 @@ caching without evicting existing objects. Metadata capture continues.
 | `GENTLY_RAW_MANIFEST`, `GENTLY_RAW_TRUST`, `GENTLY_RAW_IDENTITY` | Override the corresponding file paths. |
 
 Capture, cloud sync and resolution are independent and disabled by default.
-Invalid boolean values are configuration errors. Register MCP resolution
+Invalid boolean/numeric values and relative raw paths are configuration errors.
+Raw paths must be absolute; expand `~` before putting a path in TOML.
+Register MCP resolution
 explicitly with `gently init --claude --resolve-raw-values` or the equivalent
 Codex command. Reinstalling without that option removes the registration flag;
 file settings or independently inherited environment settings still apply.
 See [encrypted raw setup](../guides/encrypted-raw-values.md).
+
+`gently config --json` prints only the resolved collector URL, state directory,
+tenant and device. `gently config --check` verifies enabled public capture policy,
+the metadata of a configured reader path and an existing state schema. It needs
+no token and never reads or unlocks a reader identity. Metadata queries and MCP
+initialization remain available when an opted-in private reader is unavailable.
 
 ## Local files
 

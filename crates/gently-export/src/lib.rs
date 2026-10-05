@@ -15,6 +15,14 @@ pub use http2::Http2Transport;
 pub use prefer::PreferQuic;
 pub use quic::QuicTransport;
 
+/// Truthful application identification shared by export, query and raw-value
+/// HTTP clients, including HTTP/3 through the shared transport builder.
+pub const USER_AGENT: &str = concat!(
+    "gently/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/JamieAP/gently)"
+);
+
 use gently_core::OtlpRequest;
 use gently_store::Store;
 

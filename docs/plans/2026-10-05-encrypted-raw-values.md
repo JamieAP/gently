@@ -95,4 +95,38 @@ Focused tests observed failures before implementing encryption, encrypted captur
 
 The end-to-end fixture exercises the CLI hook, keyless exporter, authenticated tenant HTTP routes, remote cache miss, enrolled local decryption and ciphertext-only persistence in separate capture/reader state roots. Worker authorization/storage is separately exercised against the actual Workers test runtime. Hardware prompts and a real Cloudflare deployment are outside synthetic verification.
 
-Final verification: 216 Rust tests (`cargo test --locked --quiet`), 49 Worker tests, 7 launcher tests, strict all-target Clippy, Rust formatting, TypeScript checks, whitespace checks and 117 local documentation link targets passed. No live state, vault, hardware identity or Cloudflare deployment was accessed.
+Initial implementation verification: 216 Rust tests (`cargo test --locked --quiet`), 49 Worker tests, 7 launcher tests, strict all-target Clippy, Rust formatting, TypeScript checks, whitespace checks and 117 local documentation link targets passed. This initial run did not access live state, vaults, hardware identities or Cloudflare.
+
+## Follow-up validation and hardening
+
+The user subsequently authorized actual disposable Secure Enclave and Cloudflare
+acceptance, overriding the initial plan's no-deployment validation scope. The
+installed vault, existing hardware identities, OAuth configuration and live
+Gently state remain outside that authorization.
+
+Regression fixes cover configuration bounds and path validation, safe public
+preflight, malformed/inline harness configuration, lazy private reader unlock,
+bounded request-level decryption caching, private-terminal echo/signal/flow
+control restoration, raw quarantine and explicit retry, raw-only export health,
+and bounded cleanup of owned service process groups. Fresh full Rust verification
+passes 239 tests, formatting and strict all-target Clippy. Launcher verification
+passes 14 tests.
+
+The actual local Wrangler/D1 acceptance passes with both harnesses, software
+CLI/MCP readers, owner recovery, tenant/device isolation, outage and authentication
+recovery, oversized-batch bisection, recipient/credential revocation, raw conflict
+quarantine/retry, and scans of database/WAL/log bytes. A separate complete run
+passes using a new disposable Secure Enclave reader through native authorization,
+CLI/MCP decryption and owner signing. Neither run uses the credential vault.
+
+The first real Cloudflare attempt exposed error 1010 for the default test-client
+User-Agent and removed both disposable cloud resources. Export, query and raw
+clients now identify themselves truthfully as Gently, with server-observed
+regressions that failed before the fix and pass afterward. The staging runner
+keeps host credentials in memory, records only public recovery IDs, and cleans
+up owned resources after normal completion or controlled interruption.
+
+The new CI workflow runs the complete software acceptance against an installed
+CLI on macOS and Linux. Hardware denial/GUI launch behavior, forced HTTP/3 where
+unavailable, production retention/quotas and writer provenance remain separate
+claims; passing software tests does not establish them.

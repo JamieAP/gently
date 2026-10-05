@@ -4,6 +4,148 @@
 use assert_cmd::Command;
 use serde_json::Value;
 
+fn isolated_init(home: &std::path::Path) -> Command {
+    let mut command = Command::cargo_bin("gently").unwrap();
+    command
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("GENTLY_STATE_DIR", home.join(".gently"));
+    command
+}
+
+#[test]
+fn codex_inline_tables_install_without_panics_and_preserve_preferences() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".codex")).unwrap();
+    let path = dir.path().join(".codex/config.toml");
+    std::fs::write(&path, "# inline preferences\nhooks = { PreToolUse = [{ hooks = [{ type = 'command', command = 'user-check' }] }] }\nmcp_servers = { other = { command = 'other-mcp' }, gently = { enabled = false, env = { USER_SETTING = 'kept' } } }\nfeatures = { multi_agent = true }\n").unwrap();
+    isolated_init(dir.path())
+        .args(["init", "--codex", "--resolve-raw-values"])
+        .assert()
+        .success();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("# inline preferences"));
+    let doc: toml::Value = toml::from_str(&text).unwrap();
+    assert_eq!(doc["features"]["multi_agent"].as_bool(), Some(true));
+    assert_eq!(doc["features"]["hooks"].as_bool(), Some(true));
+    assert_eq!(
+        doc["mcp_servers"]["other"]["command"].as_str(),
+        Some("other-mcp")
+    );
+    assert_eq!(
+        doc["mcp_servers"]["gently"]["enabled"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        doc["mcp_servers"]["gently"]["env"]["USER_SETTING"].as_str(),
+        Some("kept")
+    );
+    assert_eq!(doc["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+    isolated_init(dir.path())
+        .args(["init", "--codex"])
+        .assert()
+        .success();
+    let text = std::fs::read_to_string(path).unwrap();
+    let refreshed: toml::Value = toml::from_str(&text).unwrap();
+    assert_eq!(
+        refreshed["hooks"]["PreToolUse"].as_array().unwrap().len(),
+        2
+    );
+    assert!(refreshed["mcp_servers"]["gently"]["env"]
+        .get("GENTLY_RESOLVE_RAW_VALUES")
+        .is_none());
+}
+
+#[test]
+fn invalid_codex_shapes_return_clean_errors_and_preserve_existing_files() {
+    for (field, contents) in [
+        ("hooks", "hooks = 'unexpected'\n"),
+        ("hooks.PreToolUse", "[hooks]\nPreToolUse = 'unexpected'\n"),
+        (
+            "hooks.PreToolUse.hooks",
+            "[[hooks.PreToolUse]]\nhooks = 'unexpected'\n",
+        ),
+        ("mcp_servers", "mcp_servers = 'unexpected'\n"),
+        (
+            "mcp_servers.gently",
+            "[mcp_servers]\ngently = 'unexpected'\n",
+        ),
+        (
+            "mcp_servers.gently.env",
+            "[mcp_servers.gently]\nenv = 'unexpected'\n",
+        ),
+        ("features", "features = 'unexpected'\n"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".codex")).unwrap();
+        let path = dir.path().join(".codex/config.toml");
+        std::fs::write(&path, contents).unwrap();
+        let result = isolated_init(dir.path())
+            .args(["init", "--codex"])
+            .assert()
+            .code(1)
+            .get_output()
+            .clone();
+        let stderr = String::from_utf8(result.stderr).unwrap();
+        assert!(stderr.contains(field), "{stderr}");
+        assert!(!stderr.contains("panicked"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), contents);
+    }
+}
+
+#[test]
+fn codex_empty_inline_hook_arrays_accept_registration() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".codex")).unwrap();
+    let path = dir.path().join(".codex/config.toml");
+    std::fs::write(
+        &path,
+        "hooks = { PreToolUse = [], PostToolUse = [{ hooks = [] }] }\n",
+    )
+    .unwrap();
+    isolated_init(dir.path())
+        .args(["init", "--codex"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn unreadable_configuration_encoding_is_rejected_without_overwriting() {
+    for (harness, name) in [
+        ("--codex", ".codex/config.toml"),
+        ("--claude", ".claude/settings.json"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let contents = b"synthetic-unreadable-config\xff";
+        std::fs::write(&path, contents).unwrap();
+        isolated_init(dir.path())
+            .args(["init", harness])
+            .assert()
+            .failure();
+        assert_eq!(std::fs::read(path).unwrap(), contents);
+    }
+}
+
+#[test]
+fn malformed_codex_toml_errors_never_echo_source_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".codex/config.toml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let contents = "setting = 'synthetic-init-parse-canary\n";
+    std::fs::write(&path, contents).unwrap();
+    let result = isolated_init(dir.path())
+        .args(["init", "--codex"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert!(!String::from_utf8_lossy(&result.stderr).contains("synthetic-init-parse-canary"));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), contents);
+}
+
 fn init(home: &std::path::Path) {
     Command::cargo_bin("gently")
         .unwrap()

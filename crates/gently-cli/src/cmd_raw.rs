@@ -6,7 +6,6 @@ use serde::de::DeserializeOwned;
 use std::fs::{self, File, OpenOptions};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use zeroize::Zeroizing;
 
 const MAX_ENROLLMENT_BYTES: usize = 64 * 1024;
 
@@ -69,8 +68,8 @@ fn identity(out: &Path) -> anyhow::Result<()> {
     if !std::io::stdin().is_terminal() {
         anyhow::bail!("reader identity creation requires a private interactive terminal");
     }
-    let passphrase = Zeroizing::new(rpassword::prompt_password("Reader passphrase: ")?);
-    let confirm = Zeroizing::new(rpassword::prompt_password("Confirm reader passphrase: ")?);
+    let passphrase = gently_raw::prompt_reader_passphrase("Reader passphrase: ")?;
+    let confirm = gently_raw::prompt_reader_passphrase("Confirm reader passphrase: ")?;
     if *passphrase != *confirm {
         anyhow::bail!("reader passphrases do not match");
     }

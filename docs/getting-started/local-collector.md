@@ -51,8 +51,9 @@ device_id = "local"
 ```
 
 Use the same tenant, device and state directory for hooks and the exporter.
-The launchers default to `personal`/`local`; environment overrides take
-precedence. Restart the agent, and review/trust installed Codex hooks inside
+The launchers resolve the same file settings and environment overrides as the
+CLI; `personal`/`local` apply only when neither specifies a namespace. Restart
+the agent, and review/trust installed Codex hooks inside
 Codex. Raw capture, ciphertext sync and reader resolution remain off.
 
 ## 3. Preflight and start
@@ -64,7 +65,9 @@ Check dependencies before requesting any credential unlock:
 ./scripts/export-local --check
 ```
 
-These checks need no token and never call a secret provider. In a foreground
+These checks validate dependencies, configuration, public capture policy,
+configured reader paths and an existing state schema. They need no token,
+never unlock an identity and never call a secret provider. In a foreground
 terminal that already inherits `GENTLY_TOKEN`, start:
 
 ```sh
@@ -83,7 +86,8 @@ The provider unlocks once, then Gently starts the Worker and
 authorization map in memory from the inherited token and tenant/device IDs;
 it removes `GENTLY_TOKEN` from the Worker environment. No plaintext secret file
 or token argument is created. The Worker binds to loopback, Wrangler telemetry
-and disk diagnostics are disabled, and either child's exit stops its companion.
+and disk diagnostics are disabled. Either child's exit stops both owned process
+groups, including descendants of a parent that has already exited.
 
 Leave the terminal open. Stop both services with Ctrl+C, and stop an old
 instance before starting another. This is a foreground job, not a login

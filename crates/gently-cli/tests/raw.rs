@@ -271,3 +271,20 @@ fn protected_software_reader_never_runs_inherited_pinentry_program() {
     assert!(!dir.path().join("pinentry-started").exists());
     assert!(!out.exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn immediate_private_terminal_input_is_hidden_and_terminal_state_is_restored() {
+    let output = std::process::Command::new("python3")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+        .args(["-c", include_str!("private_reader_tty.py")])
+        .arg(assert_cmd::cargo::cargo_bin!("gently"))
+        .output()
+        .expect("Python is required for the synthetic private-terminal regression");
+    assert!(
+        output.status.success(),
+        "private-terminal regression failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

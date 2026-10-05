@@ -25,6 +25,9 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
 
+mod private_prompt;
+pub use private_prompt::prompt_reader_passphrase;
+
 pub const VERSION: u32 = 1;
 pub const MAX_PLAINTEXT_BYTES: usize = 256 * 1024;
 pub const MAX_CIPHERTEXT_BYTES: usize = 512 * 1024;
@@ -666,7 +669,7 @@ impl age::Callbacks for PrivateTerminalCallbacks {
         if !has_private_terminal {
             return None;
         }
-        let passphrase = Zeroizing::new(rpassword::prompt_password("Reader passphrase: ").ok()?);
+        let passphrase = prompt_reader_passphrase("Reader passphrase: ").ok()?;
         if passphrase.is_empty() {
             return None;
         }

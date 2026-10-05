@@ -17,20 +17,27 @@ const MAX_ATTEMPTS: u32 = 3;
 const BACKOFF_BASE: Duration = Duration::from_millis(250);
 const WATCH_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-pub fn run() -> Result<()> {
-    run_mode(None)
+pub fn run(retry_raw_quarantine: bool) -> Result<()> {
+    run_mode(None, retry_raw_quarantine)
 }
 
 /// Unlock credentials once in a foreground launcher, then drain new hook rows.
-pub fn watch(interval_secs: u64) -> Result<()> {
-    run_mode(Some(Duration::from_secs(interval_secs.max(1))))
+pub fn watch(interval_secs: u64, retry_raw_quarantine: bool) -> Result<()> {
+    run_mode(
+        Some(Duration::from_secs(interval_secs.max(1))),
+        retry_raw_quarantine,
+    )
 }
 
-fn run_mode(watch_interval: Option<Duration>) -> Result<()> {
+fn run_mode(watch_interval: Option<Duration>, retry_raw_quarantine: bool) -> Result<()> {
     let cfg = Config::load()?;
     cfg.ensure_state_dir()?;
     crate::logging::init_file_log(&cfg.runtime_dir().join("export.log"));
     cfg.require_collector()?;
+    anyhow::ensure!(
+        !retry_raw_quarantine || cfg.sync_raw_values,
+        "--retry-raw-quarantine requires encrypted raw synchronization to be enabled"
+    );
 
     let lock_path = cfg.runtime_dir().join("export.lock");
     let lock = gently_store::private_fs::open_private_file(&lock_path, false)
@@ -47,6 +54,10 @@ fn run_mode(watch_interval: Option<Duration>) -> Result<()> {
         Err(e) => return Err(e).context("acquiring export lock"),
     }
     let store = Store::open(&cfg.state_db())?;
+    if retry_raw_quarantine {
+        let objects = store.raw_objects_retry_quarantined(&cfg.tenant_id)?;
+        tracing::info!(objects, "retained rejected ciphertext scheduled for retry");
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -145,7 +156,7 @@ async fn export_with_retry<T: Transport>(
 ) -> Result<usize, ExportError> {
     for attempt in 0..MAX_ATTEMPTS {
         match drain_all(store, transport, cap, batch_size, raw_sync).await {
-            Ok(n) => return Ok(n),
+            Ok(outcome) => return Ok(outcome.spans),
             Err(e) => {
                 if !e.retryable() || attempt + 1 == MAX_ATTEMPTS {
                     return Err(e);
@@ -189,12 +200,16 @@ async fn watch_loop<T: Transport, F: Future<Output = std::io::Result<()>>>(
                 result = drain_all(store, transport, cap, batch_size, raw_sync) => result,
             };
             match result {
-                Ok(n) => {
-                    delivered_total += n;
+                Ok(outcome) => {
+                    delivered_total += outcome.spans;
                     failures = 0;
-                    if n > 0 {
+                    if outcome.spans > 0 || outcome.raw_objects > 0 {
                         let _ = store.health_record_success(now_nanos());
-                        tracing::info!(delivered = n, "export watcher drained outbox");
+                        tracing::info!(
+                            spans = outcome.spans,
+                            raw_objects = outcome.raw_objects,
+                            "export watcher delivered queued telemetry"
+                        );
                     }
                 }
                 Err(e) => {
@@ -230,17 +245,25 @@ struct RawSync {
     tenant_id: String,
 }
 
+struct DrainOutcome {
+    spans: usize,
+    raw_objects: usize,
+}
+
 async fn drain_all<T: Transport>(
     store: &Store,
     transport: &T,
     cap: usize,
     batch_size: usize,
     raw_sync: Option<&RawSync>,
-) -> Result<usize, ExportError> {
-    if let Some(raw) = raw_sync {
-        sync_ciphertext(store, &raw.client, &raw.tenant_id).await?;
-    }
-    drain(store, transport, cap, batch_size).await
+) -> Result<DrainOutcome, ExportError> {
+    let raw_objects = if let Some(raw) = raw_sync {
+        sync_ciphertext(store, &raw.client, &raw.tenant_id).await?
+    } else {
+        0
+    };
+    let spans = drain(store, transport, cap, batch_size).await?;
+    Ok(DrainOutcome { spans, raw_objects })
 }
 
 async fn sync_ciphertext(
@@ -255,9 +278,17 @@ async fn sync_ciphertext(
             return Ok(delivered);
         }
         for object in pending {
-            client.upload_raw(&object).await?;
-            store.raw_objects_mark_synced(tenant, &[object.context.raw_ref])?;
-            delivered += 1;
+            match client.upload_raw(&object).await {
+                Ok(()) => {
+                    store.raw_objects_mark_synced(tenant, &[object.context.raw_ref])?;
+                    delivered += 1;
+                }
+                Err(ExportError::Rejected(status)) => {
+                    store.raw_object_quarantine(tenant, &object.context.raw_ref, status)?;
+                    tracing::warn!(status, "collector rejected ciphertext; retained in raw quarantine; metadata export continues");
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
 }
@@ -338,6 +369,9 @@ mod tests {
     async fn watch_uploads_ciphertext_when_metadata_outbox_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("state.db")).unwrap();
+        store
+            .health_record_failure(1, "synthetic previous outage")
+            .unwrap();
         raw_fixture(&store);
         let (base, server) = crate::collector::tests::server("200 OK", "{}");
         let raw = RawSync {
@@ -367,6 +401,53 @@ mod tests {
         server.join().unwrap();
         assert!(store.raw_objects_pending("tenant-a", 1).unwrap().is_empty());
         assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
+        let health = store.health_snapshot().unwrap();
+        assert!(health.last_ok_unix_nano.is_some());
+        assert_eq!(health.consecutive_failures, 0);
+        assert_eq!(health.last_error, None);
+    }
+
+    #[tokio::test]
+    async fn rejected_ciphertext_does_not_block_metadata_and_can_be_retried() {
+        let (_directory, store) = fixture();
+        let object = raw_fixture(&store);
+        let (base, rejected_server) =
+            crate::collector::tests::server("409 Conflict", "synthetic-sensitive-response");
+        let raw = RawSync {
+            client: crate::collector::CollectorClient::new(&base, "synthetic-auth", "tenant-a", 2)
+                .unwrap(),
+            tenant_id: "tenant-a".into(),
+        };
+        let transport = recorder(false, false);
+        drain_all(&store, &transport, 100, 10, Some(&raw))
+            .await
+            .unwrap();
+        rejected_server.join().unwrap();
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(store.outbox_len().unwrap(), 0);
+        assert!(store
+            .raw_objects_pending("tenant-a", 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .raw_object_get("tenant-a", &object.context.raw_ref)
+                .unwrap(),
+            Some(object)
+        );
+        assert_eq!(store.raw_objects_retry_quarantined("tenant-a").unwrap(), 1);
+        let (base, successful_server) = crate::collector::tests::server("200 OK", "{}");
+        let client =
+            crate::collector::CollectorClient::new(&base, "synthetic-auth", "tenant-a", 2).unwrap();
+        assert_eq!(
+            sync_ciphertext(&store, &client, "tenant-a").await.unwrap(),
+            1
+        );
+        successful_server.join().unwrap();
+        assert!(store
+            .raw_objects_pending("tenant-a", 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

@@ -33,7 +33,6 @@ anyhow.workspace = true
 dirs = "5"
 toml = "0.8"
 toml_edit = "0.22"
-rpassword = "7.5.4"
 zeroize = "1.8"
 
 [dev-dependencies]
