@@ -75,19 +75,24 @@ npx wrangler d1 create gently
 ```
 
 Copy the returned database ID into `wrangler.toml`, then initialize the database,
-set a shared bearer token, and deploy:
+enroll per-host bearer credentials, and deploy:
 
 ```sh
 npx wrangler d1 execute gently --remote --file schema.sql
-npx wrangler secret put GENTLY_TOKEN
+npx wrangler secret put GENTLY_HOSTS
 npx wrangler deploy
 cd ..
 ```
 
-For a local collector with a Secure Enclave token, follow
-[Local setup](LOCAL_SETUP.md). It starts a localhost Worker, local D1, and an
-export watcher from a foreground terminal so hardware unlock can prompt once.
-Use `http://127.0.0.1:8787` as the collector URL.
+Configure `GENTLY_HOSTS` through a private secret-provider workflow as a JSON
+array of `{token, tenant_id, device_id, capabilities}` records. Use distinct
+host credentials and `ingest`/`read` capabilities; keep credential values out of
+source and shell arguments. See [collector setup](docs/getting-started/quickstart.md).
+
+For a local collector, follow [local setup](LOCAL_SETUP.md). The launchers
+accept an inherited token from your provider on Macs or Linux and start a
+loopback Worker, local D1 and an export watcher. A separate Mac hardware-backed
+secret helper is an optional wrapper.
 
 ### 2. Install the hooks
 
@@ -98,17 +103,20 @@ gently init --claude
 ```
 
 Init installs the hooks and MCP server and creates `~/.gently/config.toml` if it
-is missing. Set the collector URL there and supply the shared bearer token as
+is missing. Set the collector URL and enrolled tenant/device there. Supply the
+process's bearer credential only as
 `GENTLY_TOKEN` to export and query processes:
 
 ```toml
 collector_url = "https://gently-collector.<account>.workers.dev"
+tenant_id = "personal"
+device_id = "mac-main"
 # prefer_quic = true
 ```
 
 Restart your agent session after configuring it. Codex hooks must also be
-trusted inside Codex. `GENTLY_COLLECTOR_URL` and `GENTLY_TOKEN` override the config
-values. See [configuration](docs/getting-started/configuration.md) for queue,
+trusted inside Codex. `GENTLY_COLLECTOR_URL`, `GENTLY_TENANT_ID` and `GENTLY_DEVICE_ID` override
+public config values; `GENTLY_TOKEN` has no persisted-token fallback. See [configuration](docs/getting-started/configuration.md) for queue,
 transport, timeout, and state-directory options. A watcher can export tokenless
 desktop hooks; CLI and MCP query processes still need the token. Background
 hooks never attempt hardware unlock.
@@ -152,29 +160,34 @@ for Claude Code, check it with `claude mcp get gently`.
 | `response_fields` | Inspect available response fields |
 | `span_attr_keys` | Discover recorded attribute keys |
 
-The server uses stdio and its tools are read-only. Queries return digest
-attributes by default. See [querying and MCP](docs/guides/querying-and-mcp.md) for
+The server uses stdio and its tools are read-only. Queries return metadata, byte lengths and optional opaque raw references by
+default. See [querying and MCP](docs/guides/querying-and-mcp.md) for
 arguments, ordering, and local `jq` filters.
 
 ## Data and privacy
 
-Normal exports contain digests and byte lengths rather than raw prompt, command,
-file, or tool-output values. They also include identifying metadata such as
-working directories, host information, tool names, timings, and session IDs.
-Digests are fingerprints, not encryption.
+Normal exports contain metadata and byte lengths, with no public content
+fingerprints. Optional raw fields are encrypted before local persistence to
+only the readers in an owner-signed, locally pinned tenant policy. Capture,
+ciphertext cloud sync and reader resolution are independent and disabled by
+default. Cloudflare receives opaque ciphertext and never a raw-decryption key.
 
-Raw prompt, tool, and assistant capture is disabled by default. Enable local
-SQLite capture with `capture_raw_values = true` or `GENTLY_CAPTURE_RAW_VALUES=1`.
-Captured content is plaintext and has no automatic retention limit; disabling
-capture does not delete existing values. Raw resolution is a separate opt-in:
-install with `--resolve-local-raw-values` to let MCP queries resolve captured
-values. Those results may enter the calling agent's model-provider context.
-Reinstalling without that option removes the registered resolution opt-in.
+[Enroll Mac/Linux readers](docs/guides/encrypted-raw-values.md), including a
+recovery device, before enabling capture. Readers unlock their identity only
+for explicit resolution; decrypted CLI/MCP output can enter the calling
+agent's model-provider context. Native Mac hardware keys and passphrase-encrypted
+software keys have different protection guarantees.
 
-The collector's shared bearer token grants access to all traces. The collector
-provides no tenant separation or automatic retention. Protect both the collector
-and local state, and read [security and privacy](docs/concepts/security-and-privacy.md)
-for file permissions, exported fields, and debug-capture behaviour.
+The collector maps host credentials to tenant/device and ingest/read rights.
+Tenant boundaries are enforced in all storage and queries. Paths, host data,
+byte lengths and activity patterns remain visible, and raw objects have no
+writer signatures or full replay/provenance protocol against a malicious cloud.
+There is no automatic retention. Read
+[security and privacy](docs/concepts/security-and-privacy.md) for those limits.
+
+Gently is pre-public: existing development state must be explicitly reset to
+use the fresh encrypted schema. No plaintext migration, digest alias or
+compatibility reader is retained; the separate credential vault is preserved.
 
 ## Architecture and documentation
 
@@ -192,7 +205,8 @@ immediately; transient failures use backoff, and unprocessable envelopes can be
 quarantined.
 
 Session, turn, and subagent spans are updated as they open and close. The Worker
-replaces records with the same span ID. Exporting to another OpenTelemetry
+merges repeated span reports within a tenant and preserves each span's capture
+device ownership. Exporting to another OpenTelemetry
 backend requires handling these updates; CLI and MCP queries also depend on the
 Worker's query API.
 
@@ -222,11 +236,12 @@ cargo clippy --all-targets -- -D warnings
 cd worker
 npm ci
 npm test
+npm run typecheck
 ```
 
-For hook-schema diagnosis, see the
-[debug-capture documentation](docs/concepts/security-and-privacy.md). Debug
-capture writes additional raw data and should be enabled deliberately.
+Read the [capture and privacy documentation](docs/concepts/security-and-privacy.md)
+before enabling selected raw fields. The old plaintext full-payload debug
+capture has been removed.
 
 ## License
 

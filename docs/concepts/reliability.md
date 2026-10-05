@@ -20,10 +20,10 @@ lock and polls for new rows:
 gently export --watch --interval-secs 2
 ```
 
-The watcher needs a token in its own configuration or inherited environment.
-Gently does not unlock a secret store itself. The optional
-[local launchers](../getting-started/local-collector.md) arrange that through a
-separately installed helper. A watcher's token does not authenticate other CLI or MCP
+The watcher needs a token in its inherited environment.
+Gently does not unlock a secret store itself. A provider can wrap the
+[local launchers](../getting-started/local-collector.md) after their dependency
+preflight. A watcher's token does not authenticate other CLI or MCP
 processes, and the watcher is not installed as a login service.
 
 Stopping a watcher with Ctrl+C ends that drain loop. Start it again after a
@@ -35,8 +35,8 @@ needed to flush an idle queue.
 | Failure | Export behavior | Next step |
 | --- | --- | --- |
 | Authentication, `401` or `403` | Stop the run without retrying, falling back or quarantining the rejected send. Pending rows remain, subject to the capacity trimming below. | Correct the token and restart export or the watcher. |
-| Network error, timeout, 5xx or other endpoint rejection such as `404`, `405`, `408`, `409` or `429` | Back off; undelivered rows remain queued. | Check the endpoint and connectivity, then retry. |
-| Payload rejection, `400`, `413` or `422` | Split batches to isolate rejected envelopes and retain them in quarantine. | Inspect the rejected envelope and collector limits. |
+| Network error, timeout, 5xx or other endpoint rejection such as `404`, `405`, `408` or `429` | Back off; undelivered rows remain queued. | Check the endpoint and connectivity, then retry. |
+| Payload rejection, `400`, `409`, `413` or `422` | Split batches to isolate rejected envelopes and retain them in quarantine. | Inspect the rejected envelope and collector limits. |
 | Malformed queued JSON | Move that envelope to quarantine with a fixed diagnostic reason. | Inspect local storage and the producing version. |
 
 One-shot export makes up to three attempts for retryable failures. A watcher
@@ -44,7 +44,8 @@ continues retrying with backoff, capped at 30 seconds. Authentication errors
 stop either mode; later hooks may start a new exporter with the same still
 invalid token, so repeated failures require fixing configuration.
 
-Batch aggregation is limited to 4 MiB. A larger single envelope is sent alone.
+The collector limits requests to 1 MiB and 32 span reports. Oversized metadata is rejected and
+handled through the payload rejection path.
 An event envelope can contain several spans: quarantine operates on the whole
 envelope, so valid siblings can remain with a rejected span. Quarantine retains
 the bytes; moving a row there does not mean it reached the collector.
@@ -57,15 +58,22 @@ so a tokenless or idle queue can grow beyond it until a drain starts. The cap
 counts envelopes, not spans or bytes, and is not a bound on total database size.
 
 Capacity trimming happens before a request, including one that later fails
-authentication. Trimmed rows are lost. Raw-value storage, quarantine and
-collector traces have no automatic retention policy.
+authentication. Trimmed rows are lost. Each tenant/device database admits at
+most 64 MiB of encoded ciphertext envelopes; SQLite page/WAL overhead is extra.
+At capacity, capture retains metadata without new raw objects, and readers can
+decrypt cloud objects in memory while skipping cache insertion. Existing and
+pending ciphertext is never evicted automatically. Raw-value storage,
+quarantine and collector traces have no automatic retention policy; cloud
+quotas and scheduled deletion require a separate deployment policy.
 
 ## Replays and lifecycle gaps
 
 Acknowledged envelopes are removed from the outbox. If the exporter stops
 after the collector accepted a request but before local deletion, it may send
 those reports again. The collector merges repeated span IDs rather than
-creating duplicate rows.
+creating duplicate rows within the tenant. A different capture device cannot
+update a span owned by another host, and even its owner cannot change the trace
+identity. Cross-device parent links are allowed.
 
 Merging keeps the earliest reported start and the latest reported endpoint.
 Status, attributes and parent metadata come from the report with the latest
@@ -85,14 +93,26 @@ span can lose the local timing state needed for a later close.
 
 ## Checking health
 
-`gently status` reads local pending and quarantine counts, failure count,
+`gently status` reads local pending and quarantine counts, retained/pending raw
+object and encoded-byte counts, failure count,
 export/success timestamps and the latest error. It does not query the collector
 or confirm that a particular trace is complete. Compare it with collector
 queries when verifying delivery.
 
-`hook.log` and `export.log` live in the state directory. On process startup,
+`hook.log` and `export.log` live in the tenant/device runtime directory. On process startup,
 a log larger than 5 MiB is rotated to a single `.1` backup. Rotation is not a
 continuous size limit, so a long-running watcher can exceed that threshold.
 See [Troubleshooting](../guides/troubleshooting.md) for operational
 checks, and [Security and privacy](security-and-privacy.md) before sharing logs
 or local state.
+
+## Ciphertext delivery
+
+With `sync_raw_values` enabled, the exporter uploads immutable encrypted
+objects without a reader key. Pending ciphertext retries retain the same
+reference and bytes; acknowledgment marks only that tenant's successful
+uploads. With sync enabled, pending ciphertext is attempted before draining
+metadata, and an upload failure can stop the drain. A reference may still be
+unavailable if sync is disabled or delivery is incomplete. No decryption is needed for queueing, transport or
+cloud storage. Capture failures skip raw retention while metadata continues;
+invalid recipient policy never causes a plaintext fallback.

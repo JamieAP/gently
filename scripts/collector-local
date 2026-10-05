@@ -1,6 +1,13 @@
 #!/bin/sh
-# Unlock the local collector token once; keep it out of files and command arguments.
+# Start the local collector with credentials inherited from a secret provider.
 set -eu
+
+case ${1-} in
+  '') check_only=false ;;
+  --check) check_only=true ;;
+  *) printf '%s\n' 'Usage: collector-local [--check]' >&2; exit 2 ;;
+esac
+[ "$#" -le 1 ] || { printf '%s\n' 'Usage: collector-local [--check]' >&2; exit 2; }
 
 # Resolve the installed gently-collector symlink as well as direct invocations.
 script_path=$0
@@ -30,25 +37,21 @@ if [ ! -x "$gently_bin" ]; then
   printf '%s\n' 'Install gently before starting the local collector.' >&2
   exit 1
 fi
-secret_helper=$(command -v agent-secrets || true)
-if [ -z "$secret_helper" ]; then
-  secret_helper=$HOME/.local/bin/agent-secrets
-fi
-if [ ! -x "$secret_helper" ]; then
-  printf '%s\n' 'Install the agent-secrets helper before starting the collector.' >&2
-  exit 1
-fi
 if [ ! -f "$repo_dir/worker/node_modules/wrangler/bin/wrangler.js" ]; then
   printf '%s\n' 'Install collector dependencies with npm ci in the worker directory.' >&2
   exit 1
 fi
+if [ "$check_only" = true ]; then
+  exec "$python_bin" "$repo_dir/scripts/collector-supervise.py" --check "$gently_bin"
+fi
+if [ -z "${GENTLY_TOKEN-}" ]; then
+  printf '%s\n' 'Supply GENTLY_TOKEN through your secret provider before starting the collector.' >&2
+  exit 1
+fi
 
-cd "$repo_dir/worker"
 export WRANGLER_SEND_METRICS=false
 # Prevent diagnostics from persisting secret bindings, even on startup failures.
 export WRANGLER_WRITE_LOGS=false
 export WRANGLER_LOG=log
-export GENTLY_COLLECTOR_URL=http://127.0.0.1:8787
-# Unlock the allowlisted GENTLY_TOKEN once; children also inherit the foreground environment.
-exec "$secret_helper" run default -- "$python_bin" \
+exec "$python_bin" \
   "$repo_dir/scripts/collector-supervise.py" "$node_bin" "$gently_bin" "$repo_dir"

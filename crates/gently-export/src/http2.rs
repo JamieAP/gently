@@ -17,17 +17,32 @@ pub struct Http2Transport {
 impl Http2Transport {
     /// Build a transport targeting `collector_url` (the base URL; `/v1/traces`
     /// is appended) authenticated with `token`.
-    pub fn new(collector_url: &str, token: impl Into<String>, timeout_secs: u64) -> Self {
-        let endpoint = format!("{}/v1/traces", collector_url.trim_end_matches('/'));
+    pub fn new(
+        collector_url: &str,
+        token: impl Into<String>,
+        tenant_id: &str,
+        timeout_secs: u64,
+    ) -> Result<Self, ExportError> {
+        let endpoint = tenant_endpoint(collector_url, tenant_id)?;
         let client = client_builder(collector_url, timeout_secs)
             .build()
             .expect("reqwest client builds with default rustls config");
-        Self {
+        Ok(Self {
             endpoint,
             token: token.into(),
             client,
-        }
+        })
     }
+}
+
+pub(crate) fn tenant_endpoint(collector_url: &str, tenant_id: &str) -> Result<String, ExportError> {
+    let mut url = reqwest::Url::parse(&format!(
+        "{}/v1/traces",
+        collector_url.trim_end_matches('/')
+    ))
+    .map_err(|_| ExportError::Unavailable("invalid collector URL".into()))?;
+    url.query_pairs_mut().append_pair("tenant_id", tenant_id);
+    Ok(url.into())
 }
 
 impl Transport for Http2Transport {
@@ -48,6 +63,7 @@ impl Transport for Http2Transport {
 /// Prevent redirect replay and proxy routing from escaping a local collector.
 pub(crate) fn client_builder(collector_url: &str, timeout_secs: u64) -> reqwest::ClientBuilder {
     let mut builder = reqwest::Client::builder()
+        .user_agent(crate::USER_AGENT)
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .redirect(reqwest::redirect::Policy::none());
     if is_loopback(collector_url) {
@@ -102,7 +118,10 @@ pub(crate) fn classify(status: reqwest::StatusCode) -> Result<(), ExportError> {
         )))
     } else if matches!(
         status,
-        StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNPROCESSABLE_ENTITY
+        StatusCode::BAD_REQUEST
+            | StatusCode::CONFLICT
+            | StatusCode::PAYLOAD_TOO_LARGE
+            | StatusCode::UNPROCESSABLE_ENTITY
     ) {
         // Genuine poison: malformed / too large / unprocessable. Retrying the
         // same bytes can never succeed, so quarantine instead of looping.
@@ -119,6 +138,63 @@ mod tests {
     use super::classify;
     use crate::ExportError;
     use reqwest::StatusCode;
+
+    #[test]
+    fn trace_endpoint_is_tenant_scoped() {
+        let transport =
+            super::Http2Transport::new("http://127.0.0.1:8787", "fixture", "personal", 1).unwrap();
+        assert_eq!(
+            transport.endpoint,
+            "http://127.0.0.1:8787/v1/traces?tenant_id=personal"
+        );
+    }
+
+    #[tokio::test]
+    async fn trace_requests_identify_gently_to_the_collector() {
+        use crate::{Http2Transport, Transport};
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut headers = Vec::new();
+            let mut byte = [0];
+            while !headers.ends_with(b"\r\n\r\n") {
+                assert_eq!(stream.read(&mut byte).unwrap(), 1);
+                headers.push(byte[0]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            String::from_utf8(headers).unwrap()
+        });
+        Http2Transport::new(&base, "synthetic-token", "lab", 3)
+            .unwrap()
+            .send(Vec::new())
+            .await
+            .unwrap();
+        let headers = server.join().unwrap();
+        assert!(headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case(concat!(
+                "user-agent: gently/",
+                env!("CARGO_PKG_VERSION"),
+                " (+https://github.com/JamieAP/gently)"
+            ))));
+    }
+
+    #[test]
+    fn immutable_span_identity_conflict_is_a_payload_rejection() {
+        assert!(matches!(
+            classify(StatusCode::CONFLICT),
+            Err(ExportError::Rejected(409))
+        ));
+    }
 
     #[test]
     fn success_is_ok() {
@@ -185,7 +261,7 @@ mod tests {
                 }
             }
         });
-        let transport = Http2Transport::new(&origin_url, "synthetic-auth", 1);
+        let transport = Http2Transport::new(&origin_url, "synthetic-auth", "personal", 1).unwrap();
         assert!(transport
             .send(b"synthetic trace payload".to_vec())
             .await
@@ -223,11 +299,7 @@ mod tests {
 
     #[test]
     fn endpoint_configuration_errors_keep_valid_payloads_queued() {
-        for status in [
-            StatusCode::NOT_FOUND,
-            StatusCode::METHOD_NOT_ALLOWED,
-            StatusCode::CONFLICT,
-        ] {
+        for status in [StatusCode::NOT_FOUND, StatusCode::METHOD_NOT_ALLOWED] {
             let error = classify(status).unwrap_err();
             assert!(matches!(error, ExportError::Unavailable(_)));
             assert!(error.retryable());

@@ -1,105 +1,152 @@
 # Security and privacy
 
-Gently limits exported content fields to digests and byte lengths, but a trace
-still contains identifying metadata. Decide what may be captured, where it may
-be sent and who may query it before enabling the hooks.
+Gently encrypts opt-in raw capture before persistence, using only the public
+keys of enrolled readers. Cloudflare stores opaque ciphertext; reader private
+keys stay on devices. Ordinary traces still expose identifying metadata and
+activity patterns, so choose where that metadata may be sent.
 
 ## What is stored where
 
 | Location | Contents |
 | --- | --- |
-| Collector | Span IDs, names, timings, statuses, tool/use IDs, context and identifying metadata, plus truncated content digests and byte lengths. |
-| Local `state.db` | Pending envelopes, open-span bookkeeping, counters, quarantine and raw values when capture was enabled. |
-| Local debug files | Full hook payloads when both raw capture and debug capture are enabled. |
-| Local logs | Hook and export diagnostics. |
+| Collector metadata | IDs, names, timings, statuses, paths, host/session context, byte lengths and optional opaque raw references. |
+| Collector raw table | Immutable tenant-scoped age ciphertext envelopes when raw sync is enabled. |
+| Local `state.db` and SQLite sidecars | Metadata outbox, tracking, counters, quarantine and optional encrypted raw objects. |
+| Local logs | Operational diagnostics; processing failures use fixed messages without raw payloads. |
 
-Content digests use the first 8 bytes of SHA-256. They are fingerprints, not
-encryption or proof of anonymity. Low-entropy values can be guessed and matched.
-Byte lengths and repeated fingerprints can also reveal patterns.
+Public content hashes are not emitted, even when capture is disabled. Random
+raw references do not reveal whether two captured values are equal. Byte
+lengths, ciphertext sizes, paths, hostnames, session IDs and timing patterns
+remain visible. Encryption does not make that metadata anonymous.
 
-Working directories, hostnames, session/agent IDs, transcript paths, harness and
-version are exported as metadata. Model, source, effort, permission mode and
-agent type may also be included. Paths and activity patterns can identify
-projects or people even when prompt and tool values are not exported verbatim.
-Use a collector you control and are permitted to send that metadata to.
+## Three separate opt-ins
 
-## Capture and resolution are separate
-
-Both options are off by default and apply to different processes:
-
-| Option | Set on | Effect |
+| Control | Process | Effect |
 | --- | --- | --- |
-| `capture_raw_values = true` or `GENTLY_CAPTURE_RAW_VALUES=1` | Hook process | Store selected prompt, tool input/response and assistant values in local SQLite. |
-| `GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES=1` | Query or MCP process | Add matching retained local raw values to supported query results. |
+| `capture_raw_values` / `GENTLY_CAPTURE_RAW_VALUES` | Hook | Encrypt selected content to approved public recipients, then retain ciphertext locally. |
+| `sync_raw_values` / `GENTLY_SYNC_RAW_VALUES` | Exporter | Upload retained ciphertext without a reader identity. |
+| `resolve_raw_values` / `GENTLY_RESOLVE_RAW_VALUES` | CLI/MCP reader | Explicitly unlock a reader identity and hydrate referenced fields in memory. |
 
-Raw values are plaintext and can include credentials, commands, file contents
-or confidential material. They have no automatic retention limit. Turning off
-capture stops new raw-value writes; it does not erase existing values, sidecars,
-debug files or backups.
+All three default to false. Capture uses an owner-signed manifest and a local
+trust pin; it does not open a private key, invoke a plugin or request biometric
+unlock. Missing, invalid, expired or rolled-back policy never falls back to
+plaintext. See [enrollment](../guides/encrypted-raw-values.md) for the exact
+policy and setup workflow.
 
-Resolution does not enable capture. It looks up values already stored locally
-and does not add them to the export outbox. Resolved CLI output or MCP results
-can expose that content to readers; inside an agent, it can enter the agent's
-model-provider context.
+Reader resolution authenticates the encrypted context and field-to-span
+binding before adding content to a result. It uses retained local ciphertext,
+or authenticated cloud ciphertext when needed. Wrong keys, corrupted objects,
+changed tenant/context and mismatched field bindings are rejected. Decrypted
+output can include credentials, commands or source material, and MCP output
+can enter the calling agent's model-provider context.
 
-Normal `gently init --claude` and `gently init --codex` do not enable resolution.
-The `--resolve-local-raw-values` install option sets it for the registered MCP
-server. Running init again without the option removes the registered setting;
-an independently inherited environment flag can still enable it. See
-[Querying and MCP](../guides/querying-and-mcp.md) for the affected results.
+`gently init --claude --resolve-raw-values` and the equivalent Codex command
+set the MCP registration opt-in. Reinstalling without the flag removes that
+registration setting; independently configured settings still apply.
 
-### Debug capture
+Capture retains selected field maps. The previous plaintext full-payload debug
+JSONL path has been removed, and no process-environment snapshot is captured.
 
-`GENTLY_DEBUG=1` writes payload JSONL under
-`~/.gently/raw/<harness>/<Event>.jsonl` only when raw capture is also enabled.
-This can retain more content than the selected fields stored in SQLite. Debug
-capture does not dump the whole process environment. Files remain after the
-flags are disabled, so review their contents and retention after diagnosis.
+## Enrollment, recovery and revocation
 
-## Local file protection
+Each tenant pins its own owner verification key. That owner signs public
+reader enrollment, key epochs and expiry. Install the root through an
+independently verified trusted-device channel; do not trust a recipient key
+simply because the cloud returned it. Capture checks the signed policy against
+the local root, minimum epoch and exact manifest digest at that epoch. A
+different same-epoch policy is rejected. Advancing enrollment updates the trust
+pin on each capture host, and expired leases stop raw retention.
 
-On Unix, Gently's private-file helpers create or restrict application/harness
-state directories to `0700` and managed files to `0600`. Those files include
-config, SQLite and sidecars, raw capture, logs, locks and updated harness config.
-The helpers reject final-path symlinks and, on Unix, files owned by another user
-or with multiple hardlinks before changing them.
+Authentication credentials and raw-decryption identities are different keys.
+A capture-only Linux host needs public policy and an ingest credential, not a
+reader identity. Software reader identities are passphrase encrypted; they do
+not provide Secure Enclave hardware protection. Macs may use a dedicated
+Secure Enclave identity and native age tag recipient. Gently does not reuse or
+modify the credential vault's identity. Software reader queries and signing
+require an attached private terminal for passphrase entry. A GUI MCP process
+without a terminal needs an interactively launched reader process or an enrolled
+hardware reader; passphrases are never read from the environment.
 
-These permissions do not encrypt content or protect it from the same user,
-privileged processes or an agent allowed to read the files. Copies and backups
-have their own permissions. Other platforms do not apply these Unix modes;
-configure suitable owner-only ACLs separately. Keep local state and logs within
-the access boundary appropriate for their contents.
+Enroll a recovery reader and test recovery before keeping long-lived data.
+An additional recipient can recover objects encrypted to it; the signing
+owner key needs its own protected recovery plan. New enrollment applies to
+future objects. There is no automatic historical re-encryption command.
 
-## Collector access and transport
+Revoke cloud access by removing a host's credential record, then remove its
+reader key, sign a higher-epoch manifest and update every capture host's policy
+and trust pin. Revocation cannot erase ciphertext or plaintext already copied,
+and an offline writer can use its last valid policy until its lease expires.
 
-The Worker requires `Authorization: Bearer <GENTLY_TOKEN>` for its routes. The
-single shared token grants read and write access to all traces; there is no
-per-user or per-trace authorization. Anyone holding it can query the collector.
+Age authenticates ciphertext and encrypted context; public-key encryption
+does not prove which capture host authored an object. This version has no
+writer signatures or full replay/provenance protocol. A malicious cloud can
+fabricate an entirely new encrypted object using public recipients, replay old
+objects, alter visible metadata or deny service. Context/binding checks detect
+ordinary substitutions, but do not establish an enrolled writer's origin.
 
-For a remote deployment, configure the token as a Worker secret and provide the
-same value to authorized local processes. Keep it out of source-controlled
-files, command arguments and shared logs. HTTPS protects remote transport.
-Local development uses HTTP on loopback; do not treat that setup as a protected
-remote endpoint. The project implements no tenant separation, mTLS, IP allowlist
-or automatic trace retention.
+## Collector authorization and Cloudflare tooling
 
-Authentication failure stops export without quarantining the rejected send.
-Export capacity trimming can already have removed older queued rows before that
-request; see [Reliability](reliability.md#capacity-and-retention).
+Clients receive `GENTLY_TOKEN` only through their environment. The Worker stores
+an operator-managed `GENTLY_HOSTS` secret mapping each credential to one tenant,
+one device and ingest/read capabilities. Every route requires a named tenant,
+and every database operation is scoped to the authenticated tenant. Ingest-only
+hosts cannot query metadata or raw ciphertext. Local defaults name one personal
+tenant; additional tenants have separate authorization and encryption roots.
 
-## Local launchers and process credentials
+The current bearer map has no automatic credential expiry. Operators rotate
+or revoke individual entries. HTTPS protects remote transport; local HTTP is
+bound to loopback. Keep credentials out of source, argument lists and logs.
+Raw endpoints limit JSON requests to 1 MiB and decoded ciphertext to 512 KiB.
+The Worker checks public age framing, not cryptographic payload integrity;
+client encryption and enrolled reader verification provide that boundary.
+Known raw aliases and `.sha256` attributes are rejected at metadata ingest,
+but arbitrary externally supplied text cannot be classified as private by
+these guards.
 
-The bundled collector/export launcher scripts call a separately installed
-`agent-secrets` helper. Secret storage and hardware unlock belong to that helper,
-not the Rust CLI. Its installation and supported platforms are separate from
-Gently; see [Local collector setup](../getting-started/local-collector.md).
+[Cloudflare Access service tokens](https://developers.cloudflare.com/cloudflare-one/access-controls/service-credentials/service-tokens/)
+can add per-host admission, expiry and rotation in a future deployment. This
+repository does not provision Access or send its service-token headers.
+[Secrets Store](https://developers.cloudflare.com/secrets-store/manage-secrets/)
+manages credentials for Cloudflare services; its management API does not
+return secret values for a Mac/Linux host vault. It must not hold raw reader
+keys or act as a plaintext decryption broker. D1 stores bounded ciphertext;
+R2 is deferred until larger objects justify it.
 
-A foreground launcher can pass a token to the Worker and export watcher through
-process environments. Those processes then hold the plaintext token. Background
-hooks do not initiate hardware unlock and can queue without a token.
+## Local files and development state
 
-The watcher's credentials are not transferred to separate CLI or MCP processes.
-Each query process needs its own authorized configuration or inherited token.
-Starting the collector and watcher does not establish authenticated desktop MCP
-access. See [Configuration](../getting-started/configuration.md) for process
-settings and [Architecture](architecture.md) for the data flow.
+Unix managed directories use `0700`; files and SQLite sidecars use `0600`.
+Final-path symlinks, foreign-owned files and multiple hardlinks are rejected
+before changing private files. Permissions do not protect unlocked plaintext
+from its reader process, the same user or privileged code. Backups and copies
+have their own access and recovery policies.
+
+Runtime state, logs and locks are isolated under
+`<state_dir>/tenants/<tenant_id>/devices/<device_id>/`; public config remains at
+the state-directory root. No unscoped state fallback is read.
+
+Each tenant/device state database admits at most 64 MiB of encoded ciphertext
+envelopes; SQLite pages and WAL overhead are additional. At capacity, capture
+skips new raw data while retaining metadata, and a reader can decrypt a fetched
+object in memory without adding it to the cache. No existing or pending object
+is evicted automatically. Cloud quotas and deletion schedules are an explicit
+future deployment policy.
+
+There is no automatic ciphertext or collector retention policy. Turning off
+capture or sync stops new work; it does not erase existing data. The pre-public
+runtime accepts only the new encrypted schema. Stop Gently before explicitly
+resetting disposable old state, SQLite sidecars and debug files; no legacy
+reader, migration or alias is retained. Deletion cannot prove erasure from SSD
+snapshots or backups. Preserve the separately installed credential vault.
+
+## Launchers and process credentials
+
+The local scripts perform dependency preflight and require an inherited token.
+An optional foreground secret-provider wrapper handles private unlock. The
+supervisor constructs the Worker authorization binding in memory and starts
+the exporter; those processes necessarily hold their runtime credentials.
+No hook initiates hardware unlock.
+
+An export watcher does not authorize a separate CLI or MCP process. Each needs
+its own inherited read credential and, for raw output, an enrolled reader
+identity. See [local setup](../getting-started/local-collector.md) and
+[architecture](architecture.md).

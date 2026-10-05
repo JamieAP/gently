@@ -87,3 +87,39 @@ fn mcp_response_fields_accepts_jq_filter() {
     let fields: Vec<String> = serde_json::from_str(text).unwrap();
     assert!(fields.iter().any(|f| f == "last_activity"));
 }
+
+#[test]
+fn mcp_metadata_handshake_does_not_unlock_or_require_an_opted_in_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"response_fields","arguments":{}}}"#,
+        "\n",
+    );
+    let assert = Command::cargo_bin("gently")
+        .unwrap()
+        .arg("mcp")
+        .env("GENTLY_STATE_DIR", dir.path())
+        .env("GENTLY_TENANT_ID", "personal")
+        .env("GENTLY_DEVICE_ID", "synthetic-reader")
+        .env("GENTLY_COLLECTOR_URL", "http://127.0.0.1:9")
+        .env("GENTLY_TOKEN", "synthetic-auth")
+        .env("GENTLY_RESOLVE_RAW_VALUES", "1")
+        .env("GENTLY_RAW_IDENTITY", dir.path().join("missing-reader.age"))
+        .write_stdin(input)
+        .assert()
+        .success();
+    let output = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let messages: Vec<serde_json::Value> = output
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(messages.len(), 3);
+    assert!(messages
+        .iter()
+        .all(|message| message.get("error").is_none()));
+    assert!(assert.get_output().stderr.is_empty());
+}

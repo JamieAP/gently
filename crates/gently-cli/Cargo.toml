@@ -13,6 +13,7 @@ gently-core = { path = "../gently-core" }
 gently-store = { path = "../gently-store" }
 gently-harness = { path = "../gently-harness" }
 gently-export = { path = "../gently-export" }
+gently-raw = { path = "../gently-raw" }
 clap.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
@@ -32,8 +33,10 @@ anyhow.workspace = true
 dirs = "5"
 toml = "0.8"
 toml_edit = "0.22"
+zeroize = "1.8"
 
 [dev-dependencies]
+age = "=0.12.1"
 assert_cmd = "2"
 tempfile = "3"
 predicates = "3"

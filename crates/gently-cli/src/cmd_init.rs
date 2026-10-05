@@ -1,8 +1,7 @@
 //! `gently init --claude/--codex` - install hooks and MCP into a harness.
 //!
 //! Idempotent: merges into the existing config files, preserving every other
-//! key, and skips entries that already point at this binary. Legacy commands
-//! for this executable are requoted in place without duplicating handlers.
+//! key, and skips entries that already point at this binary.
 //! Human-facing output goes to stderr (stdout stays clean).
 
 use crate::config::Config;
@@ -32,7 +31,7 @@ const MODELED_EVENTS: &[&str] = &[
     "PostModelSwitch",
 ];
 
-pub fn run_claude(resolve_local_raw_values: bool) -> Result<()> {
+pub fn run_claude(resolve_raw_values: bool) -> Result<()> {
     let cfg = Config::load()?;
     cfg.ensure_state_dir()?;
     let home = dirs::home_dir().context("cannot determine home directory")?;
@@ -40,7 +39,7 @@ pub fn run_claude(resolve_local_raw_values: bool) -> Result<()> {
 
     scaffold_config(&cfg)?;
     let added_hooks = install_hooks(&home, &exe)?;
-    install_mcp(&home, &exe, resolve_local_raw_values)?;
+    install_mcp(&home, &exe, resolve_raw_values)?;
 
     eprintln!("gently: installed {added_hooks} hook event(s) into ~/.claude/settings.json");
     eprintln!("gently: registered MCP server 'gently' in ~/.claude.json");
@@ -75,7 +74,14 @@ fn scaffold_config(cfg: &Config) -> Result<()> {
         # export_batch = 512          # OTLP envelope rows per export request\n\
         # export_timeout_secs = 15    # per-request export timeout\n\
         # query_timeout_secs = 30     # per-request query / MCP timeout\n\
-        # capture_raw_values = false  # opt in to retaining full prompt/tool values locally\n";
+        # tenant_id = \"personal\"      # must match the collector principal\n\
+        # device_id = \"local\"         # distinct capture host within the tenant\n\
+        # capture_raw_values = false  # retain encrypted raw values using public reader policy\n\
+        # sync_raw_values = false     # upload opaque ciphertext to the collector\n\
+        # resolve_raw_values = false  # decrypt for CLI/MCP on an enrolled reader\n\
+        # raw_manifest = \"/path/to/signed-manifest.json\"\n\
+        # raw_trust = \"/path/to/trust.json\"\n\
+        # raw_identity = \"/path/to/reader.age\"\n";
     write_private_file(&path, template).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
@@ -84,7 +90,6 @@ fn install_hooks(home: &Path, exe: &Path) -> Result<usize> {
     let path = home.join(".claude").join("settings.json");
     let mut settings = read_json(&path)?;
     let command = format!("{} hook", shell_quote(exe));
-    let legacy_command = format!("{} hook", legacy_shell_quote(exe));
 
     let hooks = settings
         .as_object_mut()
@@ -97,7 +102,7 @@ fn install_hooks(home: &Path, exe: &Path) -> Result<usize> {
     for event in MODELED_EVENTS {
         let arr = hooks.entry(*event).or_insert_with(|| json!([]));
         let arr = arr.as_array_mut().context("hook event is not an array")?;
-        if hooks_contains_command(arr, &command, &legacy_command) {
+        if hooks_contains_command(arr, &command) {
             continue;
         }
         arr.push(json!({"hooks": [{"type": "command", "command": command}]}));
@@ -108,7 +113,7 @@ fn install_hooks(home: &Path, exe: &Path) -> Result<usize> {
     Ok(added)
 }
 
-fn install_mcp(home: &Path, exe: &Path, resolve_local_raw_values: bool) -> Result<()> {
+fn install_mcp(home: &Path, exe: &Path, resolve_raw_values: bool) -> Result<()> {
     let path = home.join(".claude.json");
     let mut config = read_json(&path)?;
     let servers = config
@@ -126,17 +131,17 @@ fn install_mcp(home: &Path, exe: &Path, resolve_local_raw_values: bool) -> Resul
     server.insert("type".into(), json!("stdio"));
     server.insert("command".into(), json!(exe.to_string_lossy()));
     server.insert("args".into(), json!(["mcp"]));
-    if resolve_local_raw_values {
+    if resolve_raw_values {
         let env = server.entry("env").or_insert_with(|| json!({}));
         let env = env
             .as_object_mut()
             .context("gently MCP env is not an object")?;
-        env.insert("GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES".into(), json!("1"));
+        env.insert("GENTLY_RESOLVE_RAW_VALUES".into(), json!("1"));
     } else if let Some(env) = server.get_mut("env") {
         let env = env
             .as_object_mut()
             .context("gently MCP env is not an object")?;
-        env.remove("GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES");
+        env.remove("GENTLY_RESOLVE_RAW_VALUES");
         if env.is_empty() {
             server.remove("env");
         }
@@ -144,9 +149,8 @@ fn install_mcp(home: &Path, exe: &Path, resolve_local_raw_values: bool) -> Resul
     write_json(&path, &config)
 }
 
-/// Keep managed hook groups and preferences intact, including when upgrading
-/// the previous quoting format. Only this executable's exact commands match.
-fn hooks_contains_command(arr: &mut [Value], command: &str, legacy_command: &str) -> bool {
+/// Keep managed hook groups and preferences intact. Exact commands match.
+fn hooks_contains_command(arr: &mut [Value], command: &str) -> bool {
     let mut found = false;
     for entry in arr {
         if let Some(inner) = entry.get_mut("hooks").and_then(Value::as_array_mut) {
@@ -154,7 +158,7 @@ fn hooks_contains_command(arr: &mut [Value], command: &str, legacy_command: &str
                 if handler
                     .get("command")
                     .and_then(Value::as_str)
-                    .is_some_and(|existing| existing == command || existing == legacy_command)
+                    .is_some_and(|existing| existing == command)
                 {
                     handler["command"] = json!(command);
                     found = true;
@@ -171,7 +175,12 @@ fn read_json(path: &Path) -> Result<Value> {
         Ok(s) if !s.trim().is_empty() => {
             serde_json::from_str(&s).with_context(|| format!("parsing {}", path.display()))
         }
-        _ => Ok(json!({})),
+        Ok(_) => Ok(json!({})),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
+        Err(_) => anyhow::bail!(
+            "cannot read harness JSON configuration at {}",
+            path.display()
+        ),
     }
 }
 
@@ -200,17 +209,6 @@ fn shell_quote(p: &Path) -> String {
     format!("'{}'", p.to_string_lossy().replace('\'', "'\"'\"'"))
 }
 
-/// Recognize exactly the command emitted by previous init versions so upgrades
-/// rewrite the managed command rather than adding another handler.
-fn legacy_shell_quote(p: &Path) -> String {
-    let s = p.to_string_lossy();
-    if s.contains(' ') {
-        format!("\"{s}\"")
-    } else {
-        s.into_owned()
-    }
-}
-
 /// Supported Codex 0.160.0 events. No tool matcher limits collection. The
 /// PermissionRequest marker emits no verdict and leaves approval flow intact.
 const CODEX_MODELED_EVENTS: &[&str] = &[
@@ -228,7 +226,7 @@ const CODEX_MODELED_EVENTS: &[&str] = &[
     "PostCompact",
 ];
 
-pub fn run_codex(resolve_local_raw_values: bool) -> Result<()> {
+pub fn run_codex(resolve_raw_values: bool) -> Result<()> {
     let cfg = Config::load()?;
     cfg.ensure_state_dir()?;
     let home = dirs::home_dir().context("cannot determine home directory")?;
@@ -239,10 +237,9 @@ pub fn run_codex(resolve_local_raw_values: bool) -> Result<()> {
     let path = home.join(".codex").join("config.toml");
     let mut doc = read_toml_doc(&path)?;
     let command = format!("{} hook --harness codex", shell_quote(&exe));
-    let legacy_command = format!("{} hook --harness codex", legacy_shell_quote(&exe));
-    let added = merge_codex_hooks(&mut doc, &command, Some(&legacy_command));
-    ensure_codex_mcp(&mut doc, &exe.to_string_lossy(), resolve_local_raw_values);
-    ensure_features_hooks(&mut doc);
+    let added = merge_codex_hooks(&mut doc, &command)?;
+    ensure_codex_mcp(&mut doc, &exe.to_string_lossy(), resolve_raw_values)?;
+    ensure_features_hooks(&mut doc)?;
     write_toml_doc(&path, &doc)?;
 
     eprintln!(
@@ -266,42 +263,98 @@ pub fn run_codex(resolve_local_raw_values: bool) -> Result<()> {
 /// Add a `[[hooks.<Event>]]`/`[[hooks.<Event>.hooks]]` command handler for each
 /// modeled Codex event, skipping any event group that already runs our command.
 /// Returns the number of events newly added.
-fn merge_codex_hooks(doc: &mut DocumentMut, command: &str, legacy_command: Option<&str>) -> usize {
+fn merge_codex_hooks(doc: &mut DocumentMut, command: &str) -> Result<usize> {
     let mut added = 0;
     for event in CODEX_MODELED_EVENTS {
-        if add_codex_hook_group(doc, event, command, legacy_command) {
+        if add_codex_hook_group(doc, event, command)? {
             added += 1;
         }
     }
-    added
+    Ok(added)
+}
+
+/// TOML permits both inline and section tables. Normalize only the structures
+/// that need appended hook arrays, and reject scalars before writing any file.
+fn require_table<'a>(item: &'a mut Item, name: &str) -> Result<&'a mut Table> {
+    if item.is_inline_table() {
+        let decor = item.as_value().map(|value| value.decor().clone());
+        *item = Item::Table(
+            std::mem::take(item)
+                .into_table()
+                .map_err(|_| anyhow::anyhow!("{name} must be a table"))?,
+        );
+        if let Some(decor) = decor {
+            *item.as_table_mut().unwrap().decor_mut() = decor;
+        }
+    }
+    item.as_table_mut()
+        .with_context(|| format!("{name} must be a table"))
+}
+
+fn require_root_table<'a>(doc: &'a mut DocumentMut, name: &str) -> Result<&'a mut Table> {
+    let missing = !doc.contains_key(name);
+    let inline = doc.get(name).is_some_and(Item::is_inline_table);
+    let key_prefix = doc
+        .get(name)
+        .filter(|item| item.is_inline_table())
+        .and_then(|_| doc.as_table().key(name))
+        .and_then(|key| key.leaf_decor().prefix())
+        .cloned();
+    if inline {
+        if let Some(mut key) = doc.as_table_mut().key_mut(name) {
+            // The old assignment-key prefix belongs before the new section,
+            // not inside `[section]` when the same key is rendered again.
+            key.leaf_decor_mut().clear();
+        }
+    }
+    let table = require_table(
+        doc.entry(name).or_insert_with(|| Item::Table(Table::new())),
+        name,
+    )?;
+    if missing {
+        table.set_implicit(true);
+    }
+    if let Some(prefix) = key_prefix {
+        table.decor_mut().set_prefix(prefix);
+    }
+    Ok(table)
+}
+
+fn require_groups<'a>(item: &'a mut Item, name: &str) -> Result<&'a mut ArrayOfTables> {
+    if item.as_array().is_some_and(|array| array.is_empty()) {
+        *item = Item::ArrayOfTables(ArrayOfTables::new());
+    } else if item.is_array() {
+        let previous = std::mem::take(item);
+        match previous.into_array_of_tables() {
+            Ok(groups) => *item = Item::ArrayOfTables(groups),
+            Err(previous) => {
+                *item = previous;
+                anyhow::bail!("{name} must be an array of tables");
+            }
+        }
+    }
+    item.as_array_of_tables_mut()
+        .with_context(|| format!("{name} must be an array of tables"))
 }
 
 /// Append one command-handler group under `hooks.<event>`. No `matcher` is set,
 /// so tool events match every tool. Idempotent: returns false if a group already
 /// points at `command`.
-fn add_codex_hook_group(
-    doc: &mut DocumentMut,
-    event: &str,
-    command: &str,
-    legacy_command: Option<&str>,
-) -> bool {
-    let hooks = doc
-        .entry("hooks")
-        .or_insert_with(|| Item::Table(Table::new()))
-        .as_table_mut()
-        .expect("hooks is a table");
-    hooks.set_implicit(true);
-    let groups = hooks
-        .entry(event)
-        .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()))
-        .as_array_of_tables_mut()
-        .expect("event groups is an array-of-tables");
+fn add_codex_hook_group(doc: &mut DocumentMut, event: &str, command: &str) -> Result<bool> {
+    let hooks = require_root_table(doc, "hooks")?;
+    let groups = require_groups(
+        hooks
+            .entry(event)
+            .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new())),
+        &format!("hooks.{event}"),
+    )?;
 
-    if groups
-        .iter_mut()
-        .any(|g| group_has_command(g, command, legacy_command))
-    {
-        return false;
+    let mut found = false;
+    for group in groups.iter_mut() {
+        found |= group_has_command(group, command, event)?;
+    }
+    if found {
+        return Ok(false);
     }
 
     let mut handler = Table::new();
@@ -313,82 +366,85 @@ fn add_codex_hook_group(
     let mut group = Table::new();
     group.insert("hooks", Item::ArrayOfTables(inner));
     groups.push(group);
-    true
+    Ok(true)
 }
 
-/// Requote our old managed handler while preserving its matcher and options.
-fn group_has_command(group: &mut Table, command: &str, legacy_command: Option<&str>) -> bool {
-    let Some(inner) = group
-        .get_mut("hooks")
-        .and_then(Item::as_array_of_tables_mut)
-    else {
-        return false;
+/// Match managed handlers while preserving their matcher and options.
+fn group_has_command(group: &mut Table, command: &str, event: &str) -> Result<bool> {
+    let Some(inner) = group.get_mut("hooks") else {
+        return Ok(false);
     };
+    let inner = require_groups(inner, &format!("hooks.{event}.hooks"))?;
     let mut found = false;
     for handler in inner.iter_mut() {
         if handler
             .get("command")
             .and_then(Item::as_str)
-            .is_some_and(|existing| existing == command || Some(existing) == legacy_command)
+            .is_some_and(|existing| existing == command)
         {
             handler["command"] = value(command);
             found = true;
         }
     }
-    found
+    Ok(found)
 }
 
 /// Update owned executable/args/raw-resolution fields in `[mcp_servers.gently]`,
 /// keeping the user's other MCP preferences and environment entries.
-fn ensure_codex_mcp(doc: &mut DocumentMut, exe: &str, resolve_local_raw_values: bool) {
-    let servers = doc
-        .entry("mcp_servers")
-        .or_insert_with(|| Item::Table(Table::new()))
-        .as_table_mut()
-        .expect("mcp_servers is a table");
-    servers.set_implicit(true);
+fn ensure_codex_mcp(doc: &mut DocumentMut, exe: &str, resolve_raw_values: bool) -> Result<()> {
+    let servers = require_root_table(doc, "mcp_servers")?;
     let server = servers
         .entry("gently")
         .or_insert_with(|| Item::Table(Table::new()))
         .as_table_like_mut()
-        .expect("gently MCP server is a table");
+        .context("mcp_servers.gently must be a table")?;
     server.insert("command", value(exe));
     let mut args = Array::new();
     args.push("mcp");
     server.insert("args", value(args));
-    if resolve_local_raw_values {
+    if resolve_raw_values {
         let env = server
             .entry("env")
             .or_insert_with(|| Item::Table(Table::new()))
             .as_table_like_mut()
-            .expect("gently MCP env is a table");
-        env.insert("GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES", value("1"));
-    } else if let Some(env) = server.get_mut("env").and_then(Item::as_table_like_mut) {
-        env.remove("GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES");
+            .context("mcp_servers.gently.env must be a table")?;
+        env.insert("GENTLY_RESOLVE_RAW_VALUES", value("1"));
+    } else if let Some(env) = server.get_mut("env") {
+        let env = env
+            .as_table_like_mut()
+            .context("mcp_servers.gently.env must be a table")?;
+        env.remove("GENTLY_RESOLVE_RAW_VALUES");
         if env.is_empty() {
             server.remove("env");
         }
     }
+    Ok(())
 }
 
 /// Ensure `[features] hooks = true` without disturbing other feature flags.
-fn ensure_features_hooks(doc: &mut DocumentMut) {
+fn ensure_features_hooks(doc: &mut DocumentMut) -> Result<()> {
     let features = doc
         .entry("features")
         .or_insert_with(|| Item::Table(Table::new()))
         .as_table_like_mut()
-        .expect("features is a table");
+        .context("features must be a table")?;
     features.insert("hooks", value(true));
+    Ok(())
 }
 
 /// Read a TOML document for in-place editing, or start a fresh one if absent.
 fn read_toml_doc(path: &Path) -> Result<DocumentMut> {
     harden_existing_file(path)?;
     match std::fs::read_to_string(path) {
-        Ok(s) if !s.trim().is_empty() => s
-            .parse::<DocumentMut>()
-            .with_context(|| format!("parsing {}", path.display())),
-        _ => Ok(DocumentMut::new()),
+        Ok(s) if !s.trim().is_empty() => s.parse::<DocumentMut>().map_err(|_| {
+            anyhow::anyhow!(
+                "invalid Codex configuration TOML at {}; inspect the file before retrying init",
+                path.display()
+            )
+        }),
+        Ok(_) => Ok(DocumentMut::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DocumentMut::new()),
+        Err(_) => anyhow::bail!("cannot read Codex configuration at {}", path.display()),
     }
 }
 
@@ -427,9 +483,10 @@ trust_level = "trusted"
     #[test]
     fn merge_preserves_existing_keys_comments_and_adds_hooks_and_mcp() {
         let mut doc: toml_edit::DocumentMut = EXISTING.parse().unwrap();
-        let added = merge_codex_hooks(&mut doc, "/usr/local/bin/gently hook --harness codex", None);
-        ensure_codex_mcp(&mut doc, "/usr/local/bin/gently", false);
-        ensure_features_hooks(&mut doc);
+        let added =
+            merge_codex_hooks(&mut doc, "/usr/local/bin/gently hook --harness codex").unwrap();
+        ensure_codex_mcp(&mut doc, "/usr/local/bin/gently", false).unwrap();
+        ensure_features_hooks(&mut doc).unwrap();
         let out = doc.to_string();
 
         assert!(out.contains("# my codex config"), "comment preserved");
@@ -443,7 +500,7 @@ trust_level = "trusted"
         assert!(out.contains("gently hook --harness codex"));
         assert!(out.contains("[mcp_servers.gently]"));
         assert!(out.contains("args = [\"mcp\"]"));
-        assert!(!out.contains("GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES"));
+        assert!(!out.contains("GENTLY_RESOLVE_RAW_VALUES"));
         assert_eq!(added, CODEX_MODELED_EVENTS.len());
 
         let _: toml::Value = toml::from_str(&out).unwrap();
@@ -453,8 +510,8 @@ trust_level = "trusted"
     fn merge_is_idempotent() {
         let mut doc: toml_edit::DocumentMut = EXISTING.parse().unwrap();
         let cmd = "/usr/local/bin/gently hook --harness codex";
-        let first = merge_codex_hooks(&mut doc, cmd, None);
-        let second = merge_codex_hooks(&mut doc, cmd, None);
+        let first = merge_codex_hooks(&mut doc, cmd).unwrap();
+        let second = merge_codex_hooks(&mut doc, cmd).unwrap();
         assert_eq!(first, CODEX_MODELED_EVENTS.len());
         assert_eq!(second, 0, "second merge adds nothing");
         let groups = doc["hooks"]["PreToolUse"].as_array_of_tables().unwrap();

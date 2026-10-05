@@ -103,7 +103,7 @@ fn trace_waterfall_queries_the_collector() {
             request.extend_from_slice(&buffer[..count]);
         }
         let request = String::from_utf8(request).unwrap();
-        assert!(request.starts_with("GET /v1/query?op=trace&trace_id=trace "));
+        assert!(request.starts_with("GET /v1/query?tenant_id=personal&op=trace&trace_id=trace "));
         assert!(request
             .to_lowercase()
             .contains("authorization: bearer t\r\n"));
@@ -119,6 +119,7 @@ fn trace_waterfall_queries_the_collector() {
         .args(["trace", "trace", "--waterfall"])
         .env("GENTLY_COLLECTOR_URL", format!("http://{address}"))
         .env("GENTLY_TOKEN", "t")
+        .env("GENTLY_TENANT_ID", "personal")
         .assert();
     server.join().unwrap();
     output

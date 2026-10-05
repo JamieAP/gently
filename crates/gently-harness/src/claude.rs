@@ -4,9 +4,9 @@
 //! deliberately tolerant: only `session_id` and `hook_event_name` are required;
 //! events we do not model become [`SpanOp::Mark`]s, so the
 //! adapter is forward-compatible by construction. No raw prompt or tool content
-//! is ever placed in a span - only a digest and byte length.
+//! is ever placed in a span - only its byte length.
 
-use crate::hooks::{common_attrs, push_first_str_digest, push_value_digest, str_field, u64_field};
+use crate::hooks::{common_attrs, push_first_str_length, push_value_length, str_field, u64_field};
 use crate::{Attrs, Harness, HarnessError, Parsed, SpanOp};
 use gently_core::Status;
 
@@ -49,7 +49,7 @@ impl Harness for ClaudeCode {
             }],
             "UserPromptSubmit" => {
                 let mut attrs = claude_attrs(raw, event);
-                push_first_str_digest(
+                push_first_str_length(
                     &mut attrs,
                     "gently.prompt",
                     raw,
@@ -70,7 +70,7 @@ impl Harness for ClaudeCode {
                 let mut attrs = claude_attrs(raw, event);
                 attrs.push(("gently.tool_name".into(), tool_name.clone()));
                 if let Some(input) = raw.get("tool_input") {
-                    push_value_digest(&mut attrs, "gently.tool_input", input);
+                    push_value_length(&mut attrs, "gently.tool_input", input);
                 }
                 vec![SpanOp::OpenTool {
                     tool_use_id: str_field(raw, "tool_use_id"),
@@ -83,7 +83,7 @@ impl Harness for ClaudeCode {
                 let mut attrs = claude_attrs(raw, event);
                 attrs.push(("gently.tool_name".into(), tool_name.clone()));
                 if let Some(resp) = raw.get("tool_response") {
-                    push_value_digest(&mut attrs, "gently.tool_response", resp);
+                    push_value_length(&mut attrs, "gently.tool_response", resp);
                 }
                 let status = if event == "PostToolUseFailure" {
                     Status::Error(None)
@@ -146,7 +146,7 @@ impl Harness for ClaudeCode {
     }
 }
 
-/// Current Claude-only metadata. Content-bearing fields are hashed, never copied.
+/// Current Claude-only metadata. Content-bearing fields are measured, never copied.
 fn claude_attrs(raw: &serde_json::Value, event: &str) -> Attrs {
     let mut attrs = common_attrs(raw, event);
     for field in ["prompt_id", "agent_id"] {
@@ -166,7 +166,7 @@ fn claude_attrs(raw: &serde_json::Value, event: &str) -> Attrs {
             } else {
                 ("compact_summary", "gently.compact_summary")
             };
-            push_first_str_digest(&mut attrs, key, raw, &[field]);
+            push_first_str_length(&mut attrs, key, raw, &[field]);
         }
         "PostToolBatch" => {
             if let Some(calls) = raw.get("tool_calls").filter(|value| value.is_array()) {
@@ -177,13 +177,13 @@ fn claude_attrs(raw: &serde_json::Value, event: &str) -> Attrs {
                 // Batch responses are serialized tool_result content, whereas
                 // PostToolUse responses are structured outputs. Do not replay
                 // tool closes: each tool's own post hook has already done that.
-                push_value_digest(&mut attrs, "gently.tool_calls", calls);
+                push_value_length(&mut attrs, "gently.tool_calls", calls);
             }
         }
         "StopFailure" => {
             if let Some(error) = str_field(raw, "error") {
                 // Only documented machine-readable categories are safe to keep
-                // verbatim. Future/freeform failures still retain a digest.
+                // verbatim. Future/freeform failures still retain only a byte length.
                 if matches!(
                     error.as_str(),
                     "rate_limit"
@@ -202,14 +202,14 @@ fn claude_attrs(raw: &serde_json::Value, event: &str) -> Attrs {
                     attrs.push(("gently.error_type".into(), error));
                 }
             }
-            push_first_str_digest(&mut attrs, "gently.error", raw, &["error"]);
+            push_first_str_length(&mut attrs, "gently.error", raw, &["error"]);
             if let Some(details) = raw.get("error_details").filter(|value| !value.is_null()) {
-                push_value_digest(&mut attrs, "gently.error_details", details);
+                push_value_length(&mut attrs, "gently.error_details", details);
             }
         }
         "PostToolUseFailure" => {
             // Tool errors can contain full stdout/stderr, not just an error code.
-            push_first_str_digest(&mut attrs, "gently.error", raw, &["error"]);
+            push_first_str_length(&mut attrs, "gently.error", raw, &["error"]);
             if let Some(interrupted) = raw.get("is_interrupt").and_then(|value| value.as_bool()) {
                 attrs.push(("gently.is_interrupt".into(), interrupted.to_string()));
             }
@@ -283,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn user_prompt_opens_turn_with_digest_not_content() {
+    fn user_prompt_opens_turn_with_length_not_content() {
         let parsed = ClaudeCode
             .parse(
                 &json!({"hook_event_name":"UserPromptSubmit","session_id":"s",
@@ -293,7 +293,7 @@ mod tests {
         match &parsed.ops[..] {
             [SpanOp::OpenTurn { attrs }] => {
                 let joined = format!("{attrs:?}");
-                assert!(joined.contains("gently.prompt.sha256"));
+                assert!(joined.contains("gently.prompt.bytes"));
                 assert!(joined.contains("gently.prompt.bytes"));
                 assert!(!joined.contains("secret content"));
             }
@@ -395,8 +395,8 @@ mod tests {
     }
 
     #[test]
-    fn compaction_keeps_trigger_and_digests_content() {
-        for (event, field, digest_key) in [
+    fn compaction_keeps_trigger_and_measures_content() {
+        for (event, field, content_key) in [
             (
                 "PreCompact",
                 "custom_instructions",
@@ -413,8 +413,8 @@ mod tests {
                     assert!(attrs.contains(&("gently.trigger".into(), "manual".into())));
                     assert!(attrs
                         .iter()
-                        .any(|(k, _)| k == &format!("{digest_key}.sha256")));
-                    assert!(attrs.contains(&(format!("{digest_key}.bytes"), "33".into())));
+                        .any(|(k, _)| k == &format!("{content_key}.bytes")));
+                    assert!(attrs.contains(&(format!("{content_key}.bytes"), "33".into())));
                     assert!(!format!("{parsed:?}").contains("synthetic private compaction text"));
                 }
                 other => panic!("compaction must remain a marker, got {other:?}"),
@@ -435,7 +435,7 @@ mod tests {
             [SpanOp::Mark { name, attrs }] => {
                 assert_eq!(name, "PostToolBatch");
                 assert!(attrs.contains(&("gently.tool_calls.count".into(), "2".into())));
-                assert!(attrs.iter().any(|(k, _)| k == "gently.tool_calls.sha256"));
+                assert!(attrs.iter().any(|(k, _)| k == "gently.tool_calls.bytes"));
                 assert!(!format!("{parsed:?}").contains("synthetic private text"));
             }
             other => panic!("batch must not duplicate tool closes, got {other:?}"),
@@ -443,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn api_failure_keeps_error_type_and_hashes_freeform_details() {
+    fn api_failure_keeps_error_type_and_measures_freeform_details() {
         let parsed = ClaudeCode.parse(&json!({
             "hook_event_name": "StopFailure", "session_id": "s", "error": "rate_limit",
             "error_details": "synthetic private API diagnostic", "last_assistant_message": "synthetic error rendering"
@@ -452,9 +452,7 @@ mod tests {
             [SpanOp::CloseTurn { status, attrs }] => {
                 assert_eq!(*status, Status::Error(None));
                 assert!(attrs.contains(&("gently.error_type".into(), "rate_limit".into())));
-                assert!(attrs
-                    .iter()
-                    .any(|(k, _)| k == "gently.error_details.sha256"));
+                assert!(attrs.iter().any(|(k, _)| k == "gently.error_details.bytes"));
                 assert!(!format!("{parsed:?}").contains("synthetic private API diagnostic"));
                 assert!(!format!("{parsed:?}").contains("synthetic error rendering"));
             }
@@ -463,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_failure_hashes_output_bearing_diagnostic() {
+    fn tool_failure_measures_output_bearing_diagnostic() {
         let parsed = ClaudeCode
             .parse(&json!({
                 "hook_event_name": "PostToolUseFailure", "session_id": "s", "tool_name": "Bash",
@@ -481,7 +479,7 @@ mod tests {
                 assert_eq!(*status, Status::Error(None));
                 assert_eq!(*duration_ms, Some(23));
                 assert!(attrs.contains(&("gently.is_interrupt".into(), "true".into())));
-                assert!(attrs.iter().any(|(k, _)| k == "gently.error.sha256"));
+                assert!(attrs.iter().any(|(k, _)| k == "gently.error.bytes"));
                 assert!(!format!("{parsed:?}").contains("synthetic private stdout and stderr"));
             }
             other => panic!("expected failing tool close, got {other:?}"),
@@ -578,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_api_error_is_hashed_without_raw_category() {
+    fn unknown_api_error_is_measured_without_raw_category() {
         let parsed = ClaudeCode.parse(&json!({
             "hook_event_name": "StopFailure", "session_id": "s",
             "error": "synthetic future diagnostic containing private output", "error_details": null
@@ -586,7 +584,7 @@ mod tests {
         match &parsed.ops[..] {
             [SpanOp::CloseTurn { status, attrs }] => {
                 assert_eq!(*status, Status::Error(None));
-                assert!(attrs.iter().any(|(key, _)| key == "gently.error.sha256"));
+                assert!(attrs.iter().any(|(key, _)| key == "gently.error.bytes"));
                 assert!(!attrs.iter().any(|(key, _)| key == "gently.error_type"
                     || key.starts_with("gently.error_details.")));
                 assert!(!format!("{parsed:?}").contains("synthetic future diagnostic"));
@@ -596,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_compaction_null_instructions_have_no_content_digest() {
+    fn automatic_compaction_null_instructions_have_no_content_length() {
         let parsed = ClaudeCode.parse(&json!({
             "hook_event_name": "PreCompact", "session_id": "s", "trigger": "auto", "custom_instructions": null
         })).unwrap();

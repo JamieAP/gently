@@ -23,6 +23,8 @@ authentication.
 | `last_error` | The latest recorded exporter failure. |
 | `consecutive_failures` | Repeated failures require checking the error and collector configuration. |
 | `quarantined` | Envelopes rejected or malformed during export; they are no longer in the active queue. |
+| `raw_bytes`, `raw_budget_bytes` | Encoded ciphertext storage use and its 64 MiB admission budget; SQLite overhead is additional. Full storage skips new raw capture or caching. |
+| `raw_pending`, `raw_pending_bytes` | Ciphertext objects and bytes not yet acknowledged by the collector. |
 
 Counts refer to envelopes, not spans. A zero pending count alone does not prove
 capture is working: generate a new tool-using task and confirm that a trace
@@ -39,6 +41,10 @@ appears in the collector.
 | `token is not configured` | Supply `GENTLY_TOKEN` to this command or MCP server through your secret manager. A separate watcher's token does not apply here. |
 | Export or query returns `401`/`403` | Confirm the process and collector use the same token without displaying it. Export stops on rejection and retains the queue; correct the token and restart the watcher. |
 | Local connection refused | Start `./scripts/collector-local` and leave its terminal open. Check that the configured URL is `http://127.0.0.1:8787`. |
+| Raw retention is missing | Verify capture opt-in, signed manifest, owner pin, minimum epoch, exact policy digest and expiry; check the raw byte budget. Metadata continues when policy or capacity prevents raw retention. |
+| Raw resolution fails | Check the enrolled reader identity, tenant read credential and object availability. Software unlocking requires an attached private terminal; reject wrong-key or binding errors. |
+| Span ownership conflict (`409`) | A different device or trace owns that span ID. Use fresh capture IDs for a new device/trace; do not spoof its owner. |
+| Incompatible development state | Stop Gently and explicitly reset disposable old application state and sidecars; preserve the credential vault. |
 | Cloudflare database errors | Replace `REPLACE_AFTER_CREATE` with the created D1 ID and execute `schema.sql` against the intended local or remote database. |
 | Quarantine count increases | Check the recorded error and payload/schema compatibility. Fixing the cause does not automatically replay quarantined envelopes. |
 | Export works but queries are empty | Check the target URL, query filters and state directory. Queries read the collector, not the local outbox. Generate fresh activity and list unfiltered traces. |
@@ -75,11 +81,11 @@ See [Trace model](../concepts/trace-model.md) and
 
 ## Diagnose an adapter with raw payloads
 
-Use a synthetic reproduction first. Full debug payloads can contain prompts,
-source material, credentials and local paths. If real payloads are necessary,
-explicitly enable both raw capture and debug capture for the hook process.
-Debug alone does not write payloads. Gently does not generate environment
-snapshots.
+Use a synthetic reproduction first. Selected raw fields can contain prompts,
+source material and credentials. If real fields are necessary, enroll readers
+and explicitly enable encrypted raw capture with valid signed policy. The old
+plaintext full-payload debug capture has been removed. Gently does not generate
+environment snapshots.
 
 Disable capture after diagnosis and review stored values and files before
 sharing them. Turning capture off does not remove existing data. See
@@ -88,5 +94,5 @@ sharing them. Turning capture off does not remove existing data. See
 
 For a bug report, include versions, the agent, expected behavior, observed
 behavior and a minimal invented payload. Do not attach your state database,
-real tokens or unreviewed debug captures. See
+real tokens or unreviewed raw output. See
 [Contributing](https://github.com/JamieAP/gently/blob/main/CONTRIBUTING.md).

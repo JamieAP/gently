@@ -51,6 +51,7 @@ and span attribute values use `stringValue`, including counts and byte lengths.
 | `service.name` | `gently` |
 | `gently.harness` | `claude-code` or `codex` |
 | `gently.session_id` | Harness session identifier |
+| `gently.tenant_id`, `gently.device_id` | Capture namespace; Worker verifies or injects these from authentication |
 | `gently.cwd` | Working directory from the hook |
 | `host.name` | Local hostname, or `unknown` |
 | `os.type` | Rust platform OS value, such as `macos` or `linux` |
@@ -60,7 +61,7 @@ and span attribute values use `stringValue`, including counts and byte lengths.
 
 Resource attributes accompany every event envelope. Optional context keys are
 omitted when empty. Paths, hostnames, pane IDs, and session IDs identify the local
-environment even when prompt and tool content are represented by digests.
+environment even when prompt and tool content are absent or encrypted.
 
 ## Span fields
 
@@ -86,27 +87,27 @@ Attributes vary with harness and event. Common metadata includes `gently.event`,
 `gently.agent_type`, `gently.agent_transcript_path`, and optional model, effort,
 or session-source values. They are not all present on every span.
 
-Content is represented by pairs such as:
+Selected content has byte lengths and, only after approved encrypted capture,
+opaque references:
 
 ```json
 [
-  {"key":"gently.prompt.sha256","value":{"stringValue":"0123456789abcdef"}},
+  {"key":"gently.prompt.raw_ref","value":{"stringValue":"0123456789abcdef0123456789abcdef"}},
   {"key":"gently.prompt.bytes","value":{"stringValue":"42"}}
 ]
 ```
 
-Despite the `.sha256` key name, the stored digest is the first 16 hex characters
-of SHA-256, a 64-bit prefix. `.bytes` is the byte length encoded as a string.
-Tool JSON values are serialized to compact JSON before hashing; text values use
-their UTF-8 bytes. Digests are fingerprints, not encryption or collision-free
-proof of identity. Content-bearing prompt, assistant, tool, and freeform error
-values are digested by the hook adapters rather than exported verbatim.
+`.bytes` is UTF-8 or compact-JSON byte length encoded as a string. No public
+`.sha256` content fingerprints are emitted, including with capture disabled.
+A random event reference points to an immutable encrypted field map; field
+names and owning span IDs are authenticated inside the ciphertext. The
+ciphertext is retained separately from metadata, and optional sync uses the
+raw endpoint rather than OTLP attributes.
 
-Raw capture and local query resolution are separate options. Resolution can add
-previously captured values to CLI/MCP results, without changing the exported
-OTLP envelope or retrieving raw content from the Worker. See
-[security and privacy](../concepts/security-and-privacy.md) and
-[querying and MCP](../guides/querying-and-mcp.md#raw-values).
+Reader resolution can add decrypted fields to in-memory CLI/MCP results after
+verifying tenant/session/device and field-to-span bindings. It never adds them
+to exported OTLP. See [security and privacy](../concepts/security-and-privacy.md)
+and [raw enrollment](../guides/encrypted-raw-values.md).
 
 ## Collector query shape
 
@@ -146,5 +147,5 @@ make those commands compatible with another backend.
 
 [Wire types and serialization](https://github.com/JamieAP/gently/blob/main/crates/gently-core/src/otlp.rs),
 [ID derivation](https://github.com/JamieAP/gently/blob/main/crates/gently-core/src/ids.rs), and
-[content digests](https://github.com/JamieAP/gently/blob/main/crates/gently-harness/src/hooks.rs) define the emitted
+[content lengths](https://github.com/JamieAP/gently/blob/main/crates/gently-harness/src/hooks.rs) define the emitted
 format.

@@ -116,16 +116,16 @@ beforeAll(async () => {
   // rolls back per-test writes, but beforeAll writes form the shared baseline).
   // The query tests depend on this seed; the POST tests re-insert the same
   // span_ids, so their counts stay at 2 (INSERT OR REPLACE is idempotent).
-  await SELF.fetch("https://x/v1/traces", {
+  await SELF.fetch("https://x/v1/traces?tenant_id=personal", {
     method: "POST",
     headers: { Authorization: BEARER, "Content-Type": "application/json" },
     body: JSON.stringify(makeOtlpFixture()),
   });
 });
 
-describe("POST /v1/traces", () => {
+describe("POST /v1/traces?tenant_id=personal", () => {
   it("accepts a valid OTLP payload with correct bearer and inserts spans", async () => {
-    const res = await SELF.fetch("https://x/v1/traces", {
+    const res = await SELF.fetch("https://x/v1/traces?tenant_id=personal", {
       method: "POST",
       headers: {
         Authorization: BEARER,
@@ -145,7 +145,7 @@ describe("POST /v1/traces", () => {
   });
 
   it("re-posting identical spans is idempotent (INSERT OR REPLACE)", async () => {
-    await SELF.fetch("https://x/v1/traces", {
+    await SELF.fetch("https://x/v1/traces?tenant_id=personal", {
       method: "POST",
       headers: {
         Authorization: BEARER,
@@ -161,7 +161,7 @@ describe("POST /v1/traces", () => {
   });
 
   it("rejects with 401 when Authorization header is missing", async () => {
-    const res = await SELF.fetch("https://x/v1/traces", {
+    const res = await SELF.fetch("https://x/v1/traces?tenant_id=personal", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(makeOtlpFixture()),
@@ -173,7 +173,7 @@ describe("POST /v1/traces", () => {
   });
 
   it("rejects with 401 when bearer token is wrong", async () => {
-    const res = await SELF.fetch("https://x/v1/traces", {
+    const res = await SELF.fetch("https://x/v1/traces?tenant_id=personal", {
       method: "POST",
       headers: {
         Authorization: "Bearer wrong-token",
@@ -185,12 +185,12 @@ describe("POST /v1/traces", () => {
     expect(res.status).toBe(401);
   });
 
-  it("rejects even Bearer blank when Worker token secret is empty", async () => {
+  it("rejects even Bearer blank when Worker host secret is empty", async () => {
     const res = await worker.fetch(
-      new Request("https://x/v1/query?op=traces", {
+      new Request("https://x/v1/query?tenant_id=personal&op=traces", {
         headers: { Authorization: "Bearer " },
       }),
-      { DB: env.DB, GENTLY_TOKEN: "" } satisfies Env,
+      { DB: env.DB, GENTLY_HOSTS: "" } satisfies Env,
     );
 
     expect(res.status).toBe(401);
@@ -229,7 +229,7 @@ describe("idempotent-monotonic ingest", () => {
     };
   }
   const post = (body: unknown) =>
-    SELF.fetch("https://x/v1/traces", {
+    SELF.fetch("https://x/v1/traces?tenant_id=personal", {
       method: "POST",
       headers: { Authorization: BEARER, "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -271,7 +271,7 @@ describe("idempotent-monotonic ingest", () => {
 describe("GET /v1/query", () => {
   it("op=trace returns spans for a trace ordered by start", async () => {
     const res = await SELF.fetch(
-      `https://x/v1/query?op=trace&trace_id=${TRACE_ID}`,
+      `https://x/v1/query?tenant_id=personal&op=trace&trace_id=${TRACE_ID}`,
       {
         headers: { Authorization: BEARER },
       },
@@ -296,7 +296,7 @@ describe("GET /v1/query", () => {
     const CHILD = "ddeeff0011223311";
     const ROOT_START = "1700000100000000000";
     const CHILD_END = "1700000900000000000";
-    await SELF.fetch("https://x/v1/traces", {
+    await SELF.fetch("https://x/v1/traces?tenant_id=personal", {
       method: "POST",
       headers: { Authorization: BEARER, "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -339,7 +339,7 @@ describe("GET /v1/query", () => {
       }),
     });
 
-    const res = await SELF.fetch(`https://x/v1/query?op=trace&trace_id=${EFF_TRACE}`, {
+    const res = await SELF.fetch(`https://x/v1/query?tenant_id=personal&op=trace&trace_id=${EFF_TRACE}`, {
       headers: { Authorization: BEARER },
     });
     expect(res.status).toBe(200);
@@ -363,7 +363,7 @@ describe("GET /v1/query", () => {
     const P = "eeff001122334400";
     const C = "eeff001122334411";
     const P_END = "1700001000000000000"; // parent ends last
-    await SELF.fetch("https://x/v1/traces", {
+    await SELF.fetch("https://x/v1/traces?tenant_id=personal", {
       method: "POST",
       headers: { Authorization: BEARER, "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -390,7 +390,7 @@ describe("GET /v1/query", () => {
         ],
       }),
     });
-    const res = await SELF.fetch(`https://x/v1/query?op=trace&trace_id=${FT}`, {
+    const res = await SELF.fetch(`https://x/v1/query?tenant_id=personal&op=trace&trace_id=${FT}`, {
       headers: { Authorization: BEARER },
     });
     const rows = await res.json<Array<{ span_id: string; effective_end_unix_nano: string }>>();
@@ -407,7 +407,7 @@ describe("GET /v1/query", () => {
     const TOOL = "ff0011223344aa22";
     const TURN_START = "1700002000000000000";
     const TOOL_END = "1700002800000000000";
-    await SELF.fetch("https://x/v1/traces", {
+    await SELF.fetch("https://x/v1/traces?tenant_id=personal", {
       method: "POST",
       headers: { Authorization: BEARER, "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -427,7 +427,7 @@ describe("GET /v1/query", () => {
         ],
       }),
     });
-    const res = await SELF.fetch(`https://x/v1/query?op=trace&trace_id=${FT}`, {
+    const res = await SELF.fetch(`https://x/v1/query?tenant_id=personal&op=trace&trace_id=${FT}`, {
       headers: { Authorization: BEARER },
     });
     const rows = await res.json<Array<{ span_id: string; effective_end_unix_nano: string }>>();
@@ -445,7 +445,7 @@ describe("GET /v1/query", () => {
     const TOOL = "00112233445566cc"; // starts before the turn
     const TOOL_START = "1700004000000000000";
     const TURN_START = "1700004500000000000"; // 500s AFTER its tool
-    await SELF.fetch("https://x/v1/traces", {
+    await SELF.fetch("https://x/v1/traces?tenant_id=personal", {
       method: "POST",
       headers: { Authorization: BEARER, "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -465,7 +465,7 @@ describe("GET /v1/query", () => {
         ],
       }),
     });
-    const res = await SELF.fetch(`https://x/v1/query?op=trace&trace_id=${FT}`, {
+    const res = await SELF.fetch(`https://x/v1/query?tenant_id=personal&op=trace&trace_id=${FT}`, {
       headers: { Authorization: BEARER },
     });
     const rows = await res.json<Array<{ span_id: string; effective_start_unix_nano: string }>>();
@@ -485,7 +485,7 @@ describe("GET /v1/query", () => {
     const ROOT_START = "1700005000000000000";
     const ROOT_STORED_END = "1700005100000000000"; // last SessionStart (looks "finalized")
     const TOOL_END = "1700005900000000000"; // a child ran well past the root's stored end
-    await SELF.fetch("https://x/v1/traces", {
+    await SELF.fetch("https://x/v1/traces?tenant_id=personal", {
       method: "POST",
       headers: { Authorization: BEARER, "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -504,7 +504,7 @@ describe("GET /v1/query", () => {
         ],
       }),
     });
-    const res = await SELF.fetch(`https://x/v1/query?op=trace&trace_id=${FT}`, {
+    const res = await SELF.fetch(`https://x/v1/query?tenant_id=personal&op=trace&trace_id=${FT}`, {
       headers: { Authorization: BEARER },
     });
     const rows = await res.json<Array<{ span_id: string; effective_end_unix_nano: string }>>();
@@ -513,7 +513,7 @@ describe("GET /v1/query", () => {
   });
 
   it("op=traces returns aggregated trace with correct span_count", async () => {
-    const res = await SELF.fetch("https://x/v1/query?op=traces", {
+    const res = await SELF.fetch("https://x/v1/query?tenant_id=personal&op=traces", {
       headers: { Authorization: BEARER },
     });
 
@@ -582,13 +582,13 @@ describe("GET /v1/query", () => {
       ],
     };
 
-    await SELF.fetch("https://x/v1/traces", {
+    await SELF.fetch("https://x/v1/traces?tenant_id=personal", {
       method: "POST",
       headers: { Authorization: BEARER, "Content-Type": "application/json" },
       body: JSON.stringify(fixture),
     });
 
-    const res = await SELF.fetch(`https://x/v1/query?op=traces&session_id=${sess}`, {
+    const res = await SELF.fetch(`https://x/v1/query?tenant_id=personal&op=traces&session_id=${sess}`, {
       headers: { Authorization: BEARER },
     });
     expect(res.status).toBe(200);
@@ -599,7 +599,7 @@ describe("GET /v1/query", () => {
 
   it("op=traces filters by session_id and orders by start ascending", async () => {
     const res = await SELF.fetch(
-      "https://x/v1/query?op=traces&session_id=sess-abc&order=start_asc",
+      "https://x/v1/query?tenant_id=personal&op=traces&session_id=sess-abc&order=start_asc",
       {
         headers: { Authorization: BEARER },
       },
@@ -615,7 +615,7 @@ describe("GET /v1/query", () => {
   });
 
   it("op=traces supports last_activity ordering", async () => {
-    await SELF.fetch("https://x/v1/traces", {
+    await SELF.fetch("https://x/v1/traces?tenant_id=personal", {
       method: "POST",
       headers: { Authorization: BEARER, "Content-Type": "application/json" },
       body: JSON.stringify(
@@ -629,7 +629,7 @@ describe("GET /v1/query", () => {
       ),
     });
 
-    const res = await SELF.fetch("https://x/v1/query?op=traces&order=last_activity&limit=1", {
+    const res = await SELF.fetch("https://x/v1/query?tenant_id=personal&op=traces&order=last_activity&limit=1", {
       headers: { Authorization: BEARER },
     });
 
@@ -645,7 +645,7 @@ describe("GET /v1/query", () => {
 
   it("op=spans returns filtered spans by trace_id", async () => {
     const res = await SELF.fetch(
-      `https://x/v1/query?op=spans&trace_id=${TRACE_ID}`,
+      `https://x/v1/query?tenant_id=personal&op=spans&trace_id=${TRACE_ID}`,
       {
         headers: { Authorization: BEARER },
       },
@@ -658,7 +658,7 @@ describe("GET /v1/query", () => {
 
   it("op=spans supports indexed filters and explicit order", async () => {
     const res = await SELF.fetch(
-      `https://x/v1/query?op=spans&trace_id=${TRACE_ID}&session_id=sess-abc&harness=claude-code&order=start_asc`,
+      `https://x/v1/query?tenant_id=personal&op=spans&trace_id=${TRACE_ID}&session_id=sess-abc&harness=claude-code&order=start_asc`,
       {
         headers: { Authorization: BEARER },
       },
@@ -668,7 +668,7 @@ describe("GET /v1/query", () => {
     const rows = await res.json<Array<{ span_id: string }>>();
     expect(rows.map((r) => r.span_id)).toEqual([SPAN_ID_1, SPAN_ID_2]);
 
-    const statusRes = await SELF.fetch("https://x/v1/query?op=spans&status=2&kind=0&name=turn:1", {
+    const statusRes = await SELF.fetch("https://x/v1/query?tenant_id=personal&op=spans&status=2&kind=0&name=turn:1", {
       headers: { Authorization: BEARER },
     });
     expect(statusRes.status).toBe(200);
@@ -677,7 +677,7 @@ describe("GET /v1/query", () => {
   });
 
   it("op=stats returns per-tool stats", async () => {
-    const res = await SELF.fetch("https://x/v1/query?op=stats", {
+    const res = await SELF.fetch("https://x/v1/query?tenant_id=personal&op=stats", {
       headers: { Authorization: BEARER },
     });
 
@@ -689,7 +689,7 @@ describe("GET /v1/query", () => {
   });
 
   it("unknown op returns 404", async () => {
-    const res = await SELF.fetch("https://x/v1/query?op=unknown", {
+    const res = await SELF.fetch("https://x/v1/query?tenant_id=personal&op=unknown", {
       headers: { Authorization: BEARER },
     });
     expect(res.status).toBe(404);

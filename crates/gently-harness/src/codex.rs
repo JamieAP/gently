@@ -16,7 +16,7 @@
 //! isError flag. Classify those structured results; leave opaque status Unset.
 //! Prompt and tool content is recorded only as a digest and byte length.
 
-use crate::hooks::{common_attrs, push_first_str_digest, push_value_digest, str_field};
+use crate::hooks::{common_attrs, push_first_str_length, push_value_length, str_field};
 use crate::{Attrs, Harness, HarnessError, Parsed, SpanOp};
 use gently_core::Status;
 
@@ -65,7 +65,7 @@ impl Harness for Codex {
             }],
             "UserPromptSubmit" => {
                 let mut attrs = codex_attrs(raw, event);
-                push_first_str_digest(
+                push_first_str_length(
                     &mut attrs,
                     "gently.prompt",
                     raw,
@@ -106,7 +106,7 @@ impl Harness for Codex {
                 let mut attrs = tool_attrs(raw, event, &tool_name);
                 let status = tool_status(&tool_name, raw.get("tool_response"));
                 if let Some(resp) = raw.get("tool_response") {
-                    push_value_digest(&mut attrs, "gently.tool_response", resp);
+                    push_value_length(&mut attrs, "gently.tool_response", resp);
                 }
                 vec![SpanOp::CloseTool {
                     tool_use_id: str_field(raw, "tool_use_id"),
@@ -196,7 +196,7 @@ fn tool_attrs(raw: &serde_json::Value, event: &str, tool_name: &str) -> Attrs {
     let mut attrs = codex_attrs(raw, event);
     attrs.push(("gently.tool_name".into(), tool_name.into()));
     if let Some(input) = raw.get("tool_input") {
-        push_value_digest(&mut attrs, "gently.tool_input", input);
+        push_value_length(&mut attrs, "gently.tool_input", input);
     }
     attrs
 }
@@ -250,9 +250,9 @@ mod tests {
             }
             other => panic!("expected OpenTool, got {other:?}"),
         }
-        // raw tool_input content is digested, never placed verbatim in a span
+        // raw tool_input content is measured, never placed verbatim in a span
         let pre_attrs = format!("{:?}", parsed.ops);
-        assert!(pre_attrs.contains("gently.tool_input.sha256"));
+        assert!(pre_attrs.contains("gently.tool_input.bytes"));
         assert!(!pre_attrs.contains("\"ls\""));
 
         let post = json!({"hook_event_name":"PostToolUse","session_id":"s",
@@ -273,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn user_prompt_opens_turn_with_digest_not_content() {
+    fn user_prompt_opens_turn_with_length_not_content() {
         let parsed = Codex
             .parse(
                 &json!({"hook_event_name":"UserPromptSubmit","session_id":"s",
@@ -283,7 +283,7 @@ mod tests {
         match &parsed.ops[..] {
             [SpanOp::OpenTurn { attrs }] => {
                 let joined = format!("{attrs:?}");
-                assert!(joined.contains("gently.prompt.sha256"));
+                assert!(joined.contains("gently.prompt.bytes"));
                 assert!(joined.contains("gently.prompt.bytes"));
                 assert!(!joined.contains("secret content"));
             }
@@ -292,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_message_gets_digest_not_content() {
+    fn assistant_message_gets_length_not_content() {
         let parsed = Codex
             .parse(&json!({"hook_event_name":"Stop","session_id":"s",
                 "last_assistant_message":"assistant secret here"}))
@@ -300,7 +300,7 @@ mod tests {
         match &parsed.ops[..] {
             [SpanOp::CloseTurn { attrs, .. }] => {
                 let joined = format!("{attrs:?}");
-                assert!(joined.contains("gently.assistant.sha256"));
+                assert!(joined.contains("gently.assistant.bytes"));
                 assert!(joined.contains("gently.assistant.bytes"));
                 assert!(!joined.contains("assistant secret"));
             }
@@ -550,8 +550,8 @@ mod tests {
                     assert_eq!(*status, expected);
                     assert_eq!(tool_use_id.as_deref(), Some("call-mcp"));
                     let attrs = format!("{attrs:?}");
-                    assert!(attrs.contains("gently.tool_response.sha256"));
-                    assert!(attrs.contains("gently.tool_input.sha256"));
+                    assert!(attrs.contains("gently.tool_response.bytes"));
+                    assert!(attrs.contains("gently.tool_input.bytes"));
                     assert!(!attrs.contains("private tool output"));
                     assert!(!attrs.contains("private tool input"));
                 }
@@ -598,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_request_records_only_tool_metadata_and_input_digest() {
+    fn permission_request_records_only_tool_metadata_and_input_length() {
         let parsed = Codex
             .parse(&json!({
                 "hook_event_name": "PermissionRequest", "session_id": "s", "turn_id": "t",
@@ -610,7 +610,7 @@ mod tests {
                 assert_eq!(name, "PermissionRequest");
                 assert!(attrs.contains(&("gently.tool_name".into(), "Bash".into())));
                 let attrs = format!("{attrs:?}");
-                assert!(attrs.contains("gently.tool_input.sha256"));
+                assert!(attrs.contains("gently.tool_input.bytes"));
                 assert!(!attrs.contains("private command"));
             }
             other => panic!("expected permission Mark, got {other:?}"),

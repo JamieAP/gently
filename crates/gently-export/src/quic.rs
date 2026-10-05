@@ -39,10 +39,11 @@ impl QuicTransport {
     pub fn new(
         collector_url: &str,
         token: impl Into<String>,
+        tenant_id: &str,
         timeout_secs: u64,
     ) -> Result<Self, ExportError> {
         ensure_crypto_provider();
-        let endpoint = format!("{}/v1/traces", collector_url.trim_end_matches('/'));
+        let endpoint = crate::http2::tenant_endpoint(collector_url, tenant_id)?;
         let client = crate::http2::client_builder(collector_url, timeout_secs)
             .http3_prior_knowledge()
             .build()

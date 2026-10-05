@@ -19,9 +19,10 @@ CLI or MCP to inspect sessions, tool calls and delegated work.
 | Find missing spans or fix export/query failures | [Troubleshooting](guides/troubleshooting.md) |
 | Understand what is stored or shared | [Security and privacy](concepts/security-and-privacy.md) |
 
-The Cloudflare setup uses Wrangler and D1. The supplied local launcher also
-requires a separately installed `agent-secrets` helper; Gently does not install
-that helper or its hardware-backed vault.
+The Cloudflare setup uses Wrangler and D1. Local launchers accept an inherited
+token from your secret provider on Macs and Linux; a separately installed
+macOS hardware-backed helper is optional. Raw reader enrollment is separate
+from credential storage.
 
 ## What is supported
 
@@ -33,8 +34,9 @@ MCP access and Claude Chat/Cowork integration remain incomplete.
 
 Raw content capture is off by default. Ordinary exports still contain identifying
 metadata such as paths, host information and session IDs. The collector's
-shared token grants access to all its traces; there is no tenant separation or
-automatic retention. Read the [data flow and controls](concepts/security-and-privacy.md)
+host credentials grant tenant-scoped ingest/read access. Optional raw capture
+is encrypted to enrolled devices, with separate sync and resolution opt-ins.
+There is no automatic retention. Read the [data flow and controls](concepts/security-and-privacy.md)
 before enabling capture or sharing a collector.
 
 ## How it works

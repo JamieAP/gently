@@ -73,10 +73,11 @@ success or failure signal.
 
 Claude batch events create one marker instead of repeating individual tool
 closes. Content-bearing tool diagnostics, API failure details, compaction and
-batch values are hashed. Recognized error categories and selected lifecycle
+batch values emit byte lengths and can be retained only as encrypted raw
+fields. Public content hashes are not emitted. Recognized error categories and selected lifecycle
 metadata may remain readable; freeform details are not raw status text.
 
-Capture, debug payload files and local query resolution are independent of
+Encrypted capture and reader resolution are independent of
 these adapter mappings. Read [Security and privacy](../concepts/security-and-privacy.md)
 before enabling raw content options.
 

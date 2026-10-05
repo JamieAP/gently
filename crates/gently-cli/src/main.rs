@@ -6,7 +6,9 @@ mod cmd_hook;
 mod cmd_init;
 mod cmd_mcp;
 mod cmd_query;
+mod cmd_raw;
 mod cmd_status;
+mod collector;
 mod config;
 mod local_raw;
 mod logging;
@@ -50,22 +52,38 @@ enum Command {
         /// Seconds between drains in watch mode.
         #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=60))]
         interval_secs: u64,
+        /// Retry retained ciphertext previously rejected by the collector.
+        #[arg(long)]
+        retry_raw_quarantine: bool,
+    },
+    /// Manage encrypted raw-value reader enrollment and public trust policy.
+    Raw {
+        #[command(subcommand)]
+        command: cmd_raw::RawCommand,
     },
     /// Show local exporter health and queue depth.
     Status,
+    /// Print the resolved public configuration for setup and local launchers.
+    Config {
+        #[arg(long, required_unless_present = "check", conflicts_with = "check")]
+        json: bool,
+        /// Validate public policy, configured paths and an existing state schema.
+        #[arg(long, required_unless_present = "json", conflicts_with = "json")]
+        check: bool,
+    },
     /// Run the MCP stdio server exposing trace queries.
     Mcp,
     /// Install gently's hooks and MCP server into a harness.
     Init {
         /// Install into Claude Code (`~/.claude`).
-        #[arg(long, default_value_t = true)]
+        #[arg(long, conflicts_with = "codex")]
         claude: bool,
         /// Install into Codex (`~/.codex/config.toml`).
         #[arg(long, default_value_t = false)]
         codex: bool,
-        /// Allow MCP queries to return locally stored raw prompt/tool values.
+        /// Allow MCP queries to decrypt raw prompt/tool values on this reader.
         #[arg(long, default_value_t = false)]
-        resolve_local_raw_values: bool,
+        resolve_raw_values: bool,
     },
     /// List recent traces.
     Traces {
@@ -159,24 +177,33 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Export {
             watch,
             interval_secs,
+            retry_raw_quarantine,
         } => {
             if watch {
-                cmd_export::watch(interval_secs)
+                cmd_export::watch(interval_secs, retry_raw_quarantine)
             } else {
-                cmd_export::run()
+                cmd_export::run(retry_raw_quarantine)
             }
         }
+        Command::Raw { command } => cmd_raw::run(command),
         Command::Status => cmd_status::run(),
+        Command::Config { check, .. } => {
+            if check {
+                config::check_setup()
+            } else {
+                config::print_setup_json()
+            }
+        }
         Command::Mcp => cmd_mcp::run(),
         Command::Init {
             claude: _,
             codex,
-            resolve_local_raw_values,
+            resolve_raw_values,
         } => {
             if codex {
-                cmd_init::run_codex(resolve_local_raw_values)
+                cmd_init::run_codex(resolve_raw_values)
             } else {
-                cmd_init::run_claude(resolve_local_raw_values)
+                cmd_init::run_claude(resolve_raw_values)
             }
         }
         Command::Traces {

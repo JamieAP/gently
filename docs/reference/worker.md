@@ -6,25 +6,37 @@ this collector, rather than the local outbox.
 
 ## Authentication
 
-Every route requires `Authorization: Bearer <token>` matching the Worker's
-`GENTLY_TOKEN`. A missing, empty, or incorrect token returns `401`. The shared
-token grants access to all stored traces; there is no per-user or tenant access
-boundary and no automatic database retention policy.
+Every route requires `Authorization: Bearer <token>` and exactly one
+`tenant_id` query parameter. The Worker's `GENTLY_HOSTS` secret is a JSON array
+of `{token, tenant_id, device_id, capabilities}` records; no shared
+`GENTLY_TOKEN` server fallback is supported. A missing, invalid or ambiguous
+credential/configuration returns `401`; a missing/invalid tenant returns `400`;
+a different tenant or missing capability returns `403`.
 
-The implementation returns JSON with `Cache-Control: no-store` and
-`X-Content-Type-Options: nosniff`. These headers do not remove previously stored
-span data. See [security and privacy](../concepts/security-and-privacy.md).
+`ingest` permits metadata/ciphertext writes; `read` permits metadata/ciphertext
+queries. Tenant ownership comes from the authenticated principal, and every
+D1 operation is tenant scoped. Capture device claims are authenticated as
+well: missing resource namespace/device attributes are injected from the
+principal; conflicting or duplicate resource/span claims are rejected.
+
+Responses use `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+There is no automatic credential expiry, account provisioning or retention.
+See [security and privacy](../concepts/security-and-privacy.md).
 
 ## Endpoints
 
-| Method and path | Purpose |
-| --- | --- |
-| `POST /v1/traces` | Flatten an OTLP/JSON request and upsert its spans |
-| `GET /v1/query?op=traces` | Trace/session summaries |
-| `GET /v1/query?op=trace&trace_id=TRACE_ID` | All rows for one trace, raw start ascending, with effective bounds |
-| `GET /v1/query?op=spans` | Limited, filtered span search |
-| `GET /v1/query?op=stats` | Unfiltered per-tool rollups |
-| `GET /v1/whoami` | Protocol probe for this HTTP request |
+Every path below also requires `tenant_id=TENANT` in its query string.
+
+| Method and path | Capability | Purpose |
+| --- | --- | --- |
+| `POST /v1/traces` | ingest | Flatten metadata OTLP/JSON and merge spans |
+| `GET /v1/query?op=traces` | read | Trace/session summaries |
+| `GET /v1/query?op=trace&trace_id=TRACE_ID` | read | One trace, with effective bounds |
+| `GET /v1/query?op=spans` | read | Limited, filtered span search |
+| `GET /v1/query?op=stats` | read | Tenant-wide tool rollups |
+| `POST /v1/raw-values` | ingest | Store an immutable encrypted raw object |
+| `GET /v1/raw-values/RAW_REF` | read | Fetch that tenant's opaque ciphertext object |
+| `GET /v1/whoami` | authenticated | Protocol probe for the request |
 
 Successful ingest returns:
 
@@ -36,10 +48,14 @@ Successful ingest returns:
 without it. `/v1/whoami` returns only that field. It does not identify a user or
 session and is unrelated to `gently whoami --pane`.
 
-Unsupported methods, paths, and query operations return `404`. JSON parsing,
-flattening, or database exceptions return a generic `500`. The ingest handler
-does not provide detailed per-span validation or rejection counts; an empty
-span envelope can succeed without inserting rows.
+Unsupported methods, paths and query operations return `404` after auth and
+tenant checks. Invalid JSON or guarded payloads return a safe `400`; actual
+request bytes over 1 MiB or metadata requests over 32 span reports return
+`413`. The span limit bounds upserts and ownership checks within D1's Free-plan
+[per-invocation query budget](https://developers.cloudflare.com/d1/platform/limits/).
+Other unhandled shape/database errors
+return a generic `500`. Empty span envelopes can succeed; the handler does not
+validate every OTLP feature or return detailed rejected-span counts.
 
 ### Example query
 
@@ -53,7 +69,7 @@ The CLI reads `GENTLY_TOKEN` from its environment and adds the bearer header.
 For a custom client, the corresponding request is:
 
 ```http
-GET /v1/query?op=traces&harness=codex&limit=5&order=last_activity HTTP/1.1
+GET /v1/query?tenant_id=personal&op=traces&harness=codex&limit=5&order=last_activity HTTP/1.1
 Authorization: Bearer <token supplied by the client>
 ```
 
@@ -135,12 +151,21 @@ nested descendants. `op=spans` does not calculate effective bounds. See the
 ## Ingest and repeated span updates
 
 Gently can report the same span on open, close, and session resume. The Worker
-uses `span_id` as the primary key and preserves the earliest reported start and
+uses `(tenant_id, span_id)` as the primary key and preserves the earliest reported start and
 latest reported end-or-start. Status, name, parent, and attribute fields come
 from the report whose end-or-start is latest. Equal ending timestamps favor
 the incoming report, so conflicting metadata at a tie depends on delivery order.
-Stored trace IDs are not updated on conflict; span IDs must therefore identify
-the same logical span consistently.
+Changing a span's trace ID returns `409`, including conflicts within a single
+request; repeated reports for the same logical span remain valid. Each row has an authoritative immutable
+`source_device_id` from authentication. A different device cannot update that
+span, even within the same tenant (`409`); moving capture to another device
+requires a fresh span ID. Cross-device parent links within a tenant are allowed.
+Guarded upserts prevent an ownership race from overwriting another host's row.
+
+Known raw-content aliases and all `.sha256` attributes are rejected rather than
+persisted in metadata. Byte lengths and random `.raw_ref` pointers are allowed.
+This prevents accidental uploads from old Gently producers; arbitrary external
+metadata strings cannot be proven free of private content.
 
 Timestamp strings preserve the received representation, but merge comparisons
 and effective bounds cast them to SQLite signed integers. The implementation
@@ -152,16 +177,65 @@ The response's empty `partialSuccess` object does not report rejected-span count
 
 ## D1 schema (`worker/schema.sql`)
 
-The `spans` table stores one row per `span_id`. It indexes trace, session, raw
-start, tool, and several compound filter/start keys. Effective bounds are query
-results, not columns. See [schema.sql](https://github.com/JamieAP/gently/blob/main/worker/schema.sql) for the exact
-DDL and [d1.ts](https://github.com/JamieAP/gently/blob/main/worker/src/d1.ts) for query and merge logic.
+The `spans` table keys rows by `(tenant_id, span_id)` and stores immutable
+capture-device ownership. Indexes start with tenant and cover trace, session,
+start, tool and common filters. Queries use explicit metadata projections;
+internal storage columns and raw ciphertext are not automatically included.
+
+`raw_values` keys immutable envelopes by `(tenant_id, raw_ref)`, with capture
+device, key epoch and creation time. D1 stores bounded ciphertext directly;
+no R2 bucket or decryption broker is provisioned. The new schema is pre-public:
+initialize a fresh database after an explicit reset of disposable old state,
+rather than applying it as a migration. See [schema.sql](https://github.com/JamieAP/gently/blob/main/worker/schema.sql).
+
+## Encrypted raw object contract
+
+An upload has exactly this shape (ciphertext and IDs here are placeholders):
+
+```json
+{
+  "version": 1,
+  "context": {
+    "tenant_id": "personal",
+    "device_id": "mac-main",
+    "key_epoch": 1,
+    "raw_ref": "0123456789abcdef0123456789abcdef",
+    "session_id": "example-session",
+    "harness": "codex",
+    "event": "UserPromptSubmit"
+  },
+  "ciphertext_b64": "STANDARD_BASE64_OF_BINARY_AGE_V1_CIPHERTEXT"
+}
+```
+
+Extra envelope/context properties are rejected. Tenant/device must match the
+upload principal. Namespace IDs use 1–64 ASCII letters, digits, dashes or
+underscores. References are 32 lowercase hex characters; key epochs are
+positive safe integers. Session/harness/event are nonempty strings up to 256
+UTF-8 bytes without control characters. Ciphertext must be canonical standard
+base64 and decode to at most 512 KiB. The Worker parses age v1 recipient
+stanzas, canonical header MAC framing and a minimum nonce/tag body; password
+recipients and incomplete/prefix-only headers are rejected. This
+[age format guard](https://c2sp.org/age@v1.1.0) cannot authenticate the header
+MAC or encrypted payload, or prove that arbitrary client content is secret.
+
+Successful upload returns `200 {"raw_ref":"..."}`. Retrying an identical
+normalized envelope succeeds; different content/context for an existing ref
+returns `409`. Fetch returns the exact envelope or `404` within the authorized
+tenant. Another tenant cannot select that object's namespace. No plaintext raw
+field or decryption endpoint is supported.
+
+Enrolled clients encrypt/authenticate an inner payload containing context,
+fields and owning span IDs. Readers verify those bindings locally. Recipient
+manifests are signed, but raw objects carry no writer signature or complete
+replay/provenance protocol. See
+[raw enrollment](../guides/encrypted-raw-values.md).
 
 ## Deploy and operate
 
 Follow the [quick start](../getting-started/quickstart.md) for Cloudflare setup,
 or [local setup](../getting-started/local-collector.md) for a localhost Worker and local D1.
-The `DB` binding and database ID live in `worker/wrangler.toml`; `GENTLY_TOKEN`
+The `DB` binding and database ID live in `worker/wrangler.toml`; `GENTLY_HOSTS`
 is supplied separately. Avoid committing tokens to source or configuration.
 
 For development from the checkout:
@@ -170,6 +244,7 @@ For development from the checkout:
 cd worker
 npm ci
 npm test
+npm run typecheck
 ```
 
 There is no built-in deletion, retention scheduler, token provisioning endpoint,

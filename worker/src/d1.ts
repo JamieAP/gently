@@ -1,9 +1,17 @@
 import type { Row } from "./otlp.js";
+import { ClientError } from "./http.js";
 
 export interface Env {
   DB: D1Database;
-  GENTLY_TOKEN: string;
+  GENTLY_HOSTS: string;
 }
+
+// Deliberately project the public metadata fields. New storage columns must not
+// silently become query response fields.
+const SPAN_COLUMNS = [
+  "span_id", "trace_id", "parent_span_id", "name", "kind", "start_unix_nano", "end_unix_nano",
+  "status", "session_id", "harness", "tool_name", "tool_use_id", "attrs_json", "resource_json", "ingested_unix_nano",
+];
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 1000;
@@ -44,8 +52,35 @@ function intFilter(raw: string | null | undefined): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-export async function insertSpans(env: Env, rows: Row[]): Promise<void> {
+export async function insertSpans(env: Env, tenantId: string, deviceId: string, rows: Row[]): Promise<void> {
   if (rows.length === 0) return;
+  const expectedTraces = new Map<string, string>();
+  for (const row of rows) {
+    const previousTrace = expectedTraces.get(row.span_id);
+    if (previousTrace !== undefined && previousTrace !== row.trace_id) {
+      throw new ClientError(409, "Span belongs to another trace");
+    }
+    expectedTraces.set(row.span_id, row.trace_id);
+  }
+  // Repeated lifecycle reports share an ID. Read ownership once per unique ID,
+  // using one tenant binding plus at most 99 IDs per D1 statement.
+  const ids = [...expectedTraces.keys()];
+  const ownershipStatements = () => {
+    const statements: D1PreparedStatement[] = [];
+    for (let offset = 0; offset < ids.length; offset += 99) {
+      const chunk = ids.slice(offset, offset + 99);
+      statements.push(env.DB.prepare(
+        `SELECT span_id, source_device_id, trace_id FROM spans WHERE tenant_id = ? AND span_id IN (${chunk.map(() => "?").join(",")})`,
+      ).bind(tenantId, ...chunk));
+    }
+    return statements;
+  };
+  type Owner = { span_id: string; source_device_id: string; trace_id: string };
+  const owners = await env.DB.batch<Owner>(ownershipStatements());
+  const conflicts = (owner: Owner) => owner.source_device_id !== deviceId || owner.trace_id !== expectedTraces.get(owner.span_id);
+  if (owners.some(result => result.results.some(conflicts))) {
+    throw new ClientError(409, "Span belongs to another capture device or trace");
+  }
 
   // Idempotent-monotonic upsert. The hook layer is a distributed, retrying,
   // multi-process emitter with no delivery-order guarantee: the same span_id is
@@ -65,12 +100,12 @@ export async function insertSpans(env: Env, rows: Row[]): Promise<void> {
   const stmts = rows.map((r) =>
     env.DB.prepare(
       `INSERT INTO spans
-        (span_id, trace_id, parent_span_id, name, kind,
+        (tenant_id, span_id, source_device_id, trace_id, parent_span_id, name, kind,
          start_unix_nano, end_unix_nano, status,
          session_id, harness, tool_name, tool_use_id,
          attrs_json, resource_json, ingested_unix_nano)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(span_id) DO UPDATE SET
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(tenant_id, span_id) DO UPDATE SET
          start_unix_nano = CASE
            WHEN CAST(excluded.start_unix_nano AS INTEGER) < CAST(start_unix_nano AS INTEGER)
            THEN excluded.start_unix_nano ELSE start_unix_nano END,
@@ -88,9 +123,12 @@ export async function insertSpans(env: Env, rows: Row[]): Promise<void> {
          ${pick("tool_use_id")},
          ${pick("attrs_json")},
          ${pick("resource_json")},
-         ${pick("ingested_unix_nano")}`,
+         ${pick("ingested_unix_nano")}
+         WHERE source_device_id = excluded.source_device_id AND trace_id = excluded.trace_id`,
     ).bind(
+      tenantId,
       r.span_id,
+      deviceId,
       r.trace_id,
       r.parent_span_id,
       r.name,
@@ -109,6 +147,13 @@ export async function insertSpans(env: Env, rows: Row[]): Promise<void> {
   );
 
   await env.DB.batch(stmts);
+  // A competing device may claim an absent ID after preflight. The guarded
+  // upsert cannot overwrite it, and verification reports the conflict safely.
+  const storedOwners = await env.DB.batch<Owner>(ownershipStatements());
+  const stored = storedOwners.flatMap(result => result.results);
+  if (stored.length !== ids.length || stored.some(conflicts)) {
+    throw new ClientError(409, "Span belongs to another capture device or trace");
+  }
 }
 
 export interface TraceSummary {
@@ -123,6 +168,7 @@ export interface TraceSummary {
 
 export async function traces(
   env: Env,
+  tenantId: string,
   params: {
     limit?: string | null;
     harness?: string | null;
@@ -133,8 +179,8 @@ export async function traces(
   },
 ): Promise<TraceSummary[]> {
   const limit = clampLimit(params.limit ?? null);
-  const conditions: string[] = [];
-  const bindings: (string | number)[] = [];
+  const conditions: string[] = ["tenant_id = ?"];
+  const bindings: (string | number)[] = [tenantId];
 
   if (params.since) {
     conditions.push("start_unix_nano >= ?");
@@ -205,22 +251,22 @@ export interface SpanRow {
 // otherwise using direct-child maximum end or their own start. Two GROUP BYs,
 // no recursion. These observations do not prove capture completeness or actual
 // completion. Raw bounds remain unchanged; TEXT avoids JS integer rounding.
-export async function trace(env: Env, trace_id: string): Promise<SpanRow[]> {
+export async function trace(env: Env, tenantId: string, trace_id: string): Promise<SpanRow[]> {
   const result = await env.DB.prepare(
     `WITH agg AS (
        SELECT MAX(CAST(COALESCE(end_unix_nano, start_unix_nano) AS INTEGER)) AS trace_max,
               MIN(CAST(start_unix_nano AS INTEGER)) AS trace_min
-       FROM spans WHERE trace_id = ?1
+       FROM spans WHERE tenant_id = ?1 AND trace_id = ?2
      ),
      child_bounds AS (
        SELECT parent_span_id AS pid,
               MAX(CAST(COALESCE(end_unix_nano, start_unix_nano) AS INTEGER)) AS cmax,
               MIN(CAST(start_unix_nano AS INTEGER)) AS cmin
        FROM spans
-       WHERE trace_id = ?1 AND parent_span_id IS NOT NULL
+       WHERE tenant_id = ?1 AND trace_id = ?2 AND parent_span_id IS NOT NULL
        GROUP BY parent_span_id
      )
-     SELECT s.*,
+     SELECT ${SPAN_COLUMNS.map(column => `s.${column}`).join(", ")},
             CAST(CASE
               WHEN s.parent_span_id IS NULL THEN agg.trace_min
               ELSE MIN(CAST(s.start_unix_nano AS INTEGER),
@@ -239,16 +285,17 @@ export async function trace(env: Env, trace_id: string): Promise<SpanRow[]> {
               ELSE COALESCE(cb.cmax, CAST(s.start_unix_nano AS INTEGER))
             END AS TEXT) AS effective_end_unix_nano
      FROM spans s CROSS JOIN agg LEFT JOIN child_bounds cb ON cb.pid = s.span_id
-     WHERE s.trace_id = ?1
+     WHERE s.tenant_id = ?1 AND s.trace_id = ?2
      ORDER BY s.start_unix_nano ASC`,
   )
-    .bind(trace_id)
+    .bind(tenantId, trace_id)
     .all<SpanRow>();
   return result.results;
 }
 
 export async function spans(
   env: Env,
+  tenantId: string,
   params: {
     trace_id?: string | null;
     session_id?: string | null;
@@ -264,8 +311,8 @@ export async function spans(
   },
 ): Promise<SpanRow[]> {
   const limit = clampLimit(params.limit ?? null);
-  const conditions: string[] = [];
-  const bindings: (string | number)[] = [];
+  const conditions: string[] = ["tenant_id = ?"];
+  const bindings: (string | number)[] = [tenantId];
 
   if (params.trace_id) {
     conditions.push("trace_id = ?");
@@ -310,7 +357,7 @@ export async function spans(
   const direction = startOrder(params.order, START_DESC);
 
   const result = await env.DB.prepare(
-    `SELECT * FROM spans ${where} ORDER BY start_unix_nano ${direction} LIMIT ?`,
+    `SELECT ${SPAN_COLUMNS.join(", ")} FROM spans ${where} ORDER BY start_unix_nano ${direction} LIMIT ?`,
   )
     .bind(...bindings, limit)
     .all<SpanRow>();
@@ -325,7 +372,7 @@ export interface ToolStat {
   // p50/p95 not available in SQLite; see follow-up for approximation
 }
 
-export async function stats(env: Env): Promise<ToolStat[]> {
+export async function stats(env: Env, tenantId: string): Promise<ToolStat[]> {
   const result = await env.DB.prepare(
     `SELECT
        tool_name,
@@ -339,9 +386,9 @@ export async function stats(env: Env): Promise<ToolStat[]> {
          END
        ) AS avg_duration_ms
      FROM spans
-     WHERE tool_name IS NOT NULL
+     WHERE tenant_id = ? AND tool_name IS NOT NULL
      GROUP BY tool_name
      ORDER BY span_count DESC`,
-  ).all<ToolStat>();
+  ).bind(tenantId).all<ToolStat>();
   return result.results;
 }

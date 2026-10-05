@@ -7,8 +7,8 @@ this guide.
 ## 1. Install the CLI
 
 You need Git, Rust and Cargo, plus Node.js and npm for the collector. The local
-launcher additionally needs Python 3 and the external helper described in
-[Local setup](local-collector.md).
+launcher additionally needs Python 3 and an inherited token from your secret
+provider, as described in [local setup](local-collector.md).
 
 ```sh
 git clone https://github.com/JamieAP/gently.git
@@ -22,14 +22,15 @@ If the shell cannot find `gently`, add Cargo's binary directory to `PATH`
 
 ## 2. Choose a collector
 
-Export and query commands need a running collector and its shared bearer token.
+Export and query commands need a running collector and a host credential enrolled for
+the configured tenant.
 Hooks can queue events before either is available.
 
 ### Local collector
 
-Follow [Local setup](local-collector.md) if you have the separate
-`agent-secrets` helper. It starts a localhost Worker, local D1 and an export
-watcher after one foreground unlock. No Cloudflare login or cloud database is
+Follow [local setup](local-collector.md) to start a localhost Worker, local D1
+and an export watcher with an inherited token. The separate macOS
+`agent-secrets` helper is an optional foreground wrapper. No Cloudflare login or cloud database is
 needed. Use `http://127.0.0.1:8787` as the collector URL.
 
 ### Cloudflare collector
@@ -45,18 +46,31 @@ npx wrangler d1 create gently
 
 Put the returned `database_id` in `worker/wrangler.toml`, replacing
 `REPLACE_AFTER_CREATE`. From the `worker` directory, initialize the database,
-set the token through Wrangler's private interactive prompt, and deploy:
+set the host authorization JSON through a private secret-provider workflow, and deploy:
 
 ```sh
 npx wrangler d1 execute gently --remote --file schema.sql
-npx wrangler secret put GENTLY_TOKEN
+npx wrangler secret put GENTLY_HOSTS
 npx wrangler deploy
 cd ..
 ```
 
-Keep the deployed URL. Supply the same token as `GENTLY_TOKEN` to export and
-query processes through your secret manager. Keep it out of repository files,
-command arguments and shell history. See [Configuration](configuration.md).
+The Worker secret is a JSON array with this shape; replace the public template
+placeholder through your provider's private workflow:
+
+```json
+[{"token":"HOST_CREDENTIAL_FROM_PROVIDER","tenant_id":"personal","device_id":"mac-main","capabilities":["ingest","read"]}]
+```
+
+Use distinct credentials for each host. A capture/export-only host gets
+`["ingest"]`; a reader gets `["read"]`. Each record names exactly one tenant
+and device. Rotate or revoke records by updating the secret; there is no
+built-in credential expiry or Access provisioning.
+
+Keep the deployed URL. Export/query processes inherit their own host credential
+as `GENTLY_TOKEN` from the provider. Set the matching `tenant_id` and `device_id`
+in Gently configuration. Keep credentials out of repository files, argument
+lists and shell history. See [configuration](configuration.md).
 
 ## 3. Configure an agent
 
@@ -77,9 +91,12 @@ Set the collector URL in `~/.gently/config.toml`:
 ```toml
 collector_url = "http://127.0.0.1:8787"
 prefer_quic = false
+tenant_id = "personal"
+device_id = "local"
 ```
 
-For Cloudflare, replace the URL with the deployed HTTPS URL. The
+For Cloudflare, replace the URL with the deployed HTTPS URL and use the device
+ID enrolled for your credential. The
 `prefer_quic = false` setting is suitable for localhost; remote export can
 prefer HTTP/3 with a TCP fallback. Omit that line to use the default.
 If you use `GENTLY_STATE_DIR`, the config belongs in that directory instead.
@@ -128,8 +145,9 @@ agent tools. If capture or export is missing, follow
 
 ## Keep raw capture deliberate
 
-Ordinary traces contain digests and identifying metadata, rather than raw
-prompt or tool content. Capturing local raw content and resolving it into query
-results are separate opt-ins. Neither is needed to complete this guide.
+Ordinary traces contain byte lengths and identifying metadata. Encrypted raw
+capture, ciphertext cloud sync and reader resolution are separate opt-ins.
+None is needed to complete this guide. Use the
+[enrollment guide](../guides/encrypted-raw-values.md) before enabling them.
 Read [Security and privacy](../concepts/security-and-privacy.md) before enabling
 either, including for hook diagnosis.
