@@ -1,71 +1,105 @@
-# Security & privacy
+# Security and privacy
 
-## Exported metadata and local raw content
+Gently limits exported content fields to digests and byte lengths, but a trace
+still contains identifying metadata. Decide what may be captured, where it may
+be sent and who may query it before enabling the hooks.
 
-Normal exports contain span IDs, names, timings, status, tool names/use IDs,
-permission mode, and truncated SHA-256 digests plus byte lengths of prompt and
-tool values. Raw prompt, command, file, and tool output values are excluded from
-the export outbox. Digests are fingerprints rather than encryption and can be
-guessed for low-entropy content.
+## What is stored where
 
-Exports intentionally identify the working directory, hostname, operating system,
-session and agent IDs, harness/version, and sometimes model, session source,
-effort level, close reason, agent type, and agent transcript path. This metadata
-can reveal projects, local paths, activity patterns, and the tools/models used.
-Only export traces to a collector you control and are allowed to use.
+| Location | Contents |
+| --- | --- |
+| Collector | Span IDs, names, timings, statuses, tool/use IDs, context and identifying metadata, plus truncated content digests and byte lengths. |
+| Local `state.db` | Pending envelopes, open-span bookkeeping, counters, quarantine and raw values when capture was enabled. |
+| Local debug files | Full hook payloads when both raw capture and debug capture are enabled. |
+| Local logs | Hook and export diagnostics. |
 
-Raw capture is disabled by default. Setting `capture_raw_values = true` in
-config or `GENTLY_CAPTURE_RAW_VALUES=1` on the hook process stores selected
-prompts, tool inputs/responses and assistant messages locally in
-`~/.gently/state.db`, keyed by digest. This plaintext can include credentials or
-confidential source material. It has no automatic retention limit. Disabling
-capture stops new writes and does not remove existing values, including values
-captured by earlier versions.
+Content digests use the first 8 bytes of SHA-256. They are fingerprints, not
+encryption or proof of anonymity. Low-entropy values can be guessed and matched.
+Byte lengths and repeated fingerprints can also reveal patterns.
 
-CLI/MCP queries return collector digest attributes by default. Explicitly set
-`GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES=1` on a query process to add matching local
-raw attributes. `gently init --claude` and `gently init --codex` leave this disabled.
-The `--resolve-local-raw-values` install option enables it for the registered MCP
-server; re-running init without the option removes that setting. If MCP is used
-inside an agent, resolved values may enter that agent's model-provider context.
-Resolution does not enable capture: it only retrieves values already present.
+Working directories, hostnames, session/agent IDs, transcript paths, harness and
+version are exported as metadata. Model, source, effort, permission mode and
+agent type may also be included. Paths and activity patterns can identify
+projects or people even when prompt and tool values are not exported verbatim.
+Use a collector you control and are permitted to send that metadata to.
 
-`GENTLY_DEBUG=1` saves full hook payloads to
-`~/.gently/raw/<harness>/<Event>.jsonl` only when raw capture is also explicitly
-enabled. Gently never generates process-environment snapshots. Existing debug
-files, including environment snapshots made by older versions, are not deleted
-automatically. Disable capture after diagnosis and review/delete existing files
-as needed. Full payloads can contain sensitive content and have no retention
-limit.
+## Capture and resolution are separate
 
-## Local files
+Both options are off by default and apply to different processes:
 
-On Unix, gently creates or restricts application/harness state directories to
-`0700` and config, SQLite/database sidecars, raw capture, logs, locks, and updated
-harness config files to `0600`. Existing files opened through these paths are
-restricted before use; final-path symlinks are rejected. Unix helpers also refuse
-files owned by another user or with multiple hardlinks before changing their
-permissions or contents. Local content is
-plaintext, and backups made before restriction are not changed. These controls
-do not protect against the same user, privileged processes, or an agent allowed
-to read the files. On other platforms the native inherited ACL applies; configure
-an owner-only ACL separately because Unix modes are not enforced there.
+| Option | Set on | Effect |
+| --- | --- | --- |
+| `capture_raw_values = true` or `GENTLY_CAPTURE_RAW_VALUES=1` | Hook process | Store selected prompt, tool input/response and assistant values in local SQLite. |
+| `GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES=1` | Query or MCP process | Add matching retained local raw values to supported query results. |
 
-## Transport and access
+Raw values are plaintext and can include credentials, commands, file contents
+or confidential material. They have no automatic retention limit. Turning off
+capture stops new raw-value writes; it does not erase existing values, sidecars,
+debug files or backups.
 
-Remote collectors should use HTTPS. HTTP is available for local development.
-The Worker requires `Authorization: Bearer <GENTLY_TOKEN>` on its routes; the
-single shared token grants access to all traces. Configure it as a Cloudflare
-secret and in your private local config/environment, not in `wrangler.toml`.
-The repository contains a placeholder D1 database identifier to replace when
-you create your own database. Authentication failures stop export immediately
-without dropping or quarantining the queue.
+Resolution does not enable capture. It looks up values already stored locally
+and does not add them to the export outbox. Resolved CLI output or MCP results
+can expose that content to readers; inside an agent, it can enter the agent's
+model-provider context.
 
-For a hardware-bound local token, unlock once from a foreground terminal.
-A desktop/background hook cannot present that interaction reliably: it records
-locally when no token is inherited. A token-bearing export watcher can drain
-those records without prompting inside hooks. See [Local setup](../../LOCAL_SETUP.md).
+Normal `gently init --claude` and `gently init --codex` do not enable resolution.
+The `--resolve-local-raw-values` install option sets it for the registered MCP
+server. Running init again without the option removes the registered setting;
+an independently inherited environment flag can still enable it. See
+[Querying and MCP](../guides/querying-and-mcp.md) for the affected results.
 
-The collector relies on Cloudflare's service controls for data at rest. This
-project does not implement tenant separation, an IP allowlist, mTLS, or automatic
-retention. The public Worker endpoint is protected by the shared bearer token.
+### Debug capture
+
+`GENTLY_DEBUG=1` writes payload JSONL under
+`~/.gently/raw/<harness>/<Event>.jsonl` only when raw capture is also enabled.
+This can retain more content than the selected fields stored in SQLite. Debug
+capture does not dump the whole process environment. Files remain after the
+flags are disabled, so review their contents and retention after diagnosis.
+
+## Local file protection
+
+On Unix, Gently's private-file helpers create or restrict application/harness
+state directories to `0700` and managed files to `0600`. Those files include
+config, SQLite and sidecars, raw capture, logs, locks and updated harness config.
+The helpers reject final-path symlinks and, on Unix, files owned by another user
+or with multiple hardlinks before changing them.
+
+These permissions do not encrypt content or protect it from the same user,
+privileged processes or an agent allowed to read the files. Copies and backups
+have their own permissions. Other platforms do not apply these Unix modes;
+configure suitable owner-only ACLs separately. Keep local state and logs within
+the access boundary appropriate for their contents.
+
+## Collector access and transport
+
+The Worker requires `Authorization: Bearer <GENTLY_TOKEN>` for its routes. The
+single shared token grants read and write access to all traces; there is no
+per-user or per-trace authorization. Anyone holding it can query the collector.
+
+For a remote deployment, configure the token as a Worker secret and provide the
+same value to authorized local processes. Keep it out of source-controlled
+files, command arguments and shared logs. HTTPS protects remote transport.
+Local development uses HTTP on loopback; do not treat that setup as a protected
+remote endpoint. The project implements no tenant separation, mTLS, IP allowlist
+or automatic trace retention.
+
+Authentication failure stops export without quarantining the rejected send.
+Export capacity trimming can already have removed older queued rows before that
+request; see [Reliability](reliability.md#capacity-and-retention).
+
+## Local launchers and process credentials
+
+The bundled collector/export launcher scripts call a separately installed
+`agent-secrets` helper. Secret storage and hardware unlock belong to that helper,
+not the Rust CLI. Its installation and supported platforms are separate from
+Gently; see [Local collector setup](../getting-started/local-collector.md).
+
+A foreground launcher can pass a token to the Worker and export watcher through
+process environments. Those processes then hold the plaintext token. Background
+hooks do not initiate hardware unlock and can queue without a token.
+
+The watcher's credentials are not transferred to separate CLI or MCP processes.
+Each query process needs its own authorized configuration or inherited token.
+Starting the collector and watcher does not establish authenticated desktop MCP
+access. See [Configuration](../getting-started/configuration.md) for process
+settings and [Architecture](architecture.md) for the data flow.

@@ -7,10 +7,13 @@ The project is pre-1.0; pending changes appear under Unreleased.
 
 ### Added
 
+- Render trace waterfalls directly in the Rust CLI with `gently trace --waterfall`
+  or `gently waterfall` for JSON on stdin. Include Unicode-aligned labels,
+  clipping ellipses, a status legend and trace integrity diagnostics.
 - Capture model, session source, effort, close reason, and agent transcript path
   when supplied by the agent's hook payload.
-- Return effective span bounds covering a span and its descendants for trace
-  rendering.
+- Return effective bounds for trace rendering: a full-trace window for roots
+  and direct-child bounds for other spans.
 - Create provisional turn spans when events reference a turn before its opening
   event has arrived.
 - Reap open-span tracking rows older than a day.
@@ -23,6 +26,8 @@ The project is pre-1.0; pending changes appear under Unreleased.
 
 ### Changed
 
+- Replace the standalone Python waterfall renderer with the native commands.
+- Reorganize setup, querying and reference documentation and add troubleshooting.
 - Merge report time bounds and choose content by the latest report timestamp.
 - Stop immediately on authentication rejection (`401`, `403`), preserving the
   queue for a later authenticated export. Retry transient failures with backoff

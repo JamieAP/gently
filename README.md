@@ -119,19 +119,19 @@ Run a task in the configured agent, then inspect its captured activity:
 
 ```sh
 gently traces
-gently trace <trace_id>
+gently trace TRACE_ID
 gently spans --tool-name Bash
 gently stats
 gently status
 ```
 
-Replace `<trace_id>` with an ID from `gently traces`. Trace queries read from the
+Replace `TRACE_ID` with an ID from `gently traces`. Trace queries read from the
 collector; `gently status` reports local queue and exporter health.
 
 To render a trace timeline with integrity checks:
 
 ```sh
-gently trace <trace_id> --waterfall
+gently trace TRACE_ID --waterfall
 ```
 
 For saved or piped span JSON, use `gently waterfall < trace.json`. Neither
@@ -185,9 +185,11 @@ drains the queue continuously and reuses connections. Remote export can use
 HTTP/3, with a TCP fallback.
 
 The exporter drains the outbox with retry and backoff.
-The default queue cap is 10,000 envelopes, after which the oldest queued
-envelopes are dropped. Authentication failures stop export immediately;
-transient failures use backoff, and unprocessable envelopes can be quarantined.
+The default queue cap is 10,000 envelopes, applied when export drains the
+outbox; excess oldest envelopes are dropped before sending. The queue can grow
+beyond that cap while no exporter drains it. Authentication failures stop export
+immediately; transient failures use backoff, and unprocessable envelopes can be
+quarantined.
 
 Session, turn, and subagent spans are updated as they open and close. The Worker
 replaces records with the same span ID. Exporting to another OpenTelemetry
@@ -206,6 +208,7 @@ Claude Code / Codex hooks -> local SQLite outbox -> Worker -> D1
 - [Current harness hooks](docs/reference/hooks.md)
 - [Configuration](docs/getting-started/configuration.md)
 - [Querying and MCP](docs/guides/querying-and-mcp.md)
+- [Troubleshooting](docs/guides/troubleshooting.md)
 - [Security and privacy](docs/concepts/security-and-privacy.md)
 
 ## Development

@@ -5,6 +5,7 @@
 ## Getting started
 
 * [Quick start](getting-started/quickstart.md)
+* [Local collector](getting-started/local-collector.md)
 * [Configuration](getting-started/configuration.md)
 
 ## Concepts
@@ -16,7 +17,8 @@
 
 ## Guides
 
-* [Querying & MCP](guides/querying-and-mcp.md)
+* [Querying and MCP](guides/querying-and-mcp.md)
+* [Troubleshooting](guides/troubleshooting.md)
 
 ## Reference
 

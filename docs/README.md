@@ -1,47 +1,54 @@
 ---
-description: Distributed tracing for coding agents.
+description: Capture and inspect coding-agent activity with Gently.
 ---
 
 # Gently documentation
 
-Gently records Claude Code and Codex sessions as OpenTelemetry traces. Hooks store
-spans in a local SQLite outbox. A token-bearing detached exporter or
-`gently export --watch` sends them to a Cloudflare Worker backed by D1, and CLI
-or MCP queries let you inspect the recorded activity.
+Gently records Claude Code and Codex sessions as OpenTelemetry traces. Hooks
+queue events in local SQLite; an exporter sends them to a collector. Use the
+CLI or MCP to inspect sessions, tool calls and delegated work.
 
-## Getting started
+## Start here
 
-1. Follow the [quick start](getting-started/quickstart.md) to deploy a collector
-   and install the integration.
-2. Set the collector URL and token using the
-   [configuration guide](getting-started/configuration.md).
-3. Use [CLI and MCP queries](guides/querying-and-mcp.md) to inspect traces.
+| Goal | Read |
+| --- | --- |
+| Install Gently and capture your first session | [Quick start](getting-started/quickstart.md) |
+| Run the supplied localhost collector | [Local setup](getting-started/local-collector.md) |
+| Choose settings and supply a collector token | [Configuration](getting-started/configuration.md) |
+| Explore traces, waterfalls and MCP tools | [Querying and MCP](guides/querying-and-mcp.md) |
+| Find missing spans or fix export/query failures | [Troubleshooting](guides/troubleshooting.md) |
+| Understand what is stored or shared | [Security and privacy](concepts/security-and-privacy.md) |
 
-Claude Code and Codex integrations are included. Install with
-`gently init --claude` or `gently init --codex`; Codex hooks must also be trusted
-inside Codex.
+The Cloudflare setup uses Wrangler and D1. The supplied local launcher also
+requires a separately installed `agent-secrets` helper; Gently does not install
+that helper or its hardware-backed vault.
+
+## What is supported
+
+CLI hooks and token-configured queries are included for Claude Code and Codex.
+Codex hook registration also requires trusting the installed entries in Codex.
+Desktop hooks can queue without a token and use a separate export watcher.
+That watcher does not authenticate CLI or MCP queries. Authenticated desktop
+MCP access and Claude Chat/Cowork integration remain incomplete.
+
+Raw content capture is off by default. Ordinary exports still contain identifying
+metadata such as paths, host information and session IDs. The collector's
+shared token grants access to all its traces; there is no tenant separation or
+automatic retention. Read the [data flow and controls](concepts/security-and-privacy.md)
+before enabling capture or sharing a collector.
 
 ## How it works
 
-The [architecture guide](concepts/architecture.md) describes the hook, local store,
-exporter, and collector. The [trace model](concepts/trace-model.md) explains how
-session, turn, tool, and subagent spans relate, including provisional spans and
-updates with the same span ID. The [hook reference](reference/hooks.md) lists
-current Claude and Codex lifecycle mappings and prompt/subagent context.
+- [Architecture](concepts/architecture.md): capture, local storage, export and query paths.
+- [Trace model](concepts/trace-model.md): sessions, turns, tools, subagents and updated spans.
+- [Reliability](concepts/reliability.md): buffering, retries, queue caps and quarantine.
 
-## Privacy and access
+## Reference
 
-Normal exports contain digests and metadata, including local paths and host
-information. Raw-value capture is off by default; an explicit capture opt-in
-can store selected values in local plaintext storage. Resolving those values
-through CLI or MCP requires a separate opt-in; raw MCP results may enter the calling
-agent's model-provider context. The collector's shared bearer token grants
-access to all traces.
+- [CLI](reference/cli.md): commands and flags.
+- [Harness hooks](reference/hooks.md): the events and fields the adapters handle.
+- [OTel format](reference/otel-format.md): the exported envelope and attributes.
+- [Collector and Worker](reference/worker.md): endpoints, queries and database behavior.
 
-Read [security and privacy](concepts/security-and-privacy.md) for the full data
-flow, permissions, debug-capture behaviour, and retention limits.
-
-## License
-
-Gently is [MIT licensed](../LICENSE). Dependencies retain their own licenses and
-notices.
+For development and bug reports, see [Contributing](https://github.com/JamieAP/gently/blob/main/CONTRIBUTING.md).
+Gently is [MIT licensed](https://github.com/JamieAP/gently/blob/main/LICENSE); dependencies retain their own licenses.

@@ -1,85 +1,198 @@
-# Querying & MCP
+# Querying and MCP
 
-The collector exposes one read surface (`GET /v1/query`). The CLI and the MCP
-server are two front-ends onto it.
+CLI queries and MCP tools read the same collector API. They require a configured
+collector URL and a token available to the querying process. A watcher can export
+events queued by hooks without tokens, but it does not supply credentials to a
+separate CLI or MCP process. See [configuration](../getting-started/configuration.md)
+and [local setup](../getting-started/local-collector.md).
 
-## From the CLI
+`gently status` is a local health check. `gently waterfall` only reads stdin.
+Neither needs a collector token.
 
-```bash
-gently traces [--limit N] [--harness claude-code] [--session-id ..] [--since <nanos>] [--until <nanos>] [--order start_desc|start_asc|last_activity] [--json]
-gently trace <trace_id> [--json | --waterfall] # span tree, raw spans, or waterfall
-gently spans [--trace-id ..] [--session-id ..] [--harness ..] [--tool-name ..] [--name ..] [--status 0|1|2] [--kind ..] [--since <nanos>] [--until <nanos>] [--limit N] [--order start_desc|start_asc] [--json]
-gently stats [--json]                     # per-tool counts, errors, avg duration
-gently status                             # local exporter health + queue depth
-```
-
-`--json` on any query prints raw JSON for piping.
-
-By default, query JSON contains only the collector's digest attributes. Set
-`GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES=1` on the CLI or MCP server process to add
-matching locally stored raw attributes such as `gently.tool_input`,
-`gently.tool_response`, `gently.prompt`, and `gently.assistant`.
-Raw capture is disabled by default. Values are available for resolution only
-if they were previously captured with `capture_raw_values = true` or
-`GENTLY_CAPTURE_RAW_VALUES=1`, or by an older version. Resolution does not enable
-capture, and disabling capture does not remove existing values.
-Sharing resolved output with an agent can send that content to its provider.
-
-### Waterfall
-
-`gently trace --waterfall` renders a depth-indented, time-proportional timeline
-plus integrity checks: session-root presence, resolved parent links, no negative
-durations, and child-within-parent nesting. It uses collector-derived effective
-bounds when available, with raw span bounds as a fallback:
-
-```bash
-gently trace <trace_id> --waterfall
-```
-
-Labels stay aligned for Unicode names; clipped names end in an ellipsis. The
-status legend distinguishes successful, failed, unset, and unknown statuses.
-
-To render saved or piped spans without connecting to the collector:
+## Find a session and inspect its tools
 
 ```sh
-gently waterfall < trace.json
-gently trace <trace_id> --json | gently waterfall
+gently traces --harness codex --limit 5 --order last_activity
+gently trace TRACE_ID --waterfall
+gently spans --trace-id TRACE_ID --tool-name Bash --order start_asc
+gently spans --trace-id TRACE_ID --status 2 --kind 3 --json
 ```
 
-The renderer is part of the Rust binary and does not require Python. Integrity
-results are diagnostic; an incomplete capture can fail checks. Empty or
-malformed input, duplicate span IDs, and parent cycles return an error.
+Replace `TRACE_ID` with an ID from the first command. Use `--harness claude-code`
+for Claude Code captures. The last command selects error-status tool/client
+spans. A failed or interrupted turn can also have status `2`, so a status filter
+alone does not mean tool failure.
 
-## From the agent (MCP)
+`gently trace TRACE_ID` shows a span tree by default. Add `--json` for the
+span-row array or `--waterfall` for a chart. The two flags cannot be combined.
+`gently stats` summarizes all recorded tool spans, without trace or time filters.
+See the [CLI reference](../reference/cli.md) for every command and flag.
 
-`gently mcp` is a stdio MCP server exposing the same surface as tools the agent
-can call to introspect its own runs. `gently init` registers it in
-`~/.claude.json`; `gently init --codex` registers it in Codex config instead.
-Raw resolution stays off unless you add `--resolve-local-raw-values`. Ordinary
-reinstallation removes an earlier installed raw-resolution setting.
-Verify the Claude registration with `claude mcp get gently`.
+## Filters, limits, and ordering
 
-| Tool | Args | Returns |
-|---|---|---|
-| `list_traces` | `limit?`, `harness?`, `session_id?`, `since?`, `until?`, `order?`, `jq?` | sessions/traces, newest first by default |
-| `sessions` | same as `list_traces` | alias for `list_traces` |
-| `get_trace` | `trace_id`, `jq?` | all spans for a trace (tree reconstruction) |
-| `search_spans` | `trace_id?`, `session_id?`, `harness?`, `tool_name?`, `name?`, `status?`, `kind?`, `since?`, `until?`, `limit?`, `order?`, `jq?` | filtered spans |
-| `trace_stats` | `jq?` | per-tool rollups |
-| `response_fields` | `tool?`, `jq?` | documented top-level response fields and jq examples |
-| `span_attr_keys` | span filters + `limit?`, `order?`, `jq?` | discovered `attrs_json` / `resource_json` keys across matching spans |
+| Query | Default | Supported ordering |
+| --- | --- | --- |
+| Trace list | 50 summaries, newest start first | `start_desc`, `start_asc`, `last_activity`, `last_activity_desc`, `last_activity_asc` |
+| Span search | 50 spans, newest start first | `start_desc`, `start_asc` |
+| Single trace | All rows, raw start ascending | Fixed order |
+| Tool stats | All tool groups, largest span count first | Fixed order |
 
-All tools are read-only. Because the MCP call is itself a tool use, it shows up as
-its own span - the system traces itself.
+Trace-list and span-search limits cap at 1,000. Missing or non-positive limits
+use the default. There is no cursor or offset pagination. Equal ordering keys do
+not have a defined tie-breaker.
 
-`jq` is evaluated inside the local `gently mcp` process after the collector
-response is fetched and after optional local raw-value resolution. The filter is
-never sent to the Worker. When a filter emits multiple values, MCP returns them
-as a JSON array in the text content.
+Text filters use exact matches. `since` and `until` are inclusive bounds on raw
+`start_unix_nano`, supplied as decimal strings. Keep nanosecond values as strings
+instead of JavaScript numbers. For trace summaries, these filters select span
+rows **before** grouping by trace: counts and bounds then describe only matching
+rows, not necessarily the entire session. `last_activity` is the greatest raw
+end, or start for a row without an end, among those rows; it is not ingestion time.
 
-Trace/session ordering accepts `start_desc`, `start_asc`, `last_activity` (same
-as `last_activity_desc`), and `last_activity_asc`. Span ordering accepts
-`start_desc` and `start_asc`.
+Start filtering and ordering use the stored timestamp text. Use the canonical,
+equal-length decimal timestamps produced by the hooks; values with different
+digit lengths or leading zeros do not have reliable numeric ordering here.
 
-> MCP servers load at session start. After `gently init`, restart the session (or
-> `claude --continue`) and confirm with `/hooks` and `claude mcp get gently`.
+MCP uses string values for `status` and `kind`, such as `"2"` and `"3"`, and
+integer values for `limit`. CLI flags use the equivalent text arguments.
+Unknown ordering values fall back to descending start order in the Worker.
+Unparseable `status` or `kind` filters are ignored, so use numeric codes rather
+than labels such as `error`.
+
+## Read attributes from JSON
+
+CLI and MCP span rows include names, IDs, status, times, tool metadata, and two
+JSON-encoded strings: `attrs_json` and `resource_json`. Decode these strings as
+JSON arrays to inspect OTLP key/value attributes. A null field means no array was
+provided. For example, a decoded attribute can look like:
+
+```json
+{"key":"gently.event","value":{"stringValue":"PreToolUse"}}
+```
+
+`gently trace --json` includes effective bounds derived by the collector. Span
+searches do not derive them, so the CLI/MCP fields are null on those rows. The
+[Worker reference](../reference/worker.md#query-response-fields) describes the
+wire rows and how they differ from the typed CLI/MCP results.
+
+## Waterfall
+
+```sh
+gently trace TRACE_ID --waterfall
+gently trace TRACE_ID --json > trace.json
+gently waterfall < trace.json
+```
+
+The saved-file renderer is native to the Rust binary and does not load local
+configuration. The chart uses effective bounds when present, raw bounds as a
+fallback, and raw start times to order roots and siblings. Unicode labels stay
+aligned; clipped labels end in an ellipsis. The legend identifies `✓` OK, `·`
+unset, `✗` error, and `?` unknown.
+
+The report checks roots, parent links, negative raw durations, and nesting with
+2 ms of slack. A provisional or unclosed parent has no enforced upper bound.
+These checks are diagnostics, not a completeness test for capture. Failed
+checks do not make the command fail; invalid JSON or timestamps, an empty array,
+duplicate span IDs, and parent cycles do.
+
+## Register MCP with an agent
+
+```sh
+gently init --claude
+# Or:
+gently init --codex
+```
+
+Restart the agent to load its registration. Claude Code registration can be
+checked with `claude mcp get gently`. Codex hooks also need to be trusted through
+`/hooks` inside Codex.
+
+The MCP server uses stdio and read-only tools. Its process must have collector
+credentials when it starts. Authenticated desktop MCP access and Claude
+Chat/Cowork integration remain partial; hook capture and a token-bearing watcher
+do not by themselves complete desktop query setup.
+
+| Tool | Arguments | Result |
+| --- | --- | --- |
+| `list_traces` | `limit?`, `harness?`, `session_id?`, `since?`, `until?`, `order?`, `jq?` | Trace summaries |
+| `sessions` | Same as `list_traces` | Alias for `list_traces` |
+| `get_trace` | `trace_id`, `jq?` | All rows for one trace |
+| `search_spans` | `trace_id?`, `session_id?`, `harness?`, `tool_name?`, `name?`, `status?`, `kind?`, `since?`, `until?`, `limit?`, `order?`, `jq?` | Matching span rows |
+| `trace_stats` | `jq?` | Per-tool counts, errors, and mean duration |
+| `response_fields` | `tool?`, `jq?` | Common response fields and filter examples |
+| `span_attr_keys` | Same filters as `search_spans`, plus `jq?` | `span_attrs`, `resource_attrs`, and `spans_scanned` |
+
+`response_fields` does not fetch collector data, although server startup still
+requires credentials. `span_attr_keys` inspects only the returned search window;
+it is not an inventory of every attribute ever captured. When the harness emits
+tool hooks for MCP calls, a Gently query can itself appear as a tool span.
+
+### Example tool calls
+
+These JSON objects are the `params` of MCP `tools/call` requests. First select
+recent sessions and keep only the fields needed to choose a trace:
+
+```json
+{
+  "name": "list_traces",
+  "arguments": {
+    "harness": "codex",
+    "limit": 5,
+    "order": "last_activity",
+    "jq": "map({trace_id, session_id, last_activity})"
+  }
+}
+```
+
+Then inspect failed tool spans in the selected trace:
+
+```json
+{
+  "name": "search_spans",
+  "arguments": {
+    "trace_id": "TRACE_ID",
+    "status": "2",
+    "kind": "3",
+    "limit": 100,
+    "order": "start_asc",
+    "jq": "map({name, tool_name, start_unix_nano})"
+  }
+}
+```
+
+Use `response_fields` with `{"tool":"get_trace"}` to discover common row fields,
+or `span_attr_keys` with `{"trace_id":"TRACE_ID","limit":1000}` to inspect
+available attribute names.
+
+### Local `jq` filters
+
+The `jq` argument is evaluated by the embedded Rust `jaq` implementation after
+the response is fetched and after optional local raw-value resolution. It is
+never sent to the Worker and does not reduce the collector query's row limit.
+It needs no installed `jq` executable and is not a shell command. Environment
+access through `env` is unavailable; full compatibility with every standalone
+`jq` feature is not promised.
+
+No filter or a blank filter returns the payload unchanged. Zero emitted values
+become `[]`; one becomes that JSON value; multiple become a JSON array. MCP wraps
+the resulting JSON as pretty-printed text in a `content` block. Filter parse,
+compile, or execution errors return a tool-call error.
+
+## Raw values
+
+Normal Gently exports use content digests and byte lengths, while still exposing
+metadata such as paths and host information. Raw capture is disabled by default.
+Selected raw values can be stored locally by enabling `capture_raw_values = true`
+or `GENTLY_CAPTURE_RAW_VALUES=1` on the hook process. This storage is plaintext
+and has no automatic retention limit.
+
+Resolution is a separate opt-in. Set `GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES=1` on
+a CLI query process, or install MCP with `--resolve-local-raw-values`, to add
+matching locally stored values to returned span attributes. It does not fetch
+raw content from the Worker, enable capture, or reconstruct values absent from
+the local store. Resolution matches truncated digest keys; it is not proof of
+content identity.
+
+Reinstalling without the flag removes the MCP registration's resolution opt-in.
+Disabling capture does not delete values already stored. Resolved MCP output may
+enter the calling agent's model-provider context. Read
+[security and privacy](../concepts/security-and-privacy.md) before opting in.

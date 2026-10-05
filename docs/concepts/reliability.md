@@ -1,71 +1,98 @@
 # Reliability
 
-The durable SQLite outbox is the source of truth for unsent spans. Hooks are
-short-lived local writers; exports run in disposable workers or an explicitly
-started polling watcher.
+Gently queues emitted records in a local SQLite outbox and retries delivery
+separately from the hook. This can preserve records through a collector outage
+or exporter restart. It does not guarantee that every harness event is observed,
+queued or eventually delivered.
 
-## What triggers export
+## Starting a drain
 
-Each event queues one OTLP envelope containing all spans it emitted. With a
-collector token available, a hook starts detached `gently export`:
+A hook with a collector URL and token may start a detached one-shot exporter.
+Terminal events request a final drain; other events skip startup when an
+exporter lock is already held. Tokenless hooks only queue records and never
+request interactive credential unlock.
 
-* Terminal events (`Stop`, Claude `StopFailure`, Codex `Interrupt`, and
-  `SessionEnd`) request a final flush.
-* Other events skip spawning when the exporter singleton lock is already held.
+A one-shot exporter drains until the queue is empty or a failure stops the run.
+It exits if another exporter already holds the file lock. A watcher retains the
+lock and polls for new rows:
 
-Without a token, hooks queue without spawning an exporter. They never attempt
-interactive hardware unlock. `gently export --watch --interval-secs 2` polls the
-queue independently, so desktop hooks can be drained by a process whose token
-was unlocked once in a foreground terminal. Stop it with Ctrl+C; the local
-collector launcher starts this watcher alongside the Worker.
+```sh
+gently export --watch --interval-secs 2
+```
 
-A `flock` lock prevents concurrent drains. A one-shot export drains until empty;
-a watcher keeps polling for new rows. Queues from older versions containing
-single-span rows remain compatible with multi-span event envelopes.
+The watcher needs a token in its own configuration or inherited environment.
+Gently does not unlock a secret store itself. The optional
+[local launchers](../getting-started/local-collector.md) arrange that through a
+separately installed helper. A watcher's token does not authenticate other CLI or MCP
+processes, and the watcher is not installed as a login service.
 
-## Failure handling
+Stopping a watcher with Ctrl+C ends that drain loop. Start it again after a
+restart. Without a watcher, a later token-bearing hook or manual export is
+needed to flush an idle queue.
 
-* Authentication (`401`/`403`) stops immediately. The queue stays intact: no
-  retries with the same token, HTTP fallback, or quarantine. Correct the token
-  and restart export or the watcher.
-* Network failures, timeouts, 5xx and non-payload endpoint errors such as
-  `404`/`405`/`409`/`408`/`429` use exponential backoff. Failed rows remain queued
-  for a later drain.
-* Unprocessable requests (`400`/`413`/`422`) are bisected by outbox row. Rejected
-  envelopes move to quarantine so other rows can be delivered. A quarantined
-  event envelope can contain several spans; those spans are retained together,
-  including valid sibling spans. Malformed queued JSON is quarantined with a
-  safe reason.
+## Delivery failures
 
-Aggregate export batches split at 4 MiB; a larger single envelope is sent alone
-for the collector to accept or reject. The outbox capacity counts envelopes. A prolonged outage beyond the configured
-cap drops the oldest queued rows; status and diagnostics make failures visible.
+| Failure | Export behavior | Next step |
+| --- | --- | --- |
+| Authentication, `401` or `403` | Stop the run without retrying, falling back or quarantining the rejected send. Pending rows remain, subject to the capacity trimming below. | Correct the token and restart export or the watcher. |
+| Network error, timeout, 5xx or other endpoint rejection such as `404`, `405`, `408`, `409` or `429` | Back off; undelivered rows remain queued. | Check the endpoint and connectivity, then retry. |
+| Payload rejection, `400`, `413` or `422` | Split batches to isolate rejected envelopes and retain them in quarantine. | Inspect the rejected envelope and collector limits. |
+| Malformed queued JSON | Move that envelope to quarantine with a fixed diagnostic reason. | Inspect local storage and the producing version. |
 
-## Idempotent, order-independent ingest
+One-shot export makes up to three attempts for retryable failures. A watcher
+continues retrying with backoff, capped at 30 seconds. Authentication errors
+stop either mode; later hooks may start a new exporter with the same still
+invalid token, so repeated failures require fixing configuration.
 
-A deterministic span ID is reported provisionally on open and again on close.
-Session resumes preserve the earliest local open-session start. The collector
-merges reports monotonically: earliest start, latest end, and the most-finalized
-content. Replays and out-of-order delivery therefore converge without replacing
-a finalized span with an older provisional report.
+Batch aggregation is limited to 4 MiB. A larger single envelope is sent alone.
+An event envelope can contain several spans: quarantine operates on the whole
+envelope, so valid siblings can remain with a rejected span. Quarantine retains
+the bytes; moving a row there does not mean it reached the collector.
 
-## Durability and crash behavior
+## Capacity and retention
 
-* Outbox rows remain in WAL storage until a successful acknowledgement.
-* A killed exporter leaves unacknowledged rows available for another drain.
-* Session, turn and subagent spans are emitted provisionally, so an omitted close
-  still anchors the tree. Current Codex includes `SessionEnd` and `Interrupt`;
-  crashes or older harnesses can still omit lifecycle hooks. A one-day TTL reaper
-  drops stale local open-span bookkeeping; it does not remove emitted spans.
-* WAL and `busy_timeout` support concurrent tools and sessions. Prompt/turn IDs
-  and execution-agent context keep their spans correctly associated.
+`outbox_cap` defaults to 10,000 envelope rows. At the start of each drain, rows
+beyond that cap are trimmed oldest first. Enqueueing does not enforce the cap,
+so a tokenless or idle queue can grow beyond it until a drain starts. The cap
+counts envelopes, not spans or bytes, and is not a bound on total database size.
 
-## Observability
+Capacity trimming happens before a request, including one that later fails
+authentication. Trimmed rows are lost. Raw-value storage, quarantine and
+collector traces have no automatic retention policy.
 
-`gently status` reports pending outbox rows, quarantine count, consecutive
-failures, export/success timestamps and the latest error. `export.log` and
-`hook.log` rotate at 5 MB. A polling watcher uses the same health reporting.
+## Replays and lifecycle gaps
 
-A one-shot exporter pays process and connection startup on each run. An idle
-queue needs a later token-bearing hook, manual export or watcher to flush it.
-The watcher requires an explicit start and does not act as a login service.
+Acknowledged envelopes are removed from the outbox. If the exporter stops
+after the collector accepted a request but before local deletion, it may send
+those reports again. The collector merges repeated span IDs rather than
+creating duplicate rows.
+
+Merging keeps the earliest reported start and the latest reported endpoint.
+Status, attributes and parent metadata come from the report with the latest
+ending timestamp; equal timestamps favor the newly received report. Conflicting
+metadata with tied timestamps can therefore depend on delivery order.
+
+SQLite WAL and a busy timeout support concurrent hook writers. Hooks contain
+ordinary errors and caught panics, so exit status alone cannot establish that a
+record was stored. Process termination, storage faults, missing hook events and
+capacity trimming can still cause incomplete traces.
+
+Session, turn and subagent opens emit provisional reports; tools emit on close.
+Missing closes leave provisional records or omit tools. During later hook
+processing, local open-span bookkeeping with a start more than 24 hours old is
+reaped. This does not remove emitted collector records, but a very long-lived
+span can lose the local timing state needed for a later close.
+
+## Checking health
+
+`gently status` reads local pending and quarantine counts, failure count,
+export/success timestamps and the latest error. It does not query the collector
+or confirm that a particular trace is complete. Compare it with collector
+queries when verifying delivery.
+
+`hook.log` and `export.log` live in the state directory. On process startup,
+a log larger than 5 MiB is rotated to a single `.1` backup. Rotation is not a
+continuous size limit, so a long-running watcher can exceed that threshold.
+See [Troubleshooting](../guides/troubleshooting.md) for operational
+checks, and [Security and privacy](security-and-privacy.md) before sharing logs
+or local state.

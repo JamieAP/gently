@@ -1,43 +1,77 @@
 # Contributing
 
-Focused bug reports and small pull requests are welcome. Describe the behaviour
-you want to change and include a reproducible example where possible.
+Small, focused changes and reproducible bug reports are welcome. Describe the
+problem, the intended behavior and how to verify the change.
 
-## Development setup
+## Repository layout
 
-From the repository root:
+| Path | Purpose |
+| --- | --- |
+| `crates/gently-cli` | CLI commands, installation, queries, MCP and waterfall rendering. |
+| `crates/gently-harness` | Claude Code and Codex hook adapters. |
+| `crates/gently-core` | Span/envelope types and identifiers. |
+| `crates/gently-store` | Local SQLite state, outbox, raw values and file permissions. |
+| `crates/gently-export` | Export transports, delivery and retry behavior. |
+| `worker` | Cloudflare Worker, D1 schema and query API. |
+| `scripts` | Local collector/export launchers and their tests. |
+| `docs` | Setup, concepts, guides and reference. |
+
+See [Architecture](docs/concepts/architecture.md) for how these parts fit together.
+
+## Check a change
+
+From the repository root, run the Rust checks:
 
 ```sh
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo fmt --all -- --check
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
 ```
 
-For the collector:
+For Worker changes:
 
 ```sh
 cd worker
 npm ci
 npm test
+cd ..
 ```
 
-The Rust workspace is in `crates/`, the collector in `worker/`, and rendering
-helpers in `scripts/`. See the [architecture guide](docs/concepts/architecture.md)
-for the capture, storage, export, and query paths.
+For local launcher changes:
 
-Test behaviour changes in the affected component. For documentation changes,
-check the commands and links. Keep configuration examples consistent with the
-CLI and collector.
+```sh
+python3 -m unittest discover -s scripts -p 'test_*.py'
+```
 
-## Bug reports
+Add regression coverage for behavior changes in the affected component. Use
+synthetic hook payloads and a local test collector rather than real session
+content or credentials. Documentation-only changes need accurate commands,
+examples and links; keep them consistent with CLI help and the shipped source.
 
-Include the Gently version, agent and version, operating system, reproduction
-steps, expected behaviour, and observed behaviour. Synthetic hook payloads are
-useful for reproducing adapter problems.
+## Report a bug
 
-Session records and debug captures can contain private content. Review anything
-you attach to an issue, and use invented values for credentials, local paths,
-prompts, and tool output. See [data and privacy](README.md#data-and-privacy).
+Include:
+
+- Gently version, operating system, and agent name/version.
+- Minimal reproduction steps or an invented payload.
+- Expected and observed behavior.
+- Relevant error text with credentials and identifying details removed.
+
+The [troubleshooting guide](docs/guides/troubleshooting.md) helps distinguish
+capture, export and query problems. Do not attach a state database or unreviewed
+debug capture: they can contain private content and local paths. Use invented
+values for tokens, session IDs, prompts and tool output.
+See [Security and privacy](docs/concepts/security-and-privacy.md).
+
+## Keep the scope clear
+
+Keep unrelated formatting, dependency and runtime changes separate. If a hook
+mapping changes, update its fixture and [reference](docs/reference/hooks.md).
+If a CLI or query interface changes, update help, examples and the relevant
+reference. Preserve digest-only defaults and separate raw-capture/resolution
+opt-ins.
 
 ## License
 
-Gently is licensed under [MIT](LICENSE).
+Gently is licensed under [MIT](LICENSE). Dependencies retain their own licenses
+and notices.

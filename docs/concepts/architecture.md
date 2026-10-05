@@ -1,60 +1,75 @@
 # Architecture
 
-gently is a four-stage pipeline plus a query path. The two SQLite databases are
-not alternatives - they're different jobs.
+Gently separates local capture from delivery and querying. Hooks write locally;
+an exporter sends queued records to the collector; CLI and MCP queries read the
+collector's stored traces.
 
-```
-  Claude Code / Codex ──hook JSON──► gently hook
-                                     │ 1. parse event
-                                     │ 2. update local state.db (WAL)
-                                     │ 3. enqueue one event envelope → outbox
-                                     │ 4. spawn exporter if token is available
-                                     │ 5. exit 0, empty stdout
-                                     ▼
-                              ~/.gently/state.db (outbox + open spans + counters)
-                                     │
-       gently export [--watch] ◄─────┘  (flock singleton; drains outbox)
-                   │ OTLP/JSON, prefer HTTP/3 (QUIC), HTTP/2 fallback, bearer auth
-                   ▼
-        gently-collector Worker ──► D1 (spans table)
-                   ▲                      │
-   gently traces/trace/spans/stats/status, gently mcp ── GET /v1/query ──┘
+```text
+Claude Code / Codex hooks
+           |
+       gently hook
+           |
+   local SQLite state.db <--- gently status
+           |
+   gently export [--watch]
+           | OTLP/JSON + bearer token
+           v
+      Worker -> D1
+           ^
+           | collector query API
+    query commands / MCP
 ```
 
 ## Components
 
-| Stage | What it does |
-|---|---|
-| **hook** (`gently hook`) | The harness invokes this on every event. Local: parse → write one event envelope → optionally spawn exporter → exit. No network or secret unlock on the hook path. |
-| **outbox** (`state.db`) | A local SQLite WAL database: the durable staging buffer plus in-flight open spans and per-session counters. |
-| **exporter** (`gently export`) | Drains the outbox over QUIC/HTTP; one-shot by default, or polls with `--watch`. |
-| **collector** (Worker + D1) | Receives OTLP/JSON, persists spans to D1 (idempotent), and serves queries. |
-| **query** (CLI + MCP) | Reads the collector's `/v1/query` surface. |
+| Component | Responsibility |
+| --- | --- |
+| `gently hook` | Parse one hook payload, update span bookkeeping and queue the emitted spans. |
+| Local `state.db` | Hold unsent envelopes, open spans, turn counters, quarantine and optional raw values. |
+| `gently export` | Drain the outbox once, or keep polling with `--watch`. A file lock allows one exporter at a time. |
+| Worker and D1 | Accept OTLP/JSON reports, merge repeated span IDs and store traces. The Worker also serves queries. |
+| CLI and MCP | Query the collector. `gently status` reads local exporter health; `gently waterfall` renders supplied JSON offline. |
 
-## The hot path
+The default local database is `~/.gently/state.db`. The collector uses D1 in
+both local Wrangler development and Cloudflare deployments. These databases
+have different roles; the local database is not a second trace-history server.
 
-`gently hook` runs on *every* tool call, so it must be invisible:
+## From hook to collector
 
-* Queues all spans emitted by one event in a single SQLite outbox row.
-* Builds **no** network client and opens **no** connection.
-* When a token is available, spawns the exporter detached (new process group,
-  stdio to `/dev/null`) and returns immediately. Tokenless hooks only queue.
-* **Never writes stdout** (the harness parses hook stdout as control output) and
-  **always exits 0** - a panic is caught and logged, never surfaced.
+1. A configured harness starts `gently hook` with an event's JSON on stdin.
+2. The adapter extracts identifiers, metadata and content digests. The applier
+   updates local open-span records and counters.
+3. Emitted spans are queued together in one OTLP envelope. An event can emit
+   more than one span, such as an inferred turn and a completed tool.
+4. If both collector URL and token are available, the hook may start a detached
+   exporter. Otherwise the envelope remains queued for a watcher or later drain.
 
-Network and retry costs live in the exporter. Hardware-bound token unlock
-requires a foreground terminal; an already-unlocked watcher can export for
-desktop hooks that lack a token.
+The hook process does not make collector requests or unlock credentials. Its
+errors and caught panics are contained, and it writes no normal stdout. A
+successful hook exit does not prove that capture or export succeeded: parsing,
+local storage, process startup or delivery can fail. See
+[Reliability](reliability.md) for those boundaries and health checks.
 
-## Two databases, two jobs
+Export runs separately. Remote delivery can prefer HTTP/3 with a TCP fallback;
+local HTTP uses the TCP path. Query commands use the Worker's query API rather
+than a general OpenTelemetry backend interface.
 
-* **Local SQLite (`state.db`)** - write-side staging only. Spans land here first,
-  then ship to the collector and are **deleted** from the outbox on success. It
-  is never queried for trace history.
-* **Cloudflare D1** - the durable store of record *and* the only query source.
+## Storage and query boundaries
 
-Raw-value capture is disabled by default and separately configurable from query
-resolution; see [Security & privacy](security-and-privacy.md).
+Successful delivery removes acknowledged outbox envelopes. It does not remove
+local raw values, quarantine, logs or other bookkeeping. Collector queries read
+D1, so queued spans do not appear in trace history until delivered.
 
-See [Reliability](reliability.md) for queue and watcher behavior, and
-[Trace model](trace-model.md) for span structure.
+Raw capture and local query resolution are separate opt-ins. Resolution can
+look up retained raw values in local SQLite and enrich a collector result; it
+does not make SQLite a trace-history query source. Read
+[Security and privacy](security-and-privacy.md) before enabling either option.
+
+A token-bearing watcher can deliver records queued by tokenless desktop hooks.
+Its token belongs to that process; starting it does not authenticate separate
+CLI or MCP query processes. The optional local launchers invoke a separately
+installed secret helper, as described in
+[Local collector setup](../getting-started/local-collector.md).
+
+For span lifecycles, see [Trace model](trace-model.md). For endpoint and storage
+details, see [Collector reference](../reference/worker.md).

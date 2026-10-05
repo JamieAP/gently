@@ -1,37 +1,88 @@
 # Harness hooks
 
-Adapters are checked against Claude Code 2.1.285 and Codex CLI 0.160.0 using
-synthetic payloads from the [Claude hook reference](https://code.claude.com/docs/en/hooks)
-and [Codex hook contract](https://learn.chatgpt.com/docs/hooks).
-Run `gently init` again after upgrading to register newly supported events.
+This table describes the adapters and default registrations shipped in this
+checkout. Synthetic fixtures exercise selected payloads and lifecycle cases;
+they do not establish compatibility with every release or desktop integration.
+Check your installed harness's hook schema when upgrading.
 
-| Mapping | Claude Code | Codex |
-|---|---|---|
+The [Claude hook reference](https://code.claude.com/docs/en/hooks) and
+[Codex hook documentation](https://learn.chatgpt.com/docs/hooks) describe their
+respective products. Re-run `gently init --claude` or `gently init --codex` after
+updating Gently to register newly supported events, then restart the agent.
+Codex registrations also require the agent's hook trust step.
+
+## Installed mappings
+
+| Action | Claude Code | Codex |
+| --- | --- | --- |
 | Session open/close | `SessionStart` / `SessionEnd` | `SessionStart` / `SessionEnd` |
 | Turn open/close | `UserPromptSubmit` / `Stop` | `UserPromptSubmit` / `Stop` |
-| Failed/interrupted turn | `StopFailure` → error | `Interrupt` → unset, interrupted |
-| Tool open/close | `PreToolUse` / `PostToolUse`; `PostToolUseFailure` → error | `PreToolUse` / `PostToolUse` |
-| Agent open/close | `SubagentStart` / `SubagentStop` | `SubagentStart` / `SubagentStop` |
+| Failed or interrupted turn | `StopFailure` closes with error status. | `Interrupt` closes with unset status and an interruption attribute. |
+| Tool open/close | `PreToolUse` / `PostToolUse`; `PostToolUseFailure` closes with error status. | `PreToolUse` / `PostToolUse` |
+| Subagent open/close | `SubagentStart` / `SubagentStop` | `SubagentStart` / `SubagentStop` |
 | Compaction markers | `PreCompact`, `PostCompact` | `PreCompact`, `PostCompact` |
-| Other installed markers | `PermissionRequest`, `PostToolBatch`, `PostModelSwitch` | `PermissionRequest` |
+| Other markers | `PermissionRequest`, `PostToolBatch`, `PostModelSwitch` | `PermissionRequest` |
 
-Unknown events become markers when wired to Gently. Only `session_id` and
-`hook_event_name` are required. Missing lifecycle agent IDs become markers.
-Claude `prompt_id` and Codex `turn_id` correlate turns; legacy Claude falls back
-to counters. Ordinary subagent hooks use execution `agent_id`; lifecycle hooks
-identify their child subject instead. Both stay within the root session trace.
-Resumes preserve the earliest session start.
+A marker is an instant span attached to the current or inferred turn. Unknown
+events become markers only if they are explicitly wired to Gently; init does
+not register every possible harness event. Claude `PreModelSwitch`, for example,
+is parsed as a marker when wired, but is not installed by default.
 
-A lifecycle event's optional parent `tool_use_id` links to a matching open tool
-in the root or a subagent scope when that match is unique. This preserves nested
-agents' actual parent tool. Without that reference, the event cannot identify
-its caller's execution context and falls back to a root turn; missing or
-ambiguous tool references retain the root-tool fallback. Deep nesting cannot
-always be reconstructed from incomplete lifecycle payloads.
+Both adapters require string `session_id` and `hook_event_name` fields. Other
+missing fields may degrade correlation rather than reject the event. Malformed
+JSON or missing required fields cannot produce a normal span record; the hook
+contains processing errors, so its exit code is not a capture check.
 
-Claude batch events create one marker rather than duplicate individual tool
-closes. Content-bearing error/compaction/batch values are hashed. API failures
-retain safe error categories; tool diagnostics never become raw status text.
-Codex shell output has no universal success flag, so opaque tools remain unset;
-typed MCP `content` plus `isError` permits explicit status. This avoids guessing
-success from arbitrary output.
+## Turns and subagent execution
+
+Claude `prompt_id` and Codex `turn_id` identify turns when present. Without them,
+Gently uses local counters, which cannot reconstruct unseen prompt boundaries.
+A first reference to an unseen prompt/turn ID can emit a `TurnInferred` parent;
+see [Trace model](../concepts/trace-model.md#inferred-turns-and-resumes).
+
+For ordinary Claude events, a nonempty `agent_id` identifies the executing
+subagent. The Codex adapter applies that context to prompt, tool, permission,
+stop and compaction events. Both keep subagent work within the root session's
+trace. Lifecycle events use `agent_id` differently: it identifies the child
+being opened or closed. A missing or empty lifecycle agent ID produces a marker
+rather than an invented subagent span.
+
+### Subagent parentage
+
+On `SubagentStart`, parent selection depends on the payload and local state:
+
+- A supplied `tool_use_id` links to that open tool when exactly one match exists
+  across the root session's main and subagent scopes.
+- A missing or ambiguous match falls back to a tool ID in the root scope. That
+  parent can be absent from the collected trace.
+- Without `tool_use_id`, the subagent attaches to a root turn, inferred from a
+  supplied prompt/turn ID when needed.
+
+A matching local open record supplies parentage on close. If that record is
+missing, the close falls back to turn parentage. These fallbacks preserve a
+record but cannot always recover nested caller context from incomplete payloads.
+
+## Status and content handling
+
+Claude `PostToolUse` maps to success; `PostToolUseFailure` maps to error. Codex
+opaque tool results remain unset. A Codex tool named with the `mcp__` prefix and
+a structured result containing a `content` array is treated as an MCP result:
+boolean `isError: true` means error; false or absent means success. Malformed
+`isError` values remain unset. Arbitrary shell output is not interpreted as a
+success or failure signal.
+
+Claude batch events create one marker instead of repeating individual tool
+closes. Content-bearing tool diagnostics, API failure details, compaction and
+batch values are hashed. Recognized error categories and selected lifecycle
+metadata may remain readable; freeform details are not raw status text.
+
+Capture, debug payload files and local query resolution are independent of
+these adapter mappings. Read [Security and privacy](../concepts/security-and-privacy.md)
+before enabling raw content options.
+
+## Implementation references
+
+- [Claude adapter and fixtures](https://github.com/JamieAP/gently/blob/main/crates/gently-harness/src/claude.rs)
+- [Codex adapter and fixtures](https://github.com/JamieAP/gently/blob/main/crates/gently-harness/src/codex.rs)
+- [Stateful span application](https://github.com/JamieAP/gently/blob/main/crates/gently-harness/src/apply.rs)
+- [Default hook registration](https://github.com/JamieAP/gently/blob/main/crates/gently-cli/src/cmd_init.rs)
