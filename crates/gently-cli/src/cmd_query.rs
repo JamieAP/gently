@@ -2,7 +2,7 @@
 
 use crate::config::Config;
 use crate::query_client::{QueryClient, SpanFilters, SpanRow, TraceFilters};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use comfy_table::{Cell, Table};
 use std::collections::HashMap;
 
@@ -11,6 +11,13 @@ use std::collections::HashMap;
 pub enum Format {
     Table,
     Json,
+}
+
+#[derive(Clone, Copy)]
+pub enum TraceFormat {
+    Tree,
+    Json,
+    Waterfall,
 }
 
 impl Format {
@@ -61,16 +68,23 @@ pub fn traces(filters: TraceFilters, fmt: Format) -> Result<()> {
     Ok(())
 }
 
-pub fn trace(trace_id: String, fmt: Format) -> Result<()> {
+pub fn trace(trace_id: String, fmt: TraceFormat) -> Result<()> {
     let cfg = Config::load()?;
     let client = QueryClient::new(&cfg)?;
     let rows = runtime()?.block_on(client.trace(&trace_id))?;
 
-    if let Format::Json = fmt {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
-        return Ok(());
+    match fmt {
+        TraceFormat::Json => println!("{}", serde_json::to_string_pretty(&rows)?),
+        TraceFormat::Tree => print_tree(&rows),
+        TraceFormat::Waterfall => print!("{}", crate::waterfall::render(&rows)?),
     }
-    print_tree(&rows);
+    Ok(())
+}
+
+pub fn waterfall() -> Result<()> {
+    let rows: Vec<SpanRow> =
+        serde_json::from_reader(std::io::stdin().lock()).context("read span array from stdin")?;
+    print!("{}", crate::waterfall::render(&rows)?);
     Ok(())
 }
 

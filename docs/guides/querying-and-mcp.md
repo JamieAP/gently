@@ -7,7 +7,7 @@ server are two front-ends onto it.
 
 ```bash
 gently traces [--limit N] [--harness claude-code] [--session-id ..] [--since <nanos>] [--until <nanos>] [--order start_desc|start_asc|last_activity] [--json]
-gently trace <trace_id> [--json]          # span tree (indented) or raw spans
+gently trace <trace_id> [--json | --waterfall] # span tree, raw spans, or waterfall
 gently spans [--trace-id ..] [--session-id ..] [--harness ..] [--tool-name ..] [--name ..] [--status 0|1|2] [--kind ..] [--since <nanos>] [--until <nanos>] [--limit N] [--order start_desc|start_asc] [--json]
 gently stats [--json]                     # per-tool counts, errors, avg duration
 gently status                             # local exporter health + queue depth
@@ -27,13 +27,28 @@ Sharing resolved output with an agent can send that content to its provider.
 
 ### Waterfall
 
-`scripts/waterfall.py` reads `gently trace --json` and renders a depth-indented,
-time-proportional waterfall plus integrity checks (root present, parent links
-resolved, no negative durations, child-within-parent nesting):
+`gently trace --waterfall` renders a depth-indented, time-proportional timeline
+plus integrity checks: session-root presence, resolved parent links, no negative
+durations, and child-within-parent nesting. It uses collector-derived effective
+bounds when available, with raw span bounds as a fallback:
 
 ```bash
-gently trace <trace_id> --json | python3 scripts/waterfall.py
+gently trace <trace_id> --waterfall
 ```
+
+Labels stay aligned for Unicode names; clipped names end in an ellipsis. The
+status legend distinguishes successful, failed, unset, and unknown statuses.
+
+To render saved or piped spans without connecting to the collector:
+
+```sh
+gently waterfall < trace.json
+gently trace <trace_id> --json | gently waterfall
+```
+
+The renderer is part of the Rust binary and does not require Python. Integrity
+results are diagnostic; an incomplete capture can fail checks. Empty or
+malformed input, duplicate span IDs, and parent cycles return an error.
 
 ## From the agent (MCP)
 

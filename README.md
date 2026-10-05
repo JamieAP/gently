@@ -33,7 +33,7 @@ D1; the Rust CLI exports OTLP/JSON to it.
 
 ## A session at a glance
 
-A synthetic session rendered by `scripts/waterfall.py`:
+A synthetic session rendered by `gently trace --waterfall`:
 
 ```text
       dur st  span                      │timeline →                                              │
@@ -41,9 +41,11 @@ A synthetic session rendered by `scripts/waterfall.py`:
   1000.0ms ✓  session                   │████████████████████████████████████████████████████████│
    900.0ms ✓    turn:1                  │   ██████████████████████████████████████████████████   │
     20.0ms ✓      Read                  │    █                                                   │
-   200.0ms ✓      Bash                  │        ███████████                                     │
+   200.0ms ✗      Bash                  │      ███████████                                       │
    450.0ms ✓      agent:1               │                      █████████████████████████         │
-   300.0ms ✓        Bash                │                         █████████████████              │
+   300.0ms ·        Bash                │                         █████████████████              │
+
+Status: ✓ ok · unset ✗ error ? unknown
 ```
 
 ## Current support
@@ -126,11 +128,14 @@ gently status
 Replace `<trace_id>` with an ID from `gently traces`. Trace queries read from the
 collector; `gently status` reports local queue and exporter health.
 
-To render a trace timeline from the checkout:
+To render a trace timeline with integrity checks:
 
 ```sh
-gently trace <trace_id> --json | python3 scripts/waterfall.py
+gently trace <trace_id> --waterfall
 ```
+
+For saved or piped span JSON, use `gently waterfall < trace.json`. Neither
+waterfall command requires Python.
 
 ## MCP
 
@@ -205,7 +210,7 @@ Claude Code / Codex hooks -> local SQLite outbox -> Worker -> D1
 
 ## Development
 
-The Rust workspace is in `crates/`, the collector in `worker/`, and trace-rendering
+The Rust workspace is in `crates/`, the collector in `worker/`, and local collector
 helpers in `scripts/`.
 
 ```sh

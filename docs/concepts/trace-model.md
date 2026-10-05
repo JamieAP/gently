@@ -77,7 +77,7 @@ the raw `start` / `end`:
   existing non-provisional end is retained; otherwise, the end uses the observed
   maximum among direct children, falling back to the record's start.
 
-Two aggregates compute these bounds without recursion. `waterfall.py` and other
+Two aggregates compute these bounds without recursion. The CLI waterfall and other
 renderers use them for width and nesting while retaining raw bounds for checks.
 They do not recursively enclose every descendant and do not prove complete
 capture or actual session, turn or tool completion.

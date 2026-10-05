@@ -63,16 +63,20 @@ gently status                  # local exporter health + queue depth
 Render a waterfall (the example below is synthetic, with millisecond units):
 
 ```bash
-gently trace <trace_id> --json | python3 scripts/waterfall.py
+gently trace <trace_id> --waterfall
 ```
 
-```
-      dur st  span        │timeline →                                              │
- 1000.0ms ✓  session      │████████████████████████████████████████████████████████│
-  900.0ms ✓    turn:1     │  ██████████████████████████████████████████████████████│
-    20.0ms ✓      Bash     │               ██                                       │
-   40.0ms ✓      Bash     │                          ████                          │
-     2.0ms ✓      Bash     │                                              █         │
+```text
+      dur st  span                      │timeline →                                              │
+───────── ─  ──────────────────────────┼────────────────────────────────────────────────────────┤
+  1000.0ms ✓  session                   │████████████████████████████████████████████████████████│
+   900.0ms ✓    turn:1                  │   ██████████████████████████████████████████████████   │
+    20.0ms ✓      Read                  │    █                                                   │
+   200.0ms ✗      Bash                  │      ███████████                                       │
+   450.0ms ✓      agent:1               │                      █████████████████████████         │
+   300.0ms ·        Bash                │                         █████████████████              │
+
+Status: ✓ ok · unset ✗ error ? unknown
 ```
 
 Raw capture and MCP resolution are disabled by default. To deliberately share

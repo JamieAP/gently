@@ -45,8 +45,29 @@ Lists recent traces (one per session), newest first.
 
 ## `gently trace <trace_id>`
 
-Shows one trace. Default renders an indented span tree; `--json` emits the raw
-span array (feed to `scripts/waterfall.py`).
+Shows one trace. The default renders an indented span tree. `--json` emits the
+raw span array; `--waterfall` renders time-proportional bars and a trace integrity
+summary. The two flags are mutually exclusive.
+
+Waterfall labels use terminal display widths and mark clipped names with an
+ellipsis. A compact legend explains the status symbols.
+
+## `gently waterfall`
+
+Reads a JSON span array from stdin, using the `gently trace --json` shape, and
+renders the same waterfall and integrity summary. No collector, token, or
+configuration is needed:
+
+```sh
+gently waterfall < trace.json
+gently trace <trace_id> --json | gently waterfall
+```
+
+The summary checks session-root presence, parent links, negative durations, and
+temporal nesting with 2 ms of clock slack. These are diagnostics rather than a
+guarantee that every event was captured. Failed checks are reported in the
+summary; empty input, malformed timestamps, duplicate span IDs, and parent
+cycles return an error.
 
 ## `gently spans`
 
@@ -83,5 +104,6 @@ and its provider. It does not enable raw capture; that requires
 
 ---
 
-Configuration for all commands comes from `~/.gently/config.toml` + environment -
-see [Configuration](../getting-started/configuration.md).
+Commands that access the collector or local state use `~/.gently/config.toml`
+and environment settings. The stdin-only `waterfall` command does not load
+configuration. See [Configuration](../getting-started/configuration.md).

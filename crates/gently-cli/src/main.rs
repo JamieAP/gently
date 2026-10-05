@@ -12,9 +12,10 @@ mod local_raw;
 mod logging;
 mod mcp_jq;
 mod query_client;
+mod waterfall;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use cmd_query::Format;
+use cmd_query::{Format, TraceFormat};
 use query_client::{SpanFilters, TraceFilters};
 
 /// Which coding harness produced the hook event. Selected explicitly because
@@ -83,12 +84,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Show one trace as a span tree.
+    /// Show one trace as a span tree, JSON, or a timing waterfall.
     Trace {
         trace_id: String,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "waterfall")]
         json: bool,
+        /// Render a timing waterfall and trace integrity checks.
+        #[arg(long)]
+        waterfall: bool,
     },
+    /// Render a JSON span array from stdin as a waterfall. No collector needed.
+    Waterfall,
     /// Search spans.
     Spans {
         #[arg(long)]
@@ -192,9 +198,21 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
             },
             Format::from_json_flag(json),
         ),
-        Command::Trace { trace_id, json } => {
-            cmd_query::trace(trace_id, Format::from_json_flag(json))
-        }
+        Command::Trace {
+            trace_id,
+            json,
+            waterfall,
+        } => cmd_query::trace(
+            trace_id,
+            if waterfall {
+                TraceFormat::Waterfall
+            } else if json {
+                TraceFormat::Json
+            } else {
+                TraceFormat::Tree
+            },
+        ),
+        Command::Waterfall => cmd_query::waterfall(),
         Command::Spans {
             trace_id,
             session_id,
