@@ -5,8 +5,9 @@ node_modules
 .wrangler
 *.log
 
-# honkit/gitbook build output
+# Generated documentation
 docs/_book/
+/_site/
 
 .dev.vars.*
 .env

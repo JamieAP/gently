@@ -1,0 +1,11 @@
+{
+  "name": "gently-docs",
+  "private": true,
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test test_build.mjs"
+  },
+  "devDependencies": {
+    "markdown-it": "15.0.2"
+  }
+}
