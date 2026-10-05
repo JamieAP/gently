@@ -19,8 +19,25 @@ pub fn apply(
     parsed: &Parsed,
     now_nanos: u64,
 ) -> Result<Vec<Span>, gently_store::StoreError> {
-    let session = &parsed.session_id;
-    let trace_id = TraceId::from_session(session);
+    let root = &parsed.session_id;
+    // Scope counters and keyed tools to the execution agent while retaining the
+    // harness session's trace ID. Length-prefixing avoids ambiguous scopes.
+    let scope = parsed
+        .agent_id
+        .as_ref()
+        .map(|id| format!("{}:{root}:agent:{}:{id}", root.len(), id.len()));
+    let session = scope.as_deref().unwrap_or(root);
+    let trace_id = TraceId::from_session(root);
+    let context_parent = parsed
+        .agent_id
+        .as_ref()
+        .map(|id| SpanId::derive(root, &format!("agent:{id}")))
+        .unwrap_or_else(|| SpanId::derive(root, "session"));
+    let session_key = parsed
+        .agent_id
+        .as_ref()
+        .map(|id| format!("agent:{id}"))
+        .unwrap_or_else(|| "session".into());
     let mut emitted = Vec::new();
 
     for op in &parsed.ops {
@@ -28,11 +45,14 @@ pub fn apply(
             SpanOp::OpenSession { attrs } => {
                 emitted.push(open_provisional(
                     store,
-                    session,
+                    root,
                     trace_id,
-                    "session",
-                    None,
-                    "session",
+                    &session_key,
+                    parsed
+                        .agent_id
+                        .as_ref()
+                        .map(|_| SpanId::derive(root, "session")),
+                    &session_key,
                     SpanKind::Internal,
                     now_nanos,
                     attrs,
@@ -41,10 +61,10 @@ pub fn apply(
             SpanOp::CloseSession { status, attrs } => {
                 emitted.push(close(
                     store,
-                    session,
+                    root,
                     trace_id,
-                    "session",
-                    "session",
+                    &session_key,
+                    &session_key,
                     SpanKind::Internal,
                     now_nanos,
                     status,
@@ -54,7 +74,7 @@ pub fn apply(
             }
             SpanOp::OpenTurn { attrs } => {
                 let (key, name, _) = resolve_turn(store, session, parsed.turn_id.as_deref(), true)?;
-                let parent = SpanId::derive(session, "session");
+                let parent = context_parent;
                 // Provisional turn so an interrupted turn (no Stop) still appears;
                 // CloseTurn finalizes it via the same deterministic id.
                 emitted.push(open_provisional(
@@ -70,8 +90,9 @@ pub fn apply(
                 )?);
             }
             SpanOp::CloseTurn { status, attrs } => {
-                let (key, name, _) = resolve_turn(store, session, parsed.turn_id.as_deref(), false)?;
-                emitted.push(close(
+                let (key, name, _) =
+                    resolve_turn(store, session, parsed.turn_id.as_deref(), false)?;
+                let mut span = close(
                     store,
                     session,
                     trace_id,
@@ -82,7 +103,9 @@ pub fn apply(
                     status,
                     attrs,
                     None,
-                )?);
+                )?;
+                span.parent_span_id = span.parent_span_id.or(Some(context_parent));
+                emitted.push(span);
             }
             SpanOp::OpenTool {
                 tool_use_id,
@@ -93,7 +116,14 @@ pub fn apply(
                 let (turn_lkey, turn_name, first_sight) =
                     resolve_turn(store, session, parsed.turn_id.as_deref(), false)?;
                 ensure_turn_span(
-                    store, session, trace_id, &turn_lkey, &turn_name, now_nanos, first_sight,
+                    store,
+                    session,
+                    trace_id,
+                    context_parent,
+                    &turn_lkey,
+                    &turn_name,
+                    now_nanos,
+                    first_sight,
                     &mut emitted,
                 )?;
                 let parent = SpanId::derive(session, &turn_lkey);
@@ -115,7 +145,22 @@ pub fn apply(
                 attrs,
             } => {
                 let key = tool_key(tool_use_id.as_deref(), tool_name);
-                emitted.push(close(
+                // Post hooks can be the first observable tool event. Resolve
+                // an inferred turn so these spans remain attached to the tree.
+                let (turn_lkey, turn_name, first_sight) =
+                    resolve_turn(store, session, parsed.turn_id.as_deref(), false)?;
+                ensure_turn_span(
+                    store,
+                    session,
+                    trace_id,
+                    context_parent,
+                    &turn_lkey,
+                    &turn_name,
+                    now_nanos,
+                    first_sight,
+                    &mut emitted,
+                )?;
+                let mut span = close(
                     store,
                     session,
                     trace_id,
@@ -126,7 +171,11 @@ pub fn apply(
                     status,
                     attrs,
                     *duration_ms,
-                )?);
+                )?;
+                span.parent_span_id = span
+                    .parent_span_id
+                    .or(Some(SpanId::derive(session, &turn_lkey)));
+                emitted.push(span);
             }
             SpanOp::OpenAgent {
                 agent_id,
@@ -135,13 +184,34 @@ pub fn apply(
             } => {
                 let key = format!("agent:{agent_id}");
                 let parent = match parent_tool_use_id {
-                    Some(tu) => SpanId::derive(session, &format!("tool:{tu}")),
+                    Some(tu) => {
+                        let tool_key = format!("tool:{tu}");
+                        // Lifecycle agent_id names the child, so its caller can
+                        // be any execution scope in this root session. Use a
+                        // known parent only when the reference is unambiguous.
+                        store
+                            .unique_open_span_id_in_scopes(
+                                root,
+                                &format!("{}:{root}:agent:", root.len()),
+                                &tool_key,
+                            )?
+                            .as_deref()
+                            .and_then(SpanId::from_hex)
+                            .unwrap_or_else(|| SpanId::derive(session, &tool_key))
+                    }
                     None => {
                         let (turn_lkey, turn_name, first_sight) =
                             resolve_turn(store, session, parsed.turn_id.as_deref(), false)?;
                         ensure_turn_span(
-                            store, session, trace_id, &turn_lkey, &turn_name, now_nanos,
-                            first_sight, &mut emitted,
+                            store,
+                            session,
+                            trace_id,
+                            context_parent,
+                            &turn_lkey,
+                            &turn_name,
+                            now_nanos,
+                            first_sight,
+                            &mut emitted,
                         )?;
                         SpanId::derive(session, &turn_lkey)
                     }
@@ -166,7 +236,7 @@ pub fn apply(
                 attrs,
             } => {
                 let key = format!("agent:{agent_id}");
-                emitted.push(close(
+                let mut span = close(
                     store,
                     session,
                     trace_id,
@@ -177,13 +247,37 @@ pub fn apply(
                     status,
                     attrs,
                     None,
-                )?);
+                )?;
+                if span.parent_span_id.is_none() {
+                    let (turn_lkey, turn_name, first_sight) =
+                        resolve_turn(store, session, parsed.turn_id.as_deref(), false)?;
+                    ensure_turn_span(
+                        store,
+                        session,
+                        trace_id,
+                        context_parent,
+                        &turn_lkey,
+                        &turn_name,
+                        now_nanos,
+                        first_sight,
+                        &mut emitted,
+                    )?;
+                    span.parent_span_id = Some(SpanId::derive(session, &turn_lkey));
+                }
+                emitted.push(span);
             }
             SpanOp::Mark { name, attrs } => {
                 let (turn_lkey, turn_name, first_sight) =
                     resolve_turn(store, session, parsed.turn_id.as_deref(), false)?;
                 ensure_turn_span(
-                    store, session, trace_id, &turn_lkey, &turn_name, now_nanos, first_sight,
+                    store,
+                    session,
+                    trace_id,
+                    context_parent,
+                    &turn_lkey,
+                    &turn_name,
+                    now_nanos,
+                    first_sight,
                     &mut emitted,
                 )?;
                 let parent = SpanId::derive(session, &turn_lkey);
@@ -224,7 +318,11 @@ fn resolve_turn(
     match turn_id {
         Some(tid) => {
             let (ordinal, first_sight) = store.turn_ordinal(session, tid)?;
-            Ok((format!("turn:{tid}"), format!("turn:{ordinal}"), first_sight))
+            Ok((
+                format!("turn:{tid}"),
+                format!("turn:{ordinal}"),
+                first_sight,
+            ))
         }
         None => {
             // Claude's counter turns are always opened explicitly by
@@ -253,6 +351,7 @@ fn ensure_turn_span(
     store: &Store,
     session: &str,
     trace_id: TraceId,
+    parent: SpanId,
     turn_lkey: &str,
     turn_name: &str,
     now_nanos: u64,
@@ -262,7 +361,6 @@ fn ensure_turn_span(
     if !first_sight {
         return Ok(());
     }
-    let parent = SpanId::derive(session, "session");
     let attrs: Attrs = vec![("gently.event".to_string(), "TurnInferred".to_string())];
     emitted.push(open_provisional(
         store,
@@ -316,25 +414,30 @@ fn open_provisional(
     now_nanos: u64,
     attrs: &Attrs,
 ) -> Result<Span, gently_store::StoreError> {
-    store.open_span(&open(
+    let existing_attrs = store
+        .peek_open(session, logical_key)?
+        .and_then(|s| serde_json::from_str(&s.attrs_json).ok())
+        .unwrap_or_default();
+    let attrs = merge_attrs(existing_attrs, attrs);
+    let opened = store.reopen_provisional(&open(
         logical_key,
         parent,
         name,
         kind,
         now_nanos,
-        attrs,
+        &attrs,
         session,
     ))?;
     Ok(Span {
         trace_id,
         span_id: SpanId::derive(session, logical_key),
-        parent_span_id: parent,
+        parent_span_id: opened.parent_span_id.as_deref().and_then(SpanId::from_hex),
         name: name.to_string(),
         kind,
-        start_unix_nano: now_nanos,
-        end_unix_nano: now_nanos,
+        start_unix_nano: opened.start_unix_nano,
+        end_unix_nano: opened.start_unix_nano,
         status: Status::Unset,
-        attributes: attrs.clone(),
+        attributes: attrs,
     })
 }
 
@@ -746,7 +849,10 @@ mod tests {
             300,
         )
         .unwrap();
-        assert!(pre2.is_empty(), "turn already exists; no duplicate turn span");
+        assert!(
+            pre2.is_empty(),
+            "turn already exists; no duplicate turn span"
+        );
     }
 
     #[test]
@@ -775,5 +881,266 @@ mod tests {
             spans[0].parent_span_id,
             Some(SpanId::derive("s", "session"))
         );
+    }
+    #[test]
+    fn resumed_session_keeps_original_start() {
+        let (_d, store) = store();
+        let h = ClaudeCode;
+        for (now, source) in [(100, "startup"), (500, "compact")] {
+            let parsed = h.parse(&json!({"hook_event_name":"SessionStart", "session_id":"resume", "source":source})).unwrap();
+            apply(&store, &parsed, now).unwrap();
+        }
+        let parsed = h
+            .parse(
+                &json!({"hook_event_name":"SessionEnd", "session_id":"resume", "reason":"other"}),
+            )
+            .unwrap();
+        let spans = apply(&store, &parsed, 1000).unwrap();
+        assert_eq!(spans[0].start_unix_nano, 100);
+        assert_eq!(spans[0].end_unix_nano, 1000);
+    }
+
+    #[test]
+    fn child_turns_and_same_id_tools_are_isolated_from_root() {
+        let (_d, store) = store();
+        let h = ClaudeCode;
+        let events = [
+            (
+                100,
+                json!({"hook_event_name":"UserPromptSubmit","session_id":"root","prompt_id":"root-prompt"}),
+            ),
+            (
+                110,
+                json!({"hook_event_name":"SubagentStart","session_id":"root","agent_id":"child"}),
+            ),
+            (
+                120,
+                json!({"hook_event_name":"UserPromptSubmit","session_id":"root","prompt_id":"child-prompt","agent_id":"child"}),
+            ),
+            (
+                200,
+                json!({"hook_event_name":"PreToolUse","session_id":"root","prompt_id":"root-prompt","tool_name":"Bash","tool_use_id":"shared"}),
+            ),
+            (
+                300,
+                json!({"hook_event_name":"PreToolUse","session_id":"root","prompt_id":"child-prompt","agent_id":"child","tool_name":"Write","tool_use_id":"shared"}),
+            ),
+        ];
+        let mut child_turn = None;
+        for (now, raw) in events {
+            let parsed = h.parse(&raw).unwrap();
+            let spans = apply(&store, &parsed, now).unwrap();
+            if now == 120 {
+                child_turn = spans.into_iter().find(|s| s.name.starts_with("turn:"));
+            }
+        }
+        let child_turn = child_turn.unwrap();
+        assert_eq!(child_turn.name, "turn:1");
+        assert_eq!(
+            child_turn.parent_span_id,
+            Some(SpanId::derive("root", "agent:child"))
+        );
+        let root = h.parse(&json!({"hook_event_name":"PostToolUse","session_id":"root","prompt_id":"root-prompt","tool_name":"Bash","tool_use_id":"shared"})).unwrap();
+        let root_spans = apply(&store, &root, 500).unwrap();
+        let root_tool = root_spans.iter().find(|s| s.name == "Bash").unwrap();
+        assert_eq!(root_tool.start_unix_nano, 200);
+        let child = h.parse(&json!({"hook_event_name":"PostToolUse","session_id":"root","prompt_id":"child-prompt","agent_id":"child","tool_name":"Write","tool_use_id":"shared"})).unwrap();
+        let child_spans = apply(&store, &child, 600).unwrap();
+        let child_tool = child_spans.iter().find(|s| s.name == "Write").unwrap();
+        assert_eq!(child_tool.start_unix_nano, 300);
+        assert_ne!(root_tool.span_id, child_tool.span_id);
+        assert_eq!(root_tool.trace_id, child_tool.trace_id);
+        assert_eq!(child_tool.parent_span_id, Some(child_turn.span_id));
+    }
+
+    #[test]
+    fn post_tool_without_pre_still_has_a_turn_parent() {
+        let (_d, store) = store();
+        let parsed = Codex.parse(&json!({"hook_event_name":"PostToolUse","session_id":"late","turn_id":"turn-id","tool_name":"Bash","tool_use_id":"tool-id","tool_response":"opaque output"})).unwrap();
+        let spans = apply(&store, &parsed, 1000).unwrap();
+        let tool = spans.iter().find(|s| s.name == "Bash").unwrap();
+        let turn = spans.iter().find(|s| s.name == "turn:1").unwrap();
+        assert_eq!(tool.parent_span_id, Some(turn.span_id));
+    }
+
+    #[test]
+    fn missing_subagent_start_still_attaches_child_tree_to_root_turn() {
+        let (_d, s) = store();
+        let h = ClaudeCode;
+        let root = apply(&s, &h.parse(&json!({"hook_event_name":"UserPromptSubmit","session_id":"s","prompt_id":"parent"})).unwrap(), 10).unwrap();
+        let child = apply(&s, &h.parse(&json!({"hook_event_name":"UserPromptSubmit","session_id":"s","agent_id":"child","prompt_id":"child-p"})).unwrap(), 20).unwrap();
+        let ended = apply(&s, &h.parse(&json!({"hook_event_name":"SubagentStop","session_id":"s","agent_id":"child","prompt_id":"parent"})).unwrap(), 50).unwrap();
+        let agent = ended.iter().find(|s| s.name == "agent:child").unwrap();
+        assert_eq!(agent.parent_span_id, Some(root[0].span_id));
+        assert_eq!(child[0].parent_span_id, Some(agent.span_id));
+    }
+
+    #[test]
+    fn child_scope_and_turn_boundaries_do_not_collide() {
+        let (_d, s) = store();
+        let h = ClaudeCode;
+        let first = apply(&s, &h.parse(&json!({"hook_event_name":"UserPromptSubmit","session_id":"s","agent_id":"child:turn","prompt_id":"prompt"})).unwrap(), 10).unwrap();
+        let second = apply(&s, &h.parse(&json!({"hook_event_name":"UserPromptSubmit","session_id":"s","agent_id":"child","prompt_id":"turn:prompt"})).unwrap(), 20).unwrap();
+        assert_ne!(first[0].span_id, second[0].span_id);
+    }
+
+    #[test]
+    fn nested_subagent_uses_scoped_parent_tool_in_the_same_trace() {
+        let (_d, store) = store();
+        let h = ClaudeCode;
+        let root = "r_%";
+        for (now, raw) in [
+            (
+                10,
+                json!({"hook_event_name":"UserPromptSubmit","session_id":root,"prompt_id":"root-p"}),
+            ),
+            (
+                20,
+                json!({"hook_event_name":"SubagentStart","session_id":root,"agent_id":"child","prompt_id":"root-p"}),
+            ),
+            (
+                30,
+                json!({"hook_event_name":"UserPromptSubmit","session_id":root,"agent_id":"child","prompt_id":"child-p"}),
+            ),
+            (
+                40,
+                json!({"hook_event_name":"PreToolUse","session_id":root,"agent_id":"child","prompt_id":"child-p","tool_name":"Agent","tool_use_id":"parent-tool"}),
+            ),
+            // Identical references in other roots must not make this match ambiguous.
+            (
+                45,
+                json!({"hook_event_name":"PreToolUse","session_id":"rXX","agent_id":"child","prompt_id":"other-p","tool_name":"Agent","tool_use_id":"parent-tool"}),
+            ),
+            (
+                46,
+                json!({"hook_event_name":"PreToolUse","session_id":"r_%:other","prompt_id":"other-p","tool_name":"Agent","tool_use_id":"parent-tool"}),
+            ),
+        ] {
+            apply(&store, &h.parse(&raw).unwrap(), now).unwrap();
+        }
+        let started = apply(
+            &store,
+            &h.parse(&json!({
+                "hook_event_name":"SubagentStart", "session_id":root,
+                "agent_id":"grandchild", "tool_use_id":"parent-tool", "prompt_id":"child-p"
+            }))
+            .unwrap(),
+            50,
+        )
+        .unwrap();
+        let grandchild = started
+            .iter()
+            .find(|span| span.name == "agent:grandchild")
+            .unwrap();
+        let child_scope = format!("{}:{root}:agent:5:child", root.len());
+        assert_eq!(
+            grandchild.parent_span_id,
+            Some(SpanId::derive(&child_scope, "tool:parent-tool"))
+        );
+        assert_eq!(grandchild.trace_id, TraceId::from_session(root));
+
+        let descendants = apply(
+            &store,
+            &h.parse(&json!({
+                "hook_event_name":"UserPromptSubmit", "session_id":root,
+                "agent_id":"grandchild", "prompt_id":"grandchild-p"
+            }))
+            .unwrap(),
+            60,
+        )
+        .unwrap();
+        let turn = descendants
+            .iter()
+            .find(|span| span.name == "turn:1")
+            .unwrap();
+        assert_eq!(turn.parent_span_id, Some(grandchild.span_id));
+        assert_eq!(turn.trace_id, grandchild.trace_id);
+
+        // Lookup must not consume the parent: its later close keeps start and parent.
+        let completed = apply(
+            &store,
+            &h.parse(&json!({
+                "hook_event_name":"PostToolUse", "session_id":root,
+                "agent_id":"child", "prompt_id":"child-p",
+                "tool_name":"Agent", "tool_use_id":"parent-tool"
+            }))
+            .unwrap(),
+            70,
+        )
+        .unwrap();
+        let tool = completed.iter().find(|span| span.name == "Agent").unwrap();
+        assert_eq!(grandchild.parent_span_id, Some(tool.span_id));
+        assert_eq!(tool.start_unix_nano, 40);
+    }
+
+    #[test]
+    fn ambiguous_parent_tool_reference_keeps_root_fallback() {
+        let (_d, store) = store();
+        let h = Codex;
+        for (now, agent) in [(10, Some("child")), (20, Some("sibling"))] {
+            let raw = json!({"hook_event_name":"PreToolUse","session_id":"root",
+                "agent_id":agent,"turn_id":"prompt","tool_name":"Agent","tool_use_id":"shared"});
+            apply(&store, &h.parse(&raw).unwrap(), now).unwrap();
+        }
+        let spans = apply(
+            &store,
+            &h.parse(&json!({
+                "hook_event_name":"SubagentStart","session_id":"root", "agent_id":"grandchild",
+                "tool_use_id":"shared","turn_id":"prompt"
+            }))
+            .unwrap(),
+            30,
+        )
+        .unwrap();
+        let agent = spans
+            .iter()
+            .find(|span| span.name == "agent:grandchild")
+            .unwrap();
+        assert_eq!(
+            agent.parent_span_id,
+            Some(SpanId::derive("root", "tool:shared"))
+        );
+    }
+
+    #[test]
+    fn missing_parent_tool_reference_keeps_root_fallback() {
+        let (_d, store) = store();
+        let parsed = ClaudeCode
+            .parse(&json!({
+                "hook_event_name":"SubagentStart","session_id":"root", "agent_id":"child",
+                "tool_use_id":"missing"
+            }))
+            .unwrap();
+        let spans = apply(&store, &parsed, 10).unwrap();
+        assert_eq!(
+            spans[0].parent_span_id,
+            Some(SpanId::derive("root", "tool:missing"))
+        );
+    }
+
+    #[test]
+    fn parent_tool_lookup_uses_the_stored_span_identifier() {
+        let (_d, store) = store();
+        let stored = SpanId::derive("stored", "parent");
+        store
+            .open_span(&OpenSpan {
+                session_id: "root".into(),
+                logical_key: "tool:parent-tool".into(),
+                span_id: stored.to_hex(),
+                parent_span_id: None,
+                name: "Agent".into(),
+                kind: SpanKind::Client as u8,
+                start_unix_nano: 1,
+                attrs_json: "[]".into(),
+            })
+            .unwrap();
+        let parsed = ClaudeCode
+            .parse(&json!({
+                "hook_event_name":"SubagentStart", "session_id":"root",
+                "agent_id":"child", "tool_use_id":"parent-tool"
+            }))
+            .unwrap();
+        let spans = apply(&store, &parsed, 10).unwrap();
+        assert_eq!(spans[0].parent_span_id, Some(stored));
     }
 }

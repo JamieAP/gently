@@ -18,24 +18,15 @@ npx wrangler deploy                              # returns the collector URL
 cd ..
 ```
 
-For a local collector, open a separate terminal at the repository root. The
-example token below is for local development only. Run the Worker in that
-terminal while using the CLI in another:
-
-```bash
-cd worker
-npm ci
-echo 'GENTLY_TOKEN=dev-token' > .dev.vars
-npx wrangler d1 execute gently --local --file schema.sql
-npx wrangler dev                                  # http://127.0.0.1:8787
-```
-
-Use `http://127.0.0.1:8787` and the same local token in the CLI configuration.
+Prefer to stay local? Follow [Local setup](../../LOCAL_SETUP.md) for a localhost
+collector with local D1, a hardware-backed token, and an export watcher. It
+does not require Cloudflare login or a plaintext token file. Use
+`http://127.0.0.1:8787` as the collector URL.
 
 ## 2. Install the agent integration
 
 ```bash
-cargo install --path crates/gently-cli           # installs the `gently` binary
+cargo install --path crates/gently-cli --locked  # installs the `gently` binary
 gently init --claude                              # hooks + digest-only MCP queries
 # or: gently init --codex                         # trust hooks inside Codex
 ```
@@ -49,10 +40,13 @@ gently init --claude                              # hooks + digest-only MCP quer
 `gently init --codex` instead installs hooks and the MCP server in
 `~/.codex/config.toml`. Trust the installed hooks inside Codex.
 
-Set your collector + token in `~/.gently/config.toml` (see
-[Configuration](configuration.md)), then **restart your agent session**. Hooks are read at session start. For Codex,
-also trust the installed hooks inside Codex. Run a task to generate activity
-before querying it.
+Set `collector_url` in `~/.gently/config.toml` and supply `GENTLY_TOKEN` to export
+and query processes (see [Configuration](configuration.md)), then restart your
+agent session. Hooks record each event locally. Token-bearing hooks start a
+detached exporter; hooks without a token can use a foreground-unlocked
+`gently export --watch --interval-secs 2` process to drain their queue. The
+watcher does not authenticate CLI or MCP queries. Run a task to generate
+activity before querying it.
 
 ## 3. Query
 
@@ -81,8 +75,10 @@ gently trace <trace_id> --json | python3 scripts/waterfall.py
      2.0ms ✓      Bash     │                                              █         │
 ```
 
-Raw MCP resolution is disabled by default. To deliberately share locally stored
-raw values with the calling agent, add `--resolve-local-raw-values` to init.
+Raw capture and MCP resolution are disabled by default. To deliberately share
+local raw values, separately enable capture using `capture_raw_values = true`
+or `GENTLY_CAPTURE_RAW_VALUES=1`, then add `--resolve-local-raw-values` to init.
+Existing captured values remain available after capture is disabled.
 See [Security & privacy](../concepts/security-and-privacy.md).
 
 The same query surface is exposed to the agent as MCP tools; see
@@ -90,9 +86,11 @@ The same query surface is exposed to the agent as MCP tools; see
 
 ## Verify the hook schema (optional)
 
-To check hook payloads for your installed agent version, run a session with
-`GENTLY_DEBUG=1` and inspect the raw captures:
+Adapters are checked against the current official hook schemas with synthetic
+regressions; see [Harness hooks](../reference/hooks.md). If you need to inspect a
+real session payload, explicitly enable both raw capture and debug capture:
 
 ```bash
-GENTLY_DEBUG=1 claude         # then look at ~/.gently/raw/<harness>/<Event>.jsonl
+GENTLY_CAPTURE_RAW_VALUES=1 GENTLY_DEBUG=1 claude
+# Inspect ~/.gently/raw/<harness>/<Event>.jsonl; no environment snapshot is taken.
 ```

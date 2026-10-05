@@ -12,6 +12,11 @@ The Rust CLI captures hook events into a local SQLite outbox and exports
 OTLP/JSON to a collector you run. The included collector is a Cloudflare Worker
 backed by D1; it can run on Cloudflare or locally with Wrangler.
 
+Hooks queue one OTLP/JSON envelope per event. When a collector token is
+available they start a detached exporter; tokenless hooks queue locally.
+`gently export --watch` drains the queue continuously, reusing connections.
+Remote export can use HTTP/3, with a TCP fallback.
+
 ```text
 Claude Code / Codex hooks -> local SQLite outbox -> Worker -> D1
                                                    ^
@@ -44,8 +49,8 @@ See [data and privacy](#data-and-privacy) before enabling capture.
 
 ## Quick start
 
-You need Rust and Cargo, Node.js and npm, and a Cloudflare account authenticated
-with Wrangler. Start from a source checkout:
+You need Rust and Cargo, Node.js and npm. Deploying to Cloudflare also requires
+an account authenticated with Wrangler. Start from a source checkout:
 
 ```sh
 git clone https://github.com/JamieAP/gently.git
@@ -70,31 +75,34 @@ npx wrangler deploy
 cd ..
 ```
 
-For a local collector, initialize D1 with `--local`, configure the Worker's local
-`GENTLY_TOKEN`, and run `npx wrangler dev` from `worker/`. Use
-`http://127.0.0.1:8787` as the collector URL. See the
-[setup guide](docs/getting-started/quickstart.md) for details.
+For a local collector with a Secure Enclave token, follow
+[Local setup](LOCAL_SETUP.md). It starts a localhost Worker, local D1, and an
+export watcher from a foreground terminal so hardware unlock can prompt once.
+Use `http://127.0.0.1:8787` as the collector URL.
 
 ### 2. Install the hooks
 
 ```sh
-cargo install --path crates/gently-cli
+cargo install --path crates/gently-cli --locked
 gently init --claude
 # For Codex instead: gently init --codex
 ```
 
 Init installs the hooks and MCP server and creates `~/.gently/config.toml` if it
-is missing. Set the collector URL and the same bearer token there:
+is missing. Set the collector URL there and supply the shared bearer token as
+`GENTLY_TOKEN` to export and query processes:
 
 ```toml
 collector_url = "https://gently-collector.<account>.workers.dev"
-token = "replace-with-your-collector-token"
+# prefer_quic = true
 ```
 
 Restart your agent session after configuring it. Codex hooks must also be
 trusted inside Codex. `GENTLY_COLLECTOR_URL` and `GENTLY_TOKEN` override the config
 values. See [configuration](docs/getting-started/configuration.md) for queue,
-transport, timeout, and state-directory options.
+transport, timeout, and state-directory options. A watcher can export tokenless
+desktop hooks; CLI and MCP query processes still need the token. Background
+hooks never attempt hardware unlock.
 
 ### 3. Query a session
 
@@ -143,12 +151,13 @@ file, or tool-output values. They also include identifying metadata such as
 working directories, host information, tool names, timings, and session IDs.
 Digests are fingerprints, not encryption.
 
-Selected raw prompt, tool, and assistant values are stored locally in SQLite,
-even when raw resolution is disabled. This content is plaintext and has no
-automatic retention limit. To let MCP queries resolve matching local raw values,
-explicitly install with `--resolve-local-raw-values`; those results may enter the
-calling agent's model-provider context. Reinstalling without that option removes
-the registered opt-in.
+Raw prompt, tool, and assistant capture is disabled by default. Enable local
+SQLite capture with `capture_raw_values = true` or `GENTLY_CAPTURE_RAW_VALUES=1`.
+Captured content is plaintext and has no automatic retention limit; disabling
+capture does not delete existing values. Raw resolution is a separate opt-in:
+install with `--resolve-local-raw-values` to let MCP queries resolve captured
+values. Those results may enter the calling agent's model-provider context.
+Reinstalling without that option removes the registered resolution opt-in.
 
 The collector's shared bearer token grants access to all traces. The collector
 provides no tenant separation or automatic retention. Protect both the collector
@@ -159,8 +168,9 @@ for file permissions, exported fields, and debug-capture behaviour.
 
 One trace represents a session. Turns, tools, and subagents form its span tree.
 Hooks write locally; a detached exporter drains the outbox with retry and backoff.
-The default queue cap is 10,000 spans, after which the oldest queued spans are
-dropped.
+The default queue cap is 10,000 envelopes, after which the oldest queued
+envelopes are dropped. Authentication failures stop export immediately;
+transient failures use backoff, and unprocessable envelopes can be quarantined.
 
 Session, turn, and subagent spans are updated as they open and close. The Worker
 replaces records with the same span ID. Exporting to another OpenTelemetry
@@ -170,6 +180,7 @@ Worker's query API.
 - [Documentation index](docs/README.md)
 - [Architecture](docs/concepts/architecture.md)
 - [Trace model](docs/concepts/trace-model.md)
+- [Current harness hooks](docs/reference/hooks.md)
 - [Configuration](docs/getting-started/configuration.md)
 - [Querying and MCP](docs/guides/querying-and-mcp.md)
 - [Security and privacy](docs/concepts/security-and-privacy.md)

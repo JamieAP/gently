@@ -1,0 +1,13 @@
+#!/bin/sh
+# Attach a persistent exporter to an already-running local collector.
+set -eu
+gently_bin=$(command -v gently || true)
+if [ -z "$gently_bin" ]; then gently_bin=$HOME/.cargo/bin/gently; fi
+secret_helper=$(command -v agent-secrets || true)
+if [ -z "$secret_helper" ]; then secret_helper=$HOME/.local/bin/agent-secrets; fi
+if [ ! -x "$gently_bin" ] || [ ! -x "$secret_helper" ]; then
+  printf '%s\n' 'Install gently and agent-secrets before starting the exporter.' >&2
+  exit 1
+fi
+export GENTLY_COLLECTOR_URL=http://127.0.0.1:8787
+exec "$secret_helper" run default -- "$gently_bin" export --watch

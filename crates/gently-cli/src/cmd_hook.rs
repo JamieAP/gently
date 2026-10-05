@@ -42,13 +42,15 @@ fn process(harness: HarnessKind) -> anyhow::Result<()> {
     std::io::stdin().read_to_string(&mut raw)?;
     let value: serde_json::Value = serde_json::from_str(&raw)?;
 
-    if std::env::var_os("GENTLY_DEBUG").is_some() {
+    if cfg.capture_raw_values && std::env::var("GENTLY_DEBUG").as_deref() == Ok("1") {
         capture_raw(&cfg, harness, &value, &raw);
     }
 
     let store = Store::open(&cfg.state_db())?;
-    if let Err(e) = local_raw::capture_hook_values(&store, &value) {
-        tracing::warn!(error = %e, "local raw value capture failed");
+    if cfg.capture_raw_values {
+        if let Err(e) = local_raw::capture_hook_values(&store, &value) {
+            tracing::warn!(error = %e, "local raw value capture failed");
+        }
     }
 
     let adapter: &dyn Harness = match harness {
@@ -64,14 +66,15 @@ fn process(harness: HarnessKind) -> anyhow::Result<()> {
 
     let spans = apply(&store, &parsed, now_nanos())?;
 
-    for span in spans {
-        let req = OtlpRequest::single(&resource, vec![span]);
+    // One durable envelope per hook avoids repeated resource JSON and SQLite
+    // writes for inferred parents, markers and completed spans from one event.
+    if !spans.is_empty() {
+        let req = OtlpRequest::single(&resource, spans);
         store.outbox_enqueue(&serde_json::to_string(&req)?)?;
     }
 
-    // Reap provisional open spans whose close never came (Codex has no
-    // SessionEnd, and fires no Stop for an Esc-interrupted turn - openai/codex
-    // #22858), so the local table cannot grow without bound. Cheap single
+    // Reap provisional spans after crashes, older harness releases or missing
+    // lifecycle hooks so the local table cannot grow without bound. Cheap single
     // DELETE; best-effort so it never disrupts the hook.
     let cutoff = now_nanos().saturating_sub(OPEN_SPAN_TTL_NANOS);
     match store.reap_open_spans(cutoff) {
@@ -91,11 +94,11 @@ fn process(harness: HarnessKind) -> anyhow::Result<()> {
 }
 
 /// Terminal events flush the exporter unconditionally so the last spans always
-/// ship. The set is harness-specific: Codex has no `SessionEnd`/`StopFailure`.
+/// ship. Codex interrupts close a turn without claiming success or failure.
 fn is_terminal_event(harness: HarnessKind, event: &str) -> bool {
     match harness {
         HarnessKind::Claude => matches!(event, "Stop" | "StopFailure" | "SessionEnd"),
-        HarnessKind::Codex => event == "Stop",
+        HarnessKind::Codex => matches!(event, "Stop" | "Interrupt" | "SessionEnd"),
     }
 }
 
@@ -106,13 +109,8 @@ fn now_nanos() -> u64 {
         .unwrap_or(0)
 }
 
-/// Append the raw event payload to `<state_dir>/raw/<harness>/<event>.jsonl` and
-/// refresh a redacted env snapshot at `<state_dir>/raw/<harness>/env.json`.
-/// Namespacing by harness keeps Claude and Codex payloads separable for coverage
-/// audits (the payload itself has no harness field); the env snapshot records
-/// exactly what each harness hands the hook process. Best-effort: this
-/// schema-verification debug aid (gated on `GENTLY_DEBUG`) must never interfere
-/// with the pipeline.
+/// Append a payload only when both content retention and debug capture are
+/// explicitly enabled. Never inspect or persist the process environment.
 fn capture_raw(cfg: &Config, harness: HarnessKind, value: &serde_json::Value, raw: &str) {
     let hname = match harness {
         HarnessKind::Claude => "claude",
@@ -124,35 +122,22 @@ fn capture_raw(cfg: &Config, harness: HarnessKind, value: &serde_json::Value, ra
         .unwrap_or("unknown");
     let dir = cfg.state_dir.join("raw").join(hname);
     if gently_store::private_fs::ensure_private_dir(&cfg.state_dir.join("raw")).is_err()
-        || gently_store::private_fs::ensure_private_dir(&dir).is_err() {
+        || gently_store::private_fs::ensure_private_dir(&dir).is_err()
+    {
         return;
     }
     // Hook event names are input; prevent them from escaping the raw directory.
-    if !event.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') { return; }
-    if let Ok(mut f) = gently_store::private_fs::open_private_file(&dir.join(format!("{event}.jsonl")), true)
+    if !event
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return;
+    }
+    if let Ok(mut f) =
+        gently_store::private_fs::open_private_file(&dir.join(format!("{event}.jsonl")), true)
     {
         let _ = writeln!(f, "{}", raw.trim());
     }
-    if let Ok(env_json) = serde_json::to_string_pretty(&redacted_env()) {
-        let _ = gently_store::private_fs::write_private_file(&dir.join("env.json"), env_json);
-    }
-}
-
-/// A process-environment snapshot with filtering by variable name.
-/// Only names containing the listed markers are masked; secrets with other
-/// names remain in the snapshot. This denylist is not a complete secret detector.
-fn redacted_env() -> std::collections::BTreeMap<String, String> {
-    const SECRET_MARKERS: [&str; 6] = ["KEY", "TOKEN", "SECRET", "PASSWORD", "AUTH", "CREDENTIAL"];
-    std::env::vars()
-        .map(|(k, v)| {
-            let upper = k.to_ascii_uppercase();
-            if SECRET_MARKERS.iter().any(|m| upper.contains(m)) {
-                (k, "<redacted>".to_string())
-            } else {
-                (k, v)
-            }
-        })
-        .collect()
 }
 
 /// Spawn the detached exporter, unless throttled.
@@ -165,6 +150,11 @@ fn redacted_env() -> std::collections::BTreeMap<String, String> {
 /// we just enqueued. `force` (terminal events) always spawns so the final flush
 /// is guaranteed even if the previous exporter had already moved past our row.
 fn maybe_spawn_export(cfg: &Config, force: bool) {
+    // Desktop hooks often have no token. They queue for the persistent watcher
+    // without repeated failed exporter processes or biometric prompts.
+    if cfg.token.is_empty() || cfg.collector_url.is_empty() {
+        return;
+    }
     if !force && exporter_running(cfg) {
         return;
     }
@@ -175,7 +165,8 @@ fn maybe_spawn_export(cfg: &Config, force: bool) {
 /// immediately releasing is a cheap local file op; a held lock means "running".
 fn exporter_running(cfg: &Config) -> bool {
     use fs4::fs_std::FileExt;
-    let Ok(file) = gently_store::private_fs::open_private_file(&cfg.state_dir.join("export.lock"), false)
+    let Ok(file) =
+        gently_store::private_fs::open_private_file(&cfg.state_dir.join("export.lock"), false)
     else {
         return false; // can't tell → don't suppress the spawn
     };

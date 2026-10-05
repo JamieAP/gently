@@ -13,8 +13,8 @@
 mod health;
 mod open_spans;
 mod outbox;
-mod raw_values;
 pub mod private_fs;
+mod raw_values;
 
 pub use health::Health;
 pub use open_spans::OpenSpan;
@@ -47,19 +47,25 @@ impl Store {
         // Precreate and harden the database before SQLite creates WAL sidecars.
         // Do not change the caller's parent directory (it may be a shared /tmp).
         drop(private_fs::open_private_file(path, false)?);
-        let sidecars: Vec<std::path::PathBuf> = ["-wal", "-shm", "-journal"].iter()
+        let sidecars: Vec<std::path::PathBuf> = ["-wal", "-shm", "-journal"]
+            .iter()
             .map(|suffix| {
                 let mut name = path.as_os_str().to_os_string();
                 name.push(suffix);
                 std::path::PathBuf::from(name)
-            }).collect();
-        for sidecar in &sidecars { private_fs::harden_existing_file(sidecar)?; }
+            })
+            .collect();
+        for sidecar in &sidecars {
+            private_fs::harden_existing_file(sidecar)?;
+        }
         let conn = rusqlite::Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
-        for sidecar in &sidecars { private_fs::harden_existing_file(sidecar)?; }
+        for sidecar in &sidecars {
+            private_fs::harden_existing_file(sidecar)?;
+        }
         Ok(Self { conn })
     }
 }
@@ -142,10 +148,15 @@ mod tests {
             }
         }
         let reopened = Store::open(&path).unwrap();
-        reopened.raw_value_put("fixture", "private fixture content").unwrap();
+        reopened
+            .raw_value_put("fixture", "private fixture content")
+            .unwrap();
         for suffix in ["", "-wal", "-shm"] {
             let file = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
-            assert_eq!(std::fs::metadata(file).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
         drop(store);
     }

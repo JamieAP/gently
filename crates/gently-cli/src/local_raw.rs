@@ -142,14 +142,23 @@ mod tests {
     fn raw_resolution_requires_a_recognised_true_value() {
         let saved = std::env::var_os(super::RESOLVE_ENV);
         let mut results = Vec::new();
-        for (value, expected) in [(None, false), (Some(""), false), (Some("0"), false),
-                                  (Some("false"), false), (Some("1"), true)] {
-            match value { Some(v) => std::env::set_var(super::RESOLVE_ENV, v),
-                          None => std::env::remove_var(super::RESOLVE_ENV) }
+        for (value, expected) in [
+            (None, false),
+            (Some(""), false),
+            (Some("0"), false),
+            (Some("false"), false),
+            (Some("1"), true),
+        ] {
+            match value {
+                Some(v) => std::env::set_var(super::RESOLVE_ENV, v),
+                None => std::env::remove_var(super::RESOLVE_ENV),
+            }
             results.push((value, expected, super::resolve_enabled()));
         }
-        match saved { Some(v) => std::env::set_var(super::RESOLVE_ENV, v),
-                      None => std::env::remove_var(super::RESOLVE_ENV) }
+        match saved {
+            Some(v) => std::env::set_var(super::RESOLVE_ENV, v),
+            None => std::env::remove_var(super::RESOLVE_ENV),
+        }
         for (value, expected, actual) in results {
             assert_eq!(actual, expected, "raw resolution value {value:?}");
         }

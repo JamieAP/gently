@@ -5,22 +5,33 @@ A single binary, `gently`, with these subcommands.
 ## `gently hook`
 
 Harness hook entrypoint. Reads the event JSON on stdin, updates the local outbox,
-and spawns the detached exporter. **Contract:** writes nothing to stdout, always
+and starts a detached exporter only when a collector token is available.
+Without a token it records locally without spawning an exporter. **Contract:**
+writes nothing to stdout, always
 exits 0. You don't run this by hand - `gently init` wires it into the harness.
 
 ## `gently export`
 
 Drains the local outbox to the collector. A `flock` singleton: if another
-exporter holds the lock it exits immediately. Retries retryable failures
-(unreachable, timeout, 5xx, and recoverable auth/throttle `401`/`403`/`408`/`429`)
-with exponential backoff; quarantines only genuinely unprocessable 4xx
-(`400`/`413`/`422`); records health. Normally spawned by the hook, but safe to run
-manually to force a flush.
+exporter holds the lock it exits immediately. Authentication failures
+(`401`/`403`) stop immediately and retain the queue; they do not trigger transport
+fallback or retries with the same token. Unreachable collectors, timeouts, 5xx
+and non-payload endpoint errors such as `404`/`405`/`409`/`408`/`429` use
+exponential backoff. Unprocessable envelopes (`400`/`413`/`422`) and malformed
+queued JSON are quarantined; all outcomes update health. An event envelope is
+quarantined as a whole, including valid sibling spans. Run manually to force a
+flush.
+
+`gently export --watch --interval-secs 2` keeps polling the outbox, including
+spans queued by tokenless desktop hooks. Unlock a hardware-backed token once
+in a foreground terminal and pass it to this process; the watcher does not
+unlock secrets itself. Stop with Ctrl+C. Authentication failure stops the
+watcher and leaves queued spans intact; restart it with a corrected token.
 
 ## `gently status`
 
 Prints local exporter health and queue depth - collector URL, `prefer_quic`,
-pending outbox count, quarantined count, consecutive failures, last export / last
+pending outbox envelope count, quarantined count, consecutive failures, last export / last
 success (relative), last error.
 
 ## `gently traces`
@@ -66,7 +77,9 @@ installed hooks inside Codex. Re-running adds no duplicate hooks.
 
 MCP raw-value resolution is disabled unless `--resolve-local-raw-values` is
 provided. Re-running init without it removes the installed opt-in. This option
-can expose local prompt/tool/assistant content to the agent and its provider.
+can expose previously captured local prompt/tool/assistant content to the agent
+and its provider. It does not enable raw capture; that requires
+`capture_raw_values = true` or `GENTLY_CAPTURE_RAW_VALUES=1` on the hook process.
 
 ---
 

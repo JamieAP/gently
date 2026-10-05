@@ -13,7 +13,6 @@
 
 use crate::{ExportError, Transport};
 use std::sync::Once;
-use std::time::Duration;
 
 /// reqwest's HTTP/3 path uses rustls' no-bundled-provider variant, so a
 /// process-default [`CryptoProvider`](rustls::crypto::CryptoProvider) must exist
@@ -44,19 +43,10 @@ impl QuicTransport {
     ) -> Result<Self, ExportError> {
         ensure_crypto_provider();
         let endpoint = format!("{}/v1/traces", collector_url.trim_end_matches('/'));
-        let client = reqwest::Client::builder()
+        let client = crate::http2::client_builder(collector_url, timeout_secs)
             .http3_prior_knowledge()
-            .timeout(Duration::from_secs(timeout_secs))
             .build()
-            .map_err(|e| {
-                let mut msg = format!("building http3 client: {e}");
-                let mut src = std::error::Error::source(&e);
-                while let Some(s) = src {
-                    msg.push_str(&format!(" | caused by: {s}"));
-                    src = s.source();
-                }
-                ExportError::Unavailable(msg)
-            })?;
+            .map_err(|_| ExportError::Unavailable("building HTTP/3 client failed".into()))?;
         Ok(Self {
             endpoint,
             token: token.into(),
@@ -76,7 +66,7 @@ impl Transport for QuicTransport {
             .body(body)
             .send()
             .await
-            .map_err(|e| ExportError::Unavailable(e.to_string()))?;
+            .map_err(crate::http2::transport_failure)?;
         crate::http2::classify(resp.status())
     }
 }

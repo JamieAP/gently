@@ -31,12 +31,14 @@ pub struct Config {
     pub prefer_quic: bool,
     /// Max buffered outbox rows before the oldest are dropped.
     pub outbox_cap: usize,
-    /// Spans coalesced into one export request.
+    /// OTLP envelope rows coalesced into one export request.
     pub export_batch: usize,
     /// Per-request export timeout.
     pub export_timeout_secs: u64,
     /// Per-request query/MCP timeout.
     pub query_timeout_secs: u64,
+    /// Retain full prompt/tool values locally; disabled unless explicitly enabled.
+    pub capture_raw_values: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -50,6 +52,7 @@ struct FileConfig {
     export_batch: Option<usize>,
     export_timeout_secs: Option<u64>,
     query_timeout_secs: Option<u64>,
+    capture_raw_values: Option<bool>,
 }
 
 impl Config {
@@ -75,10 +78,17 @@ impl Config {
             }
         };
 
+        let capture_raw_values = match std::env::var("GENTLY_CAPTURE_RAW_VALUES").as_deref() {
+            Ok("1" | "true") => true,
+            Ok("0" | "false") => false,
+            Ok(_) => anyhow::bail!("GENTLY_CAPTURE_RAW_VALUES must be 1, 0, true or false"),
+            Err(_) => file.capture_raw_values.unwrap_or(false),
+        };
         Ok(Self {
             collector_url: env_or("GENTLY_COLLECTOR_URL", file.collector_url),
             token: env_or("GENTLY_TOKEN", file.token),
             state_dir,
+            capture_raw_values,
             prefer_quic: file.prefer_quic.unwrap_or(DEFAULT_PREFER_QUIC),
             outbox_cap: file.outbox_cap.unwrap_or(gently_store::OUTBOX_CAP),
             export_batch: file.export_batch.unwrap_or(DEFAULT_EXPORT_BATCH),
@@ -114,7 +124,7 @@ impl Config {
         );
         anyhow::ensure!(
             !self.token.is_empty(),
-            "token is not configured (set GENTLY_TOKEN or config.toml)"
+            "token is not configured (inherit GENTLY_TOKEN from agent-secrets)"
         );
         Ok(())
     }
@@ -151,6 +161,7 @@ mod tests {
 
         assert_eq!(cfg.collector_url, "https://x.workers.dev");
         assert!(cfg.prefer_quic);
+        assert!(!cfg.capture_raw_values);
         assert_eq!(cfg.outbox_cap, gently_store::OUTBOX_CAP);
         assert_eq!(cfg.export_batch, DEFAULT_EXPORT_BATCH);
         assert_eq!(cfg.export_timeout_secs, DEFAULT_EXPORT_TIMEOUT_SECS);

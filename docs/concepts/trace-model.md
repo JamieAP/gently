@@ -8,7 +8,9 @@ session                         SessionStart → SessionEnd
 └─ turn:N                       UserPromptSubmit → Stop
    ├─ tool:<id>                 PreToolUse → PostToolUse
    ├─ tool:<id>
-   └─ agent:<id>                SubagentStart → SubagentStop (best-effort link)
+   └─ agent:<id>                SubagentStart → SubagentStop
+      └─ turn:N                 subagent prompt/turn context
+         └─ tool:<id>
 ```
 
 ## Deterministic ids
@@ -17,7 +19,21 @@ Ids are pure functions of harness identifiers - the core design choice:
 
 * `trace_id = blake3(session_id)[..16]`
 * `span_id  = blake3(session_id || ":" || logical_key)[..8]`, where `logical_key`
-  is `"session"`, `"turn:N"`, `"tool:<tool_use_id>"`, or `"agent:<agent_id>"`.
+  uses the harness turn/prompt ID when available, otherwise `"turn:N"`; tools
+  use `"tool:<tool_use_id>"` and agents use `"agent:<agent_id>"`. Subagent turn and
+  tool keys include execution-agent context so they cannot collide with the
+  main thread.
+
+Claude uses `prompt_id` when present; older Claude payloads retain the monotonic
+turn-counter fallback. Codex uses `turn_id`. `agent_id` on an ordinary hook names
+the executing subagent; on `SubagentStart`/`SubagentStop` it names the lifecycle
+subject. The root session trace is shared, while subagent turns and tools parent
+under that agent. A resume or compact continuation keeps the original session
+start rather than reopening it at a later timestamp. Lifecycle hooks identify
+the child rather than its caller. A unique parent-tool reference is resolved
+against open tools throughout that root session, including subagent scopes.
+Without an unambiguous reference, nested caller context cannot be reconstructed;
+the [documented fallback](../reference/hooks.md) retains root-level parentage.
 
 Because ids are deterministic, a child span computes its `parent_span_id` without
 the parent existing yet and without any surviving local state. This is what lets
@@ -47,7 +63,8 @@ hook fires** and the turn is never opened the normal way. To keep such a turn's
 tools from dangling, the applier **back-fills a provisional turn span the first
 time *any* event references a turn** (a tool, subagent, or mark), not only
 `UserPromptSubmit`. Inferred turns carry `gently.event = "TurnInferred"` for
-transparency. (Claude opens every turn explicitly, so this never triggers there.)
+transparency. The same fallback applies when any current hook references a
+previously unseen prompt/turn ID, including subagent work.
 
 ## Effective bounds
 
@@ -82,13 +99,18 @@ capture or actual session, turn or tool completion.
 
 **Span attributes** (`gently.*`): `event`, `tool_name`, `tool_use_id`,
 `permission_mode`, and - when the harness payload carries them - `model`,
-`source` (SessionStart), `effort`, `reason` (SessionEnd), `agent_type`,
-`agent_transcript_path` (SubagentStop). Plus **digests** - `…sha256` (first 8
-bytes) + `…bytes` for tool input/response and prompts. No raw content; see
+`source` (SessionStart), `effort`, safe `reason` (SessionEnd), `agent_type`,
+`agent_transcript_path` (SubagentStop), prompt/agent context, compaction trigger,
+interrupt/error category and model-switch metadata. **Digests** use `…sha256`
+(first 8 bytes) plus `…bytes` for prompt/tool/assistant values and content-bearing
+Claude diagnostics, compaction text and batches. No raw content; see
 [Security & privacy](security-and-privacy.md).
 
 ## Durations are real
 
 A turn's duration is mostly the model thinking between and after tool calls; the
 tools are short spans nested inside it. The waterfall reflects genuine wall-clock,
-so a turn legitimately extends well past its last tool up to `Stop`.
+so a turn can extend past its last tool up to `Stop`. Claude `StopFailure` closes
+a failed turn; Codex `Interrupt` closes an interrupted turn with unset status.
+Codex opaque tool outputs also keep unset status; typed MCP `isError` results
+provide explicit success or failure. See [Harness hooks](../reference/hooks.md).

@@ -1,0 +1,54 @@
+#!/bin/sh
+# Unlock the local collector token once; keep it out of files and command arguments.
+set -eu
+
+# Resolve the installed gently-collector symlink as well as direct invocations.
+script_path=$0
+while [ -L "$script_path" ]; do
+  script_dir=$(CDPATH='' cd "$(dirname "$script_path")" && pwd)
+  script_path=$(readlink "$script_path")
+  case "$script_path" in
+  /*) ;;
+  *) script_path=$script_dir/$script_path ;;
+  esac
+done
+repo_dir=$(CDPATH='' cd "$(dirname "$script_path")/.." && pwd)
+
+node_bin=$(command -v node) || {
+  printf '%s\n' 'Node.js is required to run the local collector.' >&2
+  exit 1
+}
+python_bin=$(command -v python3) || {
+  printf '%s\n' 'Python 3 is required to supervise the local collector.' >&2
+  exit 1
+}
+gently_bin=$(command -v gently || true)
+if [ -z "$gently_bin" ]; then
+  gently_bin=$HOME/.cargo/bin/gently
+fi
+if [ ! -x "$gently_bin" ]; then
+  printf '%s\n' 'Install gently before starting the local collector.' >&2
+  exit 1
+fi
+secret_helper=$(command -v agent-secrets || true)
+if [ -z "$secret_helper" ]; then
+  secret_helper=$HOME/.local/bin/agent-secrets
+fi
+if [ ! -x "$secret_helper" ]; then
+  printf '%s\n' 'Install the agent-secrets helper before starting the collector.' >&2
+  exit 1
+fi
+if [ ! -f "$repo_dir/worker/node_modules/wrangler/bin/wrangler.js" ]; then
+  printf '%s\n' 'Install collector dependencies with npm ci in the worker directory.' >&2
+  exit 1
+fi
+
+cd "$repo_dir/worker"
+export WRANGLER_SEND_METRICS=false
+# Prevent diagnostics from persisting secret bindings, even on startup failures.
+export WRANGLER_WRITE_LOGS=false
+export WRANGLER_LOG=log
+export GENTLY_COLLECTOR_URL=http://127.0.0.1:8787
+# Unlock the allowlisted GENTLY_TOKEN once; children also inherit the foreground environment.
+exec "$secret_helper" run default -- "$python_bin" \
+  "$repo_dir/scripts/collector-supervise.py" "$node_bin" "$gently_bin" "$repo_dir"

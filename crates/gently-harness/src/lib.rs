@@ -50,6 +50,9 @@ pub struct Parsed {
     /// lifecycle events resolve the correct turn. `None` for harnesses that
     /// don't supply one (Claude), which fall back to the monotonic counter.
     pub turn_id: Option<String>,
+    /// Current execution subagent, distinct from a lifecycle event subject.
+    /// Keeps child turn/tool state separate while sharing the parent trace.
+    pub agent_id: Option<String>,
     pub ops: Vec<SpanOp>,
 }
 

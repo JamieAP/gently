@@ -38,7 +38,8 @@ resourceSpans[] → { resource{attributes[]}, scopeSpans[] → { scope, spans[] 
 `event`, `tool_name`, `tool_use_id`, `permission_mode`, and digest pairs
 `…sha256` + `…bytes` for tool input/response, prompts, and assistant messages.
 Keys are unique (close-event values win on merge). No raw content is exported;
-local CLI/MCP results can opt into SHA-based local resolution - see
+local CLI/MCP results can separately opt into SHA-based resolution of values
+previously captured with the raw-capture opt-in - see
 [Security & privacy](../concepts/security-and-privacy.md).
 
 ## Deliberate deviations
@@ -51,8 +52,8 @@ because gently owns its collector:
    reconstruction and idempotency.
 2. **Provisional-then-final double emit** of the same `span_id`, where standard
    OTel emits each span once at end. gently relies on the collector doing
-   last-write-wins by `span_id`; a backend that doesn't upsert would show
-   duplicates. The payoff is crash-durable in-flight spans, which the stable OTel
+   monotonic merging by `span_id` (earliest start, latest end, finalized content);
+   a backend that doesn't upsert would show duplicates. The payoff is crash-durable in-flight spans, which the stable OTel
    model doesn't offer.
 
 To target a standard backend: emit on close only (losing crash durability), or

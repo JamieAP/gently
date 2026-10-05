@@ -5,16 +5,8 @@
 //! set, and the unknown-event marker are identical and live here. The per-harness
 //! event vocabularies differ, so each adapter keeps its own `parse` match.
 
-use crate::{Attrs, SpanOp};
+use crate::Attrs;
 use sha2::{Digest, Sha256};
-
-/// An unmodeled or point-in-time event, recorded as an instant marker span.
-pub(crate) fn mark(raw: &serde_json::Value, event: &str) -> SpanOp {
-    SpanOp::Mark {
-        name: event.to_string(),
-        attrs: common_attrs(raw, event),
-    }
-}
 
 /// Attributes present on every hook event: the event name plus optional model,
 /// session source, permission mode and agent type when the payload carries them.
@@ -35,15 +27,32 @@ pub(crate) fn common_attrs(raw: &serde_json::Value, event: &str) -> Attrs {
     // Claude tags tool/turn events with the active effort level (the
     // effort/fast-mode dial) - captured so a breakdown can split work by it.
     // The field is an object `{"level": "medium"}`; tolerate a bare string too.
-    if let Some(level) = raw
-        .get("effort")
-        .and_then(|e| e.get("level").and_then(|l| l.as_str()).or_else(|| e.as_str()))
-    {
+    if let Some(level) = raw.get("effort").and_then(|e| {
+        e.get("level")
+            .and_then(|l| l.as_str())
+            .or_else(|| e.as_str())
+    }) {
         attrs.push(("gently.effort".into(), level.to_string()));
     }
-    // SessionEnd carries `reason` (why the session closed); only present there.
+    // Other events may use freeform reasons containing command or user text.
+    // Preserve only known lifecycle enums; hash arbitrary text.
     if let Some(reason) = str_field(raw, "reason") {
-        attrs.push(("gently.reason".into(), reason));
+        if event == "SessionEnd"
+            && matches!(
+                reason.as_str(),
+                "clear"
+                    | "logout"
+                    | "prompt_input_exit"
+                    | "bypass_permissions_disabled"
+                    | "other"
+                    | "exit"
+                    | "shutdown"
+            )
+        {
+            attrs.push(("gently.reason".into(), reason));
+        } else {
+            push_digest(&mut attrs, "gently.reason", reason.as_bytes());
+        }
     }
     // SubagentStop carries `agent_transcript_path` - the path to the subagent's
     // own transcript, so a subagent span can be traced back to its full log.
@@ -100,4 +109,20 @@ pub(crate) fn push_digest(attrs: &mut Attrs, key: &str, bytes: &[u8]) {
     let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
     attrs.push((format!("{key}.sha256"), hex));
     attrs.push((format!("{key}.bytes"), bytes.len().to_string()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn freeform_permission_reason_is_digested() {
+        let attrs = common_attrs(
+            &serde_json::json!({"reason":"secret command content"}),
+            "PermissionDenied",
+        );
+        assert!(attrs.iter().any(|(k, _)| k == "gently.reason.sha256"));
+        assert!(!attrs
+            .iter()
+            .any(|(_, v)| v.contains("secret command content")));
+    }
 }

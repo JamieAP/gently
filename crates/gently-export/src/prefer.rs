@@ -8,9 +8,9 @@
 
 use crate::{ExportError, Transport};
 
-/// Sends over `preferred` (QUIC) when present, otherwise / on failure over
-/// `fallback` (HTTP/2). Generic over both transports so the fallback logic is
-/// unit-testable with mocks.
+/// Sends over `preferred` (QUIC) when present. An absent preferred transport or
+/// a retryable failure uses `fallback` (HTTP/2); non-retryable errors return
+/// directly. Generic over both transports so the logic is testable with mocks.
 pub struct PreferQuic<P: Transport, F: Transport> {
     preferred: Option<P>,
     fallback: F,
@@ -31,6 +31,7 @@ impl<P: Transport + Sync, F: Transport + Sync> Transport for PreferQuic<P, F> {
         if let Some(preferred) = &self.preferred {
             match preferred.send(body.clone()).await {
                 Ok(()) => return Ok(()),
+                Err(e) if !e.retryable() => return Err(e),
                 Err(e) => {
                     tracing::warn!(error = %e, "QUIC send failed; falling back to HTTP/2");
                 }
@@ -69,6 +70,35 @@ mod tests {
                 Err(ExportError::Unavailable("nope".into()))
             }
         }
+    }
+
+    struct AuthFailure {
+        calls: AtomicUsize,
+    }
+    impl Transport for AuthFailure {
+        async fn send(&self, _body: Vec<u8>) -> Result<(), ExportError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ExportError::Authentication(403))
+        }
+    }
+
+    #[tokio::test]
+    async fn authentication_failure_does_not_retry_over_fallback() {
+        let t = PreferQuic::new(
+            Some(AuthFailure {
+                calls: AtomicUsize::new(0),
+            }),
+            Recorder::new(true),
+        );
+        assert!(matches!(
+            t.send(vec![1, 2, 3]).await,
+            Err(ExportError::Authentication(403))
+        ));
+        assert_eq!(
+            t.preferred.as_ref().unwrap().calls.load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(t.fallback.calls(), 0);
     }
 
     #[tokio::test]

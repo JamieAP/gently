@@ -17,17 +17,30 @@ pub use quic::QuicTransport;
 use gently_core::OtlpRequest;
 use gently_store::Store;
 
+// Bound aggregation memory and wire batches. An individual larger envelope is
+// still sent alone so the collector decides whether it is acceptable.
+const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
+
+struct PendingEnvelope {
+    id: i64,
+    request: OtlpRequest,
+    encoded_len: usize,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ExportError {
-    /// Retryable: collector unreachable, timed out, returned 5xx, or rejected on
-    /// recoverable auth/throttle grounds (401/403/408/429) - not the payload's
-    /// fault. Rows stay queued so a corrected token or a passed throttle drains
-    /// them on the next run.
+    /// Collector unreachable, timed out, returned 5xx, or throttled the request.
+    /// Rows stay queued and retrying may succeed without changing credentials.
     #[error("{0}")]
     Unavailable(String),
+    /// Valid payload, rejected credentials. Keep rows queued, but stop this run
+    /// because another request with the same token cannot fix authentication.
+    #[error("collector authentication failed (HTTP {0}); spans remain queued; relaunch exporter with the collector token")]
+    Authentication(u16),
     /// Poison: collector reached and rejected the request as genuinely
     /// unprocessable (e.g. 400/413/422) - the same bytes will never succeed, so
-    /// the offending span is quarantined rather than retried forever.
+    /// the offending envelope is quarantined rather than retried forever.
+    /// Its full bytes are retained, including any otherwise-valid sibling spans.
     #[error("collector rejected request (HTTP {0})")]
     Rejected(u16),
     #[error("store: {0}")]
@@ -35,11 +48,12 @@ pub enum ExportError {
 }
 
 impl ExportError {
-    /// Whether retrying could succeed. Only a genuine poison rejection cannot;
-    /// everything else (connection failure, timeout, 5xx, auth/throttle 4xx, a
-    /// transient store error) might.
+    /// Whether an immediate retry with the same credentials could succeed.
     pub fn retryable(&self) -> bool {
-        !matches!(self, ExportError::Rejected(_))
+        !matches!(
+            self,
+            ExportError::Rejected(_) | ExportError::Authentication(_)
+        )
     }
 }
 
@@ -58,7 +72,8 @@ pub trait Transport {
 ///
 /// Returns the number of spans successfully delivered. Trims the outbox to
 /// `cap` first, logging any drops. Queue length can exceed the cap between
-/// drains. Coalesces up to `batch_size` rows per wire request.
+/// drains. Coalesces up to `batch_size` envelopes per wire request, with a
+/// 4 MiB aggregation limit. A larger individual envelope is sent alone.
 pub async fn drain<T: Transport>(
     store: &Store,
     transport: &T,
@@ -67,18 +82,35 @@ pub async fn drain<T: Transport>(
 ) -> Result<usize, ExportError> {
     let dropped = store.outbox_trim(cap)?;
     if dropped > 0 {
-        tracing::warn!(dropped, "outbox over capacity; dropped oldest spans");
+        tracing::warn!(dropped, "outbox over capacity; dropped oldest envelopes");
     }
 
     let mut delivered = 0usize;
     loop {
-        let batch = store.outbox_take_batch(batch_size)?;
-        if batch.is_empty() {
+        let stored = store.outbox_take_batch(batch_size)?;
+        if stored.is_empty() {
             break;
         }
-        // Resolve the batch by bisection: a 2xx delivers a slice; a 4xx on a
-        // slice of one quarantines that poison span; a 4xx on a larger slice
-        // splits it to isolate the culprit without dropping good spans. A
+        let mut batch = Vec::with_capacity(stored.len());
+        for (id, json) in stored {
+            match serde_json::from_str::<OtlpRequest>(&json) {
+                Ok(request) => batch.push(PendingEnvelope {
+                    id,
+                    request,
+                    encoded_len: json.len(),
+                }),
+                Err(_) => {
+                    // Keep malformed bytes for inspection, with a fixed reason
+                    // that cannot echo the payload or a credential it contains.
+                    store.outbox_quarantine(&[id], "invalid queued OTLP envelope JSON")?;
+                    tracing::warn!(id, "invalid queued OTLP envelope; quarantined");
+                }
+            }
+        }
+        // Resolve envelope batches by bisection: a 2xx delivers a slice; a
+        // payload rejection on one envelope quarantines it; a rejection on a larger slice
+        // splits it to isolate the rejected envelope. Its full contents are
+        // retained in quarantine; there is no per-span split within a row. A
         // retryable error (collector down / 5xx / timeout) aborts the whole run
         // - the rows stay queued and the next run (or the cmd_export backoff
         // loop) retries them.
@@ -88,19 +120,34 @@ pub async fn drain<T: Transport>(
                 continue;
             }
             let slice = &batch[lo..hi];
-            match transport.send(coalesce(slice)).await {
+            if slice.len() > 1
+                && slice.iter().map(|row| row.encoded_len).sum::<usize>() > MAX_BATCH_BYTES
+            {
+                let mid = lo + (hi - lo) / 2;
+                stack.push((lo, mid));
+                stack.push((mid, hi));
+                continue;
+            }
+            let (body, span_count) = coalesce(slice);
+            if slice.len() > 1 && body.len() > MAX_BATCH_BYTES {
+                let mid = lo + (hi - lo) / 2;
+                stack.push((lo, mid));
+                stack.push((mid, hi));
+                continue;
+            }
+            match transport.send(body).await {
                 Ok(()) => {
-                    let ids: Vec<i64> = slice.iter().map(|(id, _)| *id).collect();
+                    let ids: Vec<i64> = slice.iter().map(|row| row.id).collect();
                     store.outbox_delete(&ids)?;
-                    delivered += slice.len();
+                    delivered += span_count;
                 }
-                Err(e) if e.retryable() => {
-                    tracing::warn!(error = %e, pending = slice.len(), "export unavailable; will retry");
+                Err(e) if !matches!(e, ExportError::Rejected(_)) => {
+                    tracing::warn!(error = %e, pending = slice.len(), "export paused; rows remain queued");
                     return Err(e);
                 }
                 Err(e) if hi - lo == 1 => {
-                    let id = slice[0].0;
-                    tracing::error!(error = %e, id, "collector rejected span; quarantining (poison)");
+                    let id = slice[0].id;
+                    tracing::error!(error = %e, id, "collector rejected envelope; quarantining (poison)");
                     store.outbox_quarantine(&[id], &e.to_string())?;
                 }
                 Err(_rejected) => {
@@ -114,15 +161,14 @@ pub async fn drain<T: Transport>(
     Ok(delivered)
 }
 
-/// Parse each stored single-span OTLP request and merge them into one body.
-/// Rows that fail to parse are skipped (they cannot block the rest).
-fn coalesce(batch: &[(i64, String)]) -> Vec<u8> {
-    let reqs: Vec<OtlpRequest> = batch
-        .iter()
-        .filter_map(|(_, json)| serde_json::from_str(json).ok())
-        .collect();
-    let merged = OtlpRequest::merge(reqs);
-    serde_json::to_vec(&merged).unwrap_or_else(|_| b"{\"resourceSpans\":[]}".to_vec())
+/// Merge parsed envelopes and count the actual spans in the serialized request.
+fn coalesce(batch: &[PendingEnvelope]) -> (Vec<u8>, usize) {
+    let merged = OtlpRequest::merge(batch.iter().map(|row| row.request.clone()).collect());
+    let count = merged.span_count();
+    (
+        serde_json::to_vec(&merged).expect("OTLP request serializes"),
+        count,
+    )
 }
 
 #[cfg(test)]
@@ -138,18 +184,25 @@ mod tests {
     }
 
     fn enqueue_span(s: &Store, key: &str) {
-        let span = Span {
-            trace_id: TraceId::from_session("s"),
-            span_id: SpanId::derive("s", key),
-            parent_span_id: None,
-            name: key.into(),
-            kind: SpanKind::Internal,
-            start_unix_nano: 1,
-            end_unix_nano: 2,
-            status: Status::Ok,
-            attributes: vec![],
-        };
-        let req = OtlpRequest::single(&Resource::new("s", "claude-code", "/w"), vec![span]);
+        enqueue_envelope(s, &[key]);
+    }
+
+    fn enqueue_envelope(s: &Store, keys: &[&str]) {
+        let spans = keys
+            .iter()
+            .map(|key| Span {
+                trace_id: TraceId::from_session("s"),
+                span_id: SpanId::derive("s", key),
+                parent_span_id: None,
+                name: (*key).into(),
+                kind: SpanKind::Internal,
+                start_unix_nano: 1,
+                end_unix_nano: 2,
+                status: Status::Ok,
+                attributes: vec![],
+            })
+            .collect();
+        let req = OtlpRequest::single(&Resource::new("s", "claude-code", "/w"), spans);
         s.outbox_enqueue(&serde_json::to_string(&req).unwrap())
             .unwrap();
     }
@@ -172,6 +225,96 @@ mod tests {
                 .fetch_add(req.span_count(), Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn mixed_single_and_multispan_envelopes_count_delivered_spans() {
+        let (_d, s) = store();
+        enqueue_span(&s, "old-single");
+        enqueue_envelope(&s, &["session", "turn", "tool", "terminal"]);
+        let t = FlakyTransport {
+            calls: AtomicUsize::new(0),
+            fail_n: 0,
+            spans_received: AtomicUsize::new(0),
+        };
+        assert_eq!(drain(&s, &t, 10_000, 512).await.unwrap(), 5);
+        assert_eq!(t.spans_received.load(Ordering::SeqCst), 5);
+        assert_eq!(t.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(s.outbox_len().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn malformed_envelopes_are_quarantined_without_losing_good_rows() {
+        let (_directory, store) = store();
+        store
+            .outbox_enqueue("malformed synthetic-sensitive-payload")
+            .unwrap();
+        enqueue_span(&store, "good-single");
+        enqueue_envelope(&store, &["good-turn", "good-tool"]);
+        let transport = FlakyTransport {
+            calls: AtomicUsize::new(0),
+            fail_n: 0,
+            spans_received: AtomicUsize::new(0),
+        };
+        assert_eq!(drain(&store, &transport, 10_000, 512).await.unwrap(), 3);
+        assert_eq!(store.outbox_len().unwrap(), 0);
+        assert_eq!(store.quarantine_len().unwrap(), 1);
+        assert_eq!(transport.spans_received.load(Ordering::SeqCst), 3);
+    }
+
+    struct ByteRecorder {
+        calls: AtomicUsize,
+        largest_body: AtomicUsize,
+    }
+    impl Transport for ByteRecorder {
+        async fn send(&self, body: Vec<u8>) -> Result<(), ExportError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.largest_body.fetch_max(body.len(), Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn aggregated_payload_is_split_before_exceeding_wire_byte_limit() {
+        let (_directory, store) = store();
+        let large_name = "synthetic".repeat(280_000);
+        enqueue_span(&store, &large_name);
+        enqueue_span(&store, &large_name);
+        let transport = ByteRecorder {
+            calls: AtomicUsize::new(0),
+            largest_body: AtomicUsize::new(0),
+        };
+        assert_eq!(drain(&store, &transport, 10_000, 512).await.unwrap(), 2);
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 2);
+        assert!(transport.largest_body.load(Ordering::SeqCst) <= 4 * 1024 * 1024);
+        assert_eq!(store.outbox_len().unwrap(), 0);
+    }
+
+    struct AuthenticationRejector {
+        calls: AtomicUsize,
+    }
+    impl Transport for AuthenticationRejector {
+        async fn send(&self, _body: Vec<u8>) -> Result<(), ExportError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ExportError::Authentication(401))
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_failure_preserves_entire_batch_without_bisection_or_quarantine() {
+        let (_d, s) = store();
+        enqueue_span(&s, "old-single");
+        enqueue_envelope(&s, &["session", "turn", "tool"]);
+        let t = AuthenticationRejector {
+            calls: AtomicUsize::new(0),
+        };
+        assert!(matches!(
+            drain(&s, &t, 10_000, 512).await,
+            Err(ExportError::Authentication(401))
+        ));
+        assert_eq!(t.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(s.outbox_len().unwrap(), 2);
+        assert_eq!(s.quarantine_len().unwrap(), 0);
     }
 
     /// Rejects (400) any batch containing a span named "poison".
@@ -206,6 +349,18 @@ mod tests {
         assert_eq!(delivered, 2);
         assert_eq!(s.outbox_len().unwrap(), 0, "queue drained");
         assert_eq!(s.quarantine_len().unwrap(), 1, "poison span quarantined");
+    }
+
+    #[tokio::test]
+    async fn rejected_multispan_envelope_is_retained_as_one_quarantine_item() {
+        let (_directory, store) = store();
+        enqueue_envelope(&store, &["good1", "poison", "good2"]);
+        assert_eq!(
+            drain(&store, &PoisonRejector, 10_000, 512).await.unwrap(),
+            0
+        );
+        assert_eq!(store.outbox_len().unwrap(), 0);
+        assert_eq!(store.quarantine_len().unwrap(), 1);
     }
 
     #[tokio::test]

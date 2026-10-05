@@ -1,6 +1,7 @@
 //! Pending-span tracking and the per-session turn counter.
 
 use crate::{Result, Store};
+use rusqlite::OptionalExtension;
 
 /// A span recorded at its opening event, awaiting its closing event.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,8 +38,8 @@ impl Store {
         Ok(())
     }
 
-    /// Remove and return the open span for `(session, logical_key)`, if any.
-    pub fn take_open(&self, session_id: &str, logical_key: &str) -> Result<Option<OpenSpan>> {
+    /// Inspect an open span without consuming its lifecycle state.
+    pub fn peek_open(&self, session_id: &str, logical_key: &str) -> Result<Option<OpenSpan>> {
         let row = self
             .conn
             .query_row(
@@ -58,7 +59,43 @@ impl Store {
                     })
                 },
             )
-            .ok();
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Find a referenced open span in a root and its exact child-scope prefix.
+    /// Ambiguous references return None rather than choosing an execution agent.
+    /// A literal prefix comparison avoids interpreting harness IDs as SQL patterns.
+    pub fn unique_open_span_id_in_scopes(
+        &self,
+        root_session_id: &str,
+        child_scope_prefix: &str,
+        logical_key: &str,
+    ) -> Result<Option<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT span_id FROM open_spans
+             WHERE logical_key = ?1 AND
+               (session_id = ?2 OR substr(session_id, 1, length(?3)) = ?3)
+             LIMIT 2",
+        )?;
+        let mut rows = statement.query(rusqlite::params![
+            logical_key,
+            root_session_id,
+            child_scope_prefix
+        ])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let span_id = row.get(0)?;
+        if rows.next()?.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(span_id))
+    }
+
+    /// Remove and return the open span for `(session, logical_key)`, if any.
+    pub fn take_open(&self, session_id: &str, logical_key: &str) -> Result<Option<OpenSpan>> {
+        let row = self.peek_open(session_id, logical_key)?;
         if row.is_some() {
             self.conn.execute(
                 "DELETE FROM open_spans WHERE session_id = ?1 AND logical_key = ?2",
@@ -68,10 +105,27 @@ impl Store {
         Ok(row)
     }
 
+    /// Reopen a session, turn or agent while retaining its earliest start and
+    /// original parent. SQLite performs the minimum atomically across hooks.
+    pub fn reopen_provisional(&self, s: &OpenSpan) -> Result<OpenSpan> {
+        self.conn.execute(
+            "INSERT INTO open_spans
+             (session_id, logical_key, span_id, parent_span_id, name, kind, start_unix_nano, attrs_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(session_id, logical_key) DO UPDATE SET
+               start_unix_nano = MIN(open_spans.start_unix_nano, excluded.start_unix_nano),
+               parent_span_id = COALESCE(open_spans.parent_span_id, excluded.parent_span_id),
+               attrs_json = excluded.attrs_json",
+            rusqlite::params![s.session_id, s.logical_key, s.span_id, s.parent_span_id,
+                s.name, s.kind, s.start_unix_nano as i64, s.attrs_json],
+        )?;
+        self.peek_open(&s.session_id, &s.logical_key)?
+            .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows.into())
+    }
+
     /// Drop provisional open spans whose start is older than `cutoff_unix_nano`,
-    /// returning how many were removed. A span's closing event may never arrive.
-    /// Codex emits no `SessionEnd`, and fires no `Stop` for a turn interrupted
-    /// with Esc (openai/codex#22858), so session and turn rows would otherwise
+    /// returning how many were removed. A span's closing event may never arrive
+    /// during crashes, older harness releases, or disabled hooks, so rows would otherwise
     /// accumulate without bound. Provisional spans are queued for export on
     /// open; delivery is not assured. This only bounds local bookkeeping growth
     /// without inventing an end. A later close may no longer recover the original

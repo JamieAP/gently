@@ -5,8 +5,9 @@ description: Distributed tracing for coding agents.
 # Gently documentation
 
 Gently records Claude Code and Codex sessions as OpenTelemetry traces. Hooks store
-spans in a local SQLite outbox, a detached exporter sends them to a Cloudflare
-Worker backed by D1, and CLI or MCP queries let you inspect the recorded activity.
+spans in a local SQLite outbox. A token-bearing detached exporter or
+`gently export --watch` sends them to a Cloudflare Worker backed by D1, and CLI
+or MCP queries let you inspect the recorded activity.
 
 ## Getting started
 
@@ -25,13 +26,15 @@ inside Codex.
 The [architecture guide](concepts/architecture.md) describes the hook, local store,
 exporter, and collector. The [trace model](concepts/trace-model.md) explains how
 session, turn, tool, and subagent spans relate, including provisional spans and
-updates with the same span ID.
+updates with the same span ID. The [hook reference](reference/hooks.md) lists
+current Claude and Codex lifecycle mappings and prompt/subagent context.
 
 ## Privacy and access
 
 Normal exports contain digests and metadata, including local paths and host
-information. Selected raw values remain in local plaintext storage. Resolving
-those values through CLI or MCP is opt-in; raw MCP results may enter the calling
+information. Raw-value capture is off by default; an explicit capture opt-in
+can store selected values in local plaintext storage. Resolving those values
+through CLI or MCP requires a separate opt-in; raw MCP results may enter the calling
 agent's model-provider context. The collector's shared bearer token grants
 access to all traces.
 

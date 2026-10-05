@@ -14,11 +14,13 @@ effort level, close reason, agent type, and agent transcript path. This metadata
 can reveal projects, local paths, activity patterns, and the tools/models used.
 Only export traces to a collector you control and are allowed to use.
 
-Selected raw prompts, tool inputs/responses, and assistant messages are stored
-locally in `~/.gently/state.db`, keyed by digest. They can include credentials or
-confidential source material from a session. This storage is enabled in the hook
-and has no automatic retention limit; protecting or deleting local state is an
-operator responsibility.
+Raw capture is disabled by default. Setting `capture_raw_values = true` in
+config or `GENTLY_CAPTURE_RAW_VALUES=1` on the hook process stores selected
+prompts, tool inputs/responses and assistant messages locally in
+`~/.gently/state.db`, keyed by digest. This plaintext can include credentials or
+confidential source material. It has no automatic retention limit. Disabling
+capture stops new writes and does not remove existing values, including values
+captured by earlier versions.
 
 CLI/MCP queries return collector digest attributes by default. Explicitly set
 `GENTLY_RESOLVE_LOCAL_SHA_RAW_VALUES=1` on a query process to add matching local
@@ -26,13 +28,15 @@ raw attributes. `gently init --claude` and `gently init --codex` leave this disa
 The `--resolve-local-raw-values` install option enables it for the registered MCP
 server; re-running init without the option removes that setting. If MCP is used
 inside an agent, resolved values may enter that agent's model-provider context.
+Resolution does not enable capture: it only retrieves values already present.
 
-Setting `GENTLY_DEBUG` to any value additionally saves full hook payloads to
-`~/.gently/raw/<harness>/<Event>.jsonl` and an environment snapshot at
-`raw/<harness>/env.json`. Environment keys containing KEY, TOKEN, SECRET,
-PASSWORD, AUTH, or CREDENTIAL are masked; this name-based list cannot identify
-all sensitive values. Debug capture is disabled by default and has no retention
-limit. Disable it after diagnosis and review/delete captured files as needed.
+`GENTLY_DEBUG=1` saves full hook payloads to
+`~/.gently/raw/<harness>/<Event>.jsonl` only when raw capture is also explicitly
+enabled. Gently never generates process-environment snapshots. Existing debug
+files, including environment snapshots made by older versions, are not deleted
+automatically. Disable capture after diagnosis and review/delete existing files
+as needed. Full payloads can contain sensitive content and have no retention
+limit.
 
 ## Local files
 
@@ -54,7 +58,13 @@ The Worker requires `Authorization: Bearer <GENTLY_TOKEN>` on its routes; the
 single shared token grants access to all traces. Configure it as a Cloudflare
 secret and in your private local config/environment, not in `wrangler.toml`.
 The repository contains a placeholder D1 database identifier to replace when
-you create your own database.
+you create your own database. Authentication failures stop export immediately
+without dropping or quarantining the queue.
+
+For a hardware-bound local token, unlock once from a foreground terminal.
+A desktop/background hook cannot present that interaction reliably: it records
+locally when no token is inherited. A token-bearing export watcher can drain
+those records without prompting inside hooks. See [Local setup](../../LOCAL_SETUP.md).
 
 The collector relies on Cloudflare's service controls for data at rest. This
 project does not implement tenant separation, an IP allowlist, mTLS, or automatic

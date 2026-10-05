@@ -14,17 +14,25 @@ The project is pre-1.0; pending changes appear under Unreleased.
 - Create provisional turn spans when events reference a turn before its opening
   event has arrived.
 - Reap open-span tracking rows older than a day.
-- Separate debug captures by agent and filter environment snapshots by variable
-  name.
+- Separate debug captures by agent; explicit raw capture and debug capture are
+  both required, and environment snapshots are no longer collected.
+- Add a persistent export watcher and local collector launchers that unlock a
+  hardware-backed token once in a foreground terminal.
+- Capture the current Claude Code and Codex hook events, including session end,
+  interruption, compaction, and execution-agent context.
 
 ### Changed
 
 - Merge report time bounds and choose content by the latest report timestamp.
-- Retry authentication and throttling responses (`401`, `403`, `408`, `429`),
-  while isolating and quarantining unprocessable spans from rejected batches
-  (`400`, `413`, `422`).
-- Document Codex hook gaps where session-end, stop-failure, and exit-code events
-  are unavailable.
+- Stop immediately on authentication rejection (`401`, `403`), preserving the
+  queue for a later authenticated export. Retry transient failures with backoff
+  and quarantine unprocessable envelopes (`400`, `413`, `422`).
+- Queue one envelope per hook event and reuse export clients in watch mode;
+  hooks without a token only queue locally.
+- Disable local raw-value capture by default, with a separate opt-in for MCP
+  resolution of captured values.
+- Document current hook mappings and preserve unset tool status when Codex
+  output supplies no typed success or failure signal.
 
 ### Fixed
 
@@ -32,3 +40,6 @@ The project is pre-1.0; pending changes appear under Unreleased.
 - Calculate trace bounds without recursive subtree queries.
 - Link tool spans to inferred turns during Codex continuation.
 - Preserve a resumed session's original start and derive its full trace window.
+- Scope turn and tool tracking to execution agents while retaining the root
+  session trace and nesting lifecycle spans under their parent tools.
+- Quarantine malformed outbox JSON without blocking subsequent valid envelopes.

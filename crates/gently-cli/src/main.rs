@@ -42,7 +42,14 @@ enum Command {
         harness: HarnessKind,
     },
     /// Drain the local outbox to the collector.
-    Export,
+    Export {
+        /// Keep draining new hook events after one secret-store unlock.
+        #[arg(long)]
+        watch: bool,
+        /// Seconds between drains in watch mode.
+        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=60))]
+        interval_secs: u64,
+    },
     /// Show local exporter health and queue depth.
     Status,
     /// Run the MCP stdio server exposing trace queries.
@@ -143,10 +150,23 @@ fn main() {
 fn dispatch(command: Command) -> anyhow::Result<()> {
     match command {
         Command::Hook { .. } => unreachable!("handled in main"),
-        Command::Export => cmd_export::run(),
+        Command::Export {
+            watch,
+            interval_secs,
+        } => {
+            if watch {
+                cmd_export::watch(interval_secs)
+            } else {
+                cmd_export::run()
+            }
+        }
         Command::Status => cmd_status::run(),
         Command::Mcp => cmd_mcp::run(),
-        Command::Init { claude: _, codex, resolve_local_raw_values } => {
+        Command::Init {
+            claude: _,
+            codex,
+            resolve_local_raw_values,
+        } => {
             if codex {
                 cmd_init::run_codex(resolve_local_raw_values)
             } else {
