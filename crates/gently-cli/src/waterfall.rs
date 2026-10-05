@@ -194,7 +194,7 @@ pub(crate) fn render(rows: &[SpanRow]) -> Result<String> {
     writeln!(
         output,
         "{} ─  {}┼{}┤",
-        "─".repeat(9),
+        "─".repeat(10),
         "─".repeat(LABEL_WIDTH),
         "─".repeat(WIDTH)
     )?;
@@ -320,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_the_python_layout_and_integrity_summary() {
+    fn renders_the_waterfall_layout_and_integrity_summary() {
         let session = row("s", "session", 0, Some(1_000_000_000), None);
         let mut turn = row("t", "turn:1", 50_000_000, Some(950_000_000), Some("s"));
         turn.status = 0;
@@ -342,7 +342,7 @@ mod tests {
                 "  children nest within parent : PASS ✓ (0 violations)\n",
             ),
             " ".repeat(46),
-            "─".repeat(9),
+            "─".repeat(10),
             "─".repeat(26),
             "─".repeat(56),
             "█".repeat(56),
@@ -599,6 +599,30 @@ mod tests {
                 assert_eq!(UnicodeWidthStr::width(prefix), 40, "{prefix:?}");
                 assert_eq!(UnicodeWidthStr::width(bar(line)), 56);
             }
+        }
+    }
+
+    #[test]
+    fn header_separator_and_spans_align_both_timeline_borders() {
+        let session = row("s", "session", 0, Some(1_000_000_000), None);
+        let child = row(
+            "b",
+            "界e\u{301}👩\u{200d}💻",
+            100_000_000,
+            Some(300_000_000),
+            Some("s"),
+        );
+        let output = render(&[session, child]).unwrap();
+        let border_columns = |line: &str| {
+            line.char_indices()
+                .filter(|(_, ch)| matches!(ch, '│' | '┼' | '┤'))
+                .map(|(index, _)| UnicodeWidthStr::width(&line[..index]))
+                .collect::<Vec<_>>()
+        };
+        let expected = border_columns(output.lines().next().unwrap());
+        assert_eq!(expected.len(), 2);
+        for line in output.lines().take_while(|line| !line.is_empty()) {
+            assert_eq!(border_columns(line), expected, "misaligned line: {line}");
         }
     }
 

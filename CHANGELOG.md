@@ -41,6 +41,7 @@ The project is pre-1.0; pending changes appear under Unreleased.
 
 ### Fixed
 
+- Align the waterfall separator with the header and span timeline borders.
 - Keep valid spans eligible for retry after authentication rejection.
 - Calculate trace bounds without recursive subtree queries.
 - Link tool spans to inferred turns during Codex continuation.
