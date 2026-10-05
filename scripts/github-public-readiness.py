@@ -24,10 +24,8 @@ SELECTED = {"github_owned_allowed": True, "verified_allowed": False, "patterns_a
 WORKFLOW = {"default_workflow_permissions": "read", "can_approve_pull_request_reviews": False}
 FORK = {"approval_policy": "all_external_contributors"}
 ACTIVE_STATUSES = ("in_progress", "queued", "waiting", "requested", "pending")
-CI_CONDITION = ("github.repository == 'JamieAP/gently' && github.actor == 'JamieAP' && "
-                "(github.event_name != 'pull_request' || (github.event.pull_request.user.login == 'JamieAP' "
-                "&& github.event.pull_request.head.repo.full_name == 'JamieAP/gently'))")
-PAGES_CONDITION = "github.repository == 'JamieAP/gently' && github.ref == 'refs/heads/main' && github.actor == 'JamieAP'"
+CI_CONDITION = "github.repository == 'JamieAP/gently' && github.actor == 'JamieAP' && github.triggering_actor == 'JamieAP' && (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main')"
+PAGES_CONDITION = "github.repository == 'JamieAP/gently' && github.ref == 'refs/heads/main' && github.actor == 'JamieAP' && github.triggering_actor == 'JamieAP'"
 
 
 def block(text, name, indent):
@@ -174,12 +172,15 @@ class Guard:
             raise GuardError("CODEOWNERS must assign every file to JamieAP")
         for name in FILES[:2]:
             text = self.files.get(name, "")
-            if re.search(r"\b(pull_request_target|workflow_run|issue_comment|issues|discussion_comment|repository_dispatch|self-hosted)\b", text):
+            if re.search(r"\b(pull_request|pull_request_target|workflow_run|issue_comment|issues|discussion_comment|repository_dispatch|self-hosted)\b", text):
                 raise GuardError("A reviewed workflow contains a prohibited trigger or self-hosted runner")
             if "secrets." in text or re.search(r"secrets\s*\[", text):
                 raise GuardError("Public workflows must not reference stored secrets")
             if block(text, "permissions", 0).strip() != "contents: read":
                 raise GuardError("Workflow default permissions must contain only contents: read")
+            triggers = re.findall(r"(?m)^  ([A-Za-z0-9_-]+):", block(text, "on", 0))
+            if sorted(triggers) != ["push", "workflow_dispatch"]:
+                raise GuardError("Only owner pushes and manual workflow dispatch are permitted")
             jobs = block(text, "jobs", 0)
             expected = ["validate"] if name.endswith("ci.yml") else ["build", "deploy"]
             if re.findall(r"(?m)^  ([A-Za-z0-9_-]+):$", jobs) != expected:
@@ -207,15 +208,16 @@ class Guard:
             if name.endswith("ci.yml") and re.search(r":\s*write\b", text):
                 raise GuardError("CI must have no write permissions")
 
-    def policy_issues(self, user, expect_enabled=True):
+    def policy_issues(self, user, expect_enabled=True, check_actions=True):
         issues = []
-        actions = self.get("actions/permissions")
-        if actions.get("enabled") is not expect_enabled or any(actions.get(k) != v for k, v in ACTIONS.items()):
-            issues.append("Actions must use selected GitHub-owned actions, full SHA pins, and the expected enabled state")
-        if actions.get("allowed_actions") == "selected":
-            selected = self.get("actions/permissions/selected-actions")
-            if any(selected.get(k) != v for k, v in SELECTED.items()):
-                issues.append("Only GitHub-owned actions may be allowed; verified creators and extra patterns must be disabled")
+        if check_actions:
+            actions = self.get("actions/permissions")
+            if actions.get("enabled") is not expect_enabled or any(actions.get(k) != v for k, v in ACTIONS.items()):
+                issues.append("Actions must use selected GitHub-owned actions, full SHA pins, and the expected enabled state")
+            if actions.get("allowed_actions") == "selected":
+                selected = self.get("actions/permissions/selected-actions")
+                if any(selected.get(k) != v for k, v in SELECTED.items()):
+                    issues.append("Only GitHub-owned actions may be allowed; verified creators and extra patterns must be disabled")
         workflow = self.get("actions/permissions/workflow")
         if any(workflow.get(k) != v for k, v in WORKFLOW.items()):
             issues.append("Default workflow token must be read-only and unable to approve pull requests")
@@ -350,10 +352,10 @@ class Guard:
             self.inventory()
             self.reviewed_workflows(reviewed_main_sha)
             branch, bindings = self.branch_update()
-            self.put("actions/permissions", {"enabled": False, **ACTIONS})
             self.put("actions/permissions/workflow", WORKFLOW)
-            self.put("actions/permissions/selected-actions", SELECTED)
             self.put("actions/permissions/fork-pr-contributor-approval", FORK)
+            if self.get("actions/permissions/fork-pr-contributor-approval").get("approval_policy") != FORK["approval_policy"]:
+                raise GuardError("External-contributor approval must be confirmed before Actions can be enabled")
             self.put("branches/main/protection", branch)
             readback = self.get("branches/main/protection").get("required_status_checks") or {}
             returned = {check["context"]: check.get("app_id") for check in readback.get("checks", [])}
@@ -374,10 +376,11 @@ class Guard:
                          body={"name": "main", "type": "branch"})
             self.inventory()
             self.reviewed_workflows(reviewed_main_sha)
-            issues = self.policy_issues(user, expect_enabled=False)
+            issues = self.policy_issues(user, expect_enabled=False, check_actions=False)
             if issues:
                 raise GuardError("; ".join(issues))
             self.put("actions/permissions", {"enabled": True, **ACTIONS})
+            self.put("actions/permissions/selected-actions", SELECTED)
             self.identity()
             self.inventory()
             self.reviewed_workflows(reviewed_main_sha)
@@ -405,7 +408,7 @@ def main():
     args = parser.parse_args()
     if args.plan:
         print("Target: JamieAP/gently, main. No visibility or credential changes.")
-        print("Apply disables Actions first, verifies owner-only access and reviewed main workflows, sets read-only tokens and owner approval gates, then verifies before enabling.")
+        print("Apply disables Actions first, verifies owner-only access and reviewed main workflows, sets read-only tokens and owner approval gates, verifies owner approval and deployment gates before enabling, then reads back Actions policies.")
         print("Manual prerequisites: review all installed GitHub Apps; disable github-pages administrator bypass; merge and review workflow hardening on main.")
         return 0
     root = Path(__file__).resolve().parent.parent

@@ -19,14 +19,13 @@ SHA = "a" * 40
 FILES = {
     ".github/workflows/ci.yml": """name: code
 on:
-  pull_request:
   push:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   validate:
-    if: github.repository == 'JamieAP/gently' && github.actor == 'JamieAP' && (github.event_name != 'pull_request' || (github.event.pull_request.user.login == 'JamieAP' && github.event.pull_request.head.repo.full_name == 'JamieAP/gently'))
+    if: github.repository == 'JamieAP/gently' && github.actor == 'JamieAP' && github.triggering_actor == 'JamieAP' && (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -41,14 +40,14 @@ permissions:
   contents: read
 jobs:
   build:
-    if: github.repository == 'JamieAP/gently' && github.ref == 'refs/heads/main' && github.actor == 'JamieAP'
+    if: github.repository == 'JamieAP/gently' && github.ref == 'refs/heads/main' && github.actor == 'JamieAP' && github.triggering_actor == 'JamieAP'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
         with:
           persist-credentials: false
   deploy:
-    if: github.repository == 'JamieAP/gently' && github.ref == 'refs/heads/main' && github.actor == 'JamieAP'
+    if: github.repository == 'JamieAP/gently' && github.ref == 'refs/heads/main' && github.actor == 'JamieAP' && github.triggering_actor == 'JamieAP'
     permissions:
       pages: write
       id-token: write
@@ -111,13 +110,19 @@ class FakeAPI:
                     "content": base64.b64encode(self.files[name].encode()).decode()}
         if suffix == "actions/permissions":
             if method == "PUT":
+                if body.get("enabled") is False and any(k in body for k in ("allowed_actions", "sha_pinning_required")):
+                    raise guard_module.GuardError("Policy updates require enabled Actions", status=422)
                 self.actions.update(body)
                 return None
-            return copy.deepcopy(self.actions)
+            return copy.deepcopy(self.actions) if self.actions["enabled"] else {"enabled": False}
         if suffix == "actions/permissions/selected-actions":
             if method == "PUT":
+                if not self.actions["enabled"]:
+                    raise guard_module.GuardError("Selected policies are hidden while disabled", status=404)
                 self.selected = copy.deepcopy(body)
                 return None
+            if not self.actions["enabled"]:
+                raise guard_module.GuardError("Selected policies are hidden while disabled", status=404)
             return copy.deepcopy(self.selected)
         if suffix == "actions/permissions/workflow":
             if method == "PUT":
@@ -202,7 +207,9 @@ class ReadinessTests(unittest.TestCase):
         self.apply()
         writes = [(method, path, body) for method, path, body in self.api.calls if method != "GET"]
         self.assertEqual(writes[0][2]["enabled"], False)
-        self.assertEqual(writes[-1][2]["enabled"], True)
+        self.assertTrue(self.api.actions["enabled"])
+        first_enable = next(i for i,(method,path,body) in enumerate(self.api.calls) if method == "PUT" and body and body.get("enabled") is True)
+        self.assertTrue(any(method == "GET" and path.endswith("fork-pr-contributor-approval") for method,path,body in self.api.calls[:first_enable]))
         self.assertEqual(self.guard.check(reviewed_main_sha=SHA, apps_reviewed=True), [])
 
     def test_public_check_requires_explicit_full_reviewed_commit(self):
@@ -274,7 +281,7 @@ class ReadinessTests(unittest.TestCase):
                                      for method, path, body in self.api.calls))
 
     def test_remote_workflow_or_main_drift_leaves_actions_disabled(self):
-        for change in (lambda: self.api.files[".github/workflows/ci.yml"].replace("pull_request:", "pull_request_target:"),
+        for change in (lambda: self.api.files[".github/workflows/ci.yml"].replace("workflow_dispatch:", "pull_request_target:"),
                        lambda: "b" * 40):
             with self.subTest(change=change):
                 self.setUp()
@@ -287,7 +294,7 @@ class ReadinessTests(unittest.TestCase):
                 self.assertFalse(self.api.actions["enabled"])
 
     def test_unsafe_local_reviewed_workflow_is_rejected(self):
-        for old, new in (("pull_request:", "pull_request_target:"),
+        for old, new in (("workflow_dispatch:", "pull_request_target:"),
                          ("actions/checkout@" + SHA, "actions/checkout@v4"),
                          ("actions/checkout@" + SHA, "outsider/action@" + SHA),
                          ("ubuntu-latest", "self-hosted"),
@@ -333,7 +340,8 @@ class ReadinessTests(unittest.TestCase):
                 with self.assertRaises(guard_module.GuardError):
                     self.apply()
                 self.assertFalse(self.api.actions["enabled"])
-                self.assertFalse(any(body and body.get("enabled") is True for method, path, body in self.api.calls if method == "PUT"))
+                if any(body and body.get("enabled") is True for method,path,body in self.api.calls if method == "PUT"):
+                    self.assertEqual(self.api.fork["approval_policy"], "all_external_contributors")
 
     def test_failure_after_enable_disables_again(self):
         enabled_once = False

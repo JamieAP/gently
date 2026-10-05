@@ -1,7 +1,6 @@
 name: code
 
 on:
-  pull_request:
   push:
     branches: [main]
   workflow_dispatch:
@@ -15,10 +14,7 @@ concurrency:
 
 jobs:
   validate:
-    # Outside submissions are data for owner review, not permission to run code.
-    # Repository-level approval for ALL external contributors is also required:
-    # a PR can propose changes to this workflow and remove a job-level guard.
-    if: github.repository == 'JamieAP/gently' && github.actor == 'JamieAP' && (github.event_name != 'pull_request' || (github.event.pull_request.user.login == 'JamieAP' && github.event.pull_request.head.repo.full_name == 'JamieAP/gently'))
+    if: github.repository == 'JamieAP/gently' && github.actor == 'JamieAP' && github.triggering_actor == 'JamieAP' && (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main')
     strategy:
       fail-fast: false
       matrix:
