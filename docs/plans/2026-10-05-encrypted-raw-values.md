@@ -126,6 +126,15 @@ regressions that failed before the fix and pass afterward. The staging runner
 keeps host credentials in memory, records only public recovery IDs, and cleans
 up owned resources after normal completion or controlled interruption.
 
+Real staging run `ab07a51c92c4e2d9` passes against the Cloudflare edge and remote
+D1: both harnesses, keyless export, independent software CLI/MCP readers,
+recovery signing, shared-ID tenant isolation, host ownership/capabilities,
+ciphertext opacity, raw 409 quarantine/retry, recipient revocation and historical
+access, live bearer rotation/revocation and durable queue recovery. Local scans
+and remote opaque-value scans find no raw canaries. Inventory checks confirm the
+temporary Worker and D1 database were deleted. Forced HTTP/3 is unverified because
+the host has no installed HTTP/3-capable curl.
+
 The new CI workflow runs the complete software acceptance against an installed
 CLI on macOS and Linux. Hardware denial/GUI launch behavior, forced HTTP/3 where
 unavailable, production retention/quotas and writer provenance remain separate
