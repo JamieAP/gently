@@ -203,13 +203,58 @@ class ReadinessTests(unittest.TestCase):
         mutations += [original.replace("        with:", key + " always()\n        with:")
                       for key in ['        if:', '        "if":', "        'if':", "        if :"]]
         mutations += [original.replace("      - uses:", key + " ${{ always() }}\n        uses:")
-                      for key in ['      - if:', '      - "if":', "      - 'if':", "      - if :"]]
+                      for key in ['      - if:', '      - "if":', "      - 'if':", "      - if :",
+                                  "      -   if:", "      -  if:"]]
         for changed in mutations:
             with self.subTest(workflow=changed):
                 self.guard.files[".github/workflows/ci.yml"] = changed
                 self.api.files = copy.deepcopy(self.guard.files)
                 with self.assertRaises(guard_module.GuardError):
                     self.guard.reviewed_workflows(SHA)
+
+    def test_shipped_workflows_pass_and_reviewed_bypass_variants_fail(self):
+        root = pathlib.Path(__file__).resolve().parent.parent
+        shipped = {name: (root / name).read_text(encoding="utf-8") for name in guard_module.FILES}
+        guard_module.Guard(self.api, shipped).validate_files()
+        ci, docs = shipped[".github/workflows/ci.yml"], shipped[".github/workflows/docs.yml"]
+        pin = "11d5960a326750d5838078e36cf38b85af677262"
+        checkout = f"      - uses: actions/checkout@{pin} # v4\n        with:\n          persist-credentials: false\n"
+        accept = ("      - name: Real CLI, encrypted readers, Wrangler and D1 acceptance\n"
+                  "        run: python3 scripts/acceptance-local.py")
+        self.assertIn(checkout, ci)
+        self.assertIn(accept, ci)
+        extra_job = (f'  "bypass":\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@{pin} # v4\n'
+                     "        with:\n          persist-credentials: false\n      - run: echo unguarded\n")
+        # Each variant is valid YAML that skips the job, runs a later step after
+        # the authorization step fails, or adds an ungated job.
+        ci_variants = {
+            "job quoted if": ci.replace("  validate:\n", '  validate:\n    "if": false\n'),
+            "job single-quoted spaced if": ci.replace("  validate:\n", "  validate:\n    'if' : false\n"),
+            "job spaced if": ci.replace("  validate:\n", "  validate:\n    if : false\n"),
+            "job escaped continue-on-error": ci.replace("  validate:\n", '  validate:\n    "continue\\x2don-error": true\n'),
+            "job merge key": ci.replace("  validate:\n", '  validate:\n    <<: {"if": false}\n'),
+            "checkout always()": ci.replace(checkout, "      - if: ${{ always() }}\n" + checkout.replace("      - uses:", "        uses:")),
+            "acceptance always()": ci.replace(accept, "      - if: ${{ always() }}\n" + accept.replace("      - name:", "        name:")),
+            "flow-mapping step": ci.replace(checkout, checkout + '      - {"if": "${{ always() }}", run: echo unguarded}\n'),
+            "checkout at column 10": ci.replace(checkout, "      -   if: ${{ always() }}\n" + "\n".join(
+                "  " + line for line in checkout.replace("      - uses:", "        uses:").splitlines()) + "\n"),
+            "acceptance at column 9": ci.replace(accept, "      -  if: ${{ always() }}\n" + "\n".join(
+                " " + line for line in accept.replace("      - name:", "        name:").splitlines())),
+            "quoted extra job": ci + extra_job,
+            "bare dash step": ci.replace(checkout, checkout + "      -\n        if: ${{ always() }}\n        run: echo unguarded\n"),
+            "quoted trigger": ci.replace("  workflow_dispatch:\n", '  workflow_dispatch:\n  "schedule":\n    - cron: "0 0 * * *"\n'),
+            "quoted top-level key": ci.replace("permissions:\n", '"defaults":\n  run:\n    shell: bash\npermissions:\n', 1),
+        }
+        docs_variants = {
+            "docs quoted extra job": docs.rstrip("\n") + "\n" + extra_job,
+            "docs job continue-on-error": docs.replace("    timeout-minutes: 10\n", "    timeout-minutes: 10\n    continue-on-error: true\n", 1),
+        }
+        for label, (name, text) in {**{k: (".github/workflows/ci.yml", v) for k, v in ci_variants.items()},
+                                    **{k: (".github/workflows/docs.yml", v) for k, v in docs_variants.items()}}.items():
+            with self.subTest(variant=label):
+                self.assertNotEqual(text, shipped[name])
+                with self.assertRaises(guard_module.GuardError):
+                    guard_module.Guard(self.api, {**shipped, name: text}).validate_files()
 
     def test_required_checks_are_bound_and_conflicting_bindings_refused(self):
         self.apply()
