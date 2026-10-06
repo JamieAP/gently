@@ -17,6 +17,9 @@ authentication.
 
 | Field | What to look for |
 | --- | --- |
+| `capture_degraded`, `last_capture`, `last_capture_outcome` | Check whether hooks stored encrypted content, metadata only, or encountered a fixed capture-failure category. A recent hook timestamp alone does not prove delivery. |
+| `capture_<outcome>` | Cumulative counts distinguish invalid hooks, unavailable/expired policy, raw capacity, oversized content, sealing errors and storage/capture failures. |
+| `recipient_policy`, `policy_expires_unix_secs` | Signed policy is checked without unlocking a reader. Renewal is needed when expired; `expiring_soon` means at most seven days remain. |
 | `pending (outbox)` | A growing count means events are queued faster than they are delivered, or export is unavailable. |
 | `last_success` | A recent value proves some export succeeded; `never` means this state database has no successful export recorded. |
 | `last_export` | Time since an export attempt, including failures. |

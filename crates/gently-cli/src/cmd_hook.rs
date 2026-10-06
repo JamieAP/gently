@@ -73,7 +73,10 @@ fn process(harness: HarnessKind) -> anyhow::Result<()> {
             prepared
         }
         Err(_) => {
-            outcome = if local_raw::policy_health(&cfg).0 == "expired" {
+            outcome = if matches!(
+                local_raw::policy_health(&cfg),
+                local_raw::PolicyState::Expired(_)
+            ) {
                 CaptureOutcome::PolicyExpired
             } else {
                 CaptureOutcome::PolicyUnavailable
@@ -104,6 +107,8 @@ fn process(harness: HarnessKind) -> anyhow::Result<()> {
             Some(gently_store::StoreError::RawCapacity)
         ) {
             CaptureOutcome::RawCapacity
+        } else if error.downcast_ref::<gently_store::StoreError>().is_some() {
+            CaptureOutcome::CaptureFailed
         } else if matches!(
             error.downcast_ref::<gently_raw::Error>(),
             Some(gently_raw::Error::Invalid(
@@ -111,10 +116,15 @@ fn process(harness: HarnessKind) -> anyhow::Result<()> {
             ))
         ) {
             CaptureOutcome::Oversized
-        } else if local_raw::policy_health(&cfg).0 == "expired" {
+        } else if matches!(
+            local_raw::policy_health(&cfg),
+            local_raw::PolicyState::Expired(_)
+        ) {
             CaptureOutcome::PolicyExpired
-        } else {
+        } else if error.downcast_ref::<gently_raw::Error>().is_some() {
             CaptureOutcome::SealFailed
+        } else {
+            CaptureOutcome::CaptureFailed
         };
         // The ciphertext transaction has rolled back every lifecycle write and
         // ref. An oversized payload or expired policy must not lose telemetry.

@@ -1,4 +1,4 @@
-//! `gently status` - local exporter health and queue depth.
+//! `gently status` - local capture, recipient-policy and export health.
 //!
 //! Reads the store's health row + queue/quarantine depth so a silently-failing
 //! detached exporter is observable without any daemon: the *query* tells you
@@ -20,16 +20,18 @@ pub fn run(json: bool) -> Result<()> {
     let h = store.health_snapshot()?;
     let raw = store.raw_objects_stats(&cfg.tenant_id)?;
     let capture = store.capture_snapshot()?;
-    let (policy, expires) = crate::local_raw::policy_health(&cfg);
+    let policy = crate::local_raw::policy_health(&cfg);
+    let expires = policy.expires();
     let last_outcome = capture.last_outcome.map(|v| v.label());
-    let degraded = matches!(policy, "unavailable" | "expired")
-        || capture.last_outcome.is_some_and(|v| {
-            !matches!(
-                v,
-                gently_store::CaptureOutcome::Encrypted
-                    | gently_store::CaptureOutcome::MetadataOnly
-            )
-        });
+    let degraded = matches!(
+        policy,
+        crate::local_raw::PolicyState::Unavailable | crate::local_raw::PolicyState::Expired(_)
+    ) || capture.last_outcome.is_some_and(|v| {
+        !matches!(
+            v,
+            gently_store::CaptureOutcome::Encrypted | gently_store::CaptureOutcome::MetadataOnly
+        )
+    });
     // Status remains useful for invalid configuration, but must not echo URL
     // userinfo, paths or query strings that might contain private values.
     let collector = if cfg.collector_url.is_empty() {
@@ -47,7 +49,7 @@ pub fn run(json: bool) -> Result<()> {
                 "collector_url": collector,
                 "capture": {"degraded": degraded, "last_capture_unix_nano": capture.last_capture_unix_nano,
                     "last_outcome": last_outcome, "counts": capture.counts},
-                "policy": {"state": policy, "expires_unix_secs": expires},
+                "policy": {"state": policy.label(), "expires_unix_secs": expires},
                 "export": {"pending": pending, "quarantined": quarantined,
                     "consecutive_failures": h.consecutive_failures,
                     "last_attempt_unix_nano": h.last_attempt_unix_nano,
@@ -70,7 +72,10 @@ pub fn run(json: bool) -> Result<()> {
         Cell::new("last_capture_outcome"),
         Cell::new(last_outcome.unwrap_or("never")),
     ]);
-    t.add_row(vec![Cell::new("recipient_policy"), Cell::new(policy)]);
+    t.add_row(vec![
+        Cell::new("recipient_policy"),
+        Cell::new(policy.label()),
+    ]);
     t.add_row(vec![
         Cell::new("policy_expires_unix_secs"),
         Cell::new(expires.map(|v| v.to_string()).unwrap_or_else(|| "-".into())),

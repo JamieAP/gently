@@ -32,10 +32,55 @@ const RAW_FIELDS: &[&str] = &[
     "gently.instruction_file",
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyState {
+    Disabled,
+    Unavailable,
+    Expired(u64),
+    ExpiringSoon(u64),
+    Valid(u64),
+}
+impl PolicyState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Unavailable => "unavailable",
+            Self::Expired(_) => "expired",
+            Self::ExpiringSoon(_) => "expiring_soon",
+            Self::Valid(_) => "valid",
+        }
+    }
+    pub fn expires(self) -> Option<u64> {
+        match self {
+            Self::Expired(expires) | Self::ExpiringSoon(expires) | Self::Valid(expires) => {
+                Some(expires)
+            }
+            Self::Disabled | Self::Unavailable => None,
+        }
+    }
+    fn at(expires: u64, now: u64) -> Self {
+        if expires <= now {
+            Self::Expired(expires)
+        } else if expires - now <= 7 * 24 * 3600 {
+            Self::ExpiringSoon(expires)
+        } else {
+            Self::Valid(expires)
+        }
+    }
+}
+
+pub fn policy_health(cfg: &Config) -> PolicyState {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|v| v.as_secs())
+        .unwrap_or(u64::MAX);
+    policy_state(cfg, now)
+}
+
 /// Inspect only authenticated public policy. This never opens a reader identity.
-pub fn policy_health(cfg: &Config) -> (&'static str, Option<u64>) {
+pub fn policy_state(cfg: &Config, now: u64) -> PolicyState {
     if !cfg.capture_raw_values {
-        return ("disabled", None);
+        return PolicyState::Disabled;
     }
     let inspect = || -> Result<u64> {
         let signed: SignedManifest =
@@ -49,21 +94,8 @@ pub fn policy_health(cfg: &Config) -> (&'static str, Option<u64>) {
         Ok(verified.manifest().expires_unix_secs)
     };
     match inspect() {
-        Err(_) => ("unavailable", None),
-        Ok(expires) => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|v| v.as_secs())
-                .unwrap_or(u64::MAX);
-            let state = if expires <= now {
-                "expired"
-            } else if expires.saturating_sub(now) <= 7 * 24 * 3600 {
-                "expiring_soon"
-            } else {
-                "valid"
-            };
-            (state, Some(expires))
-        }
+        Err(_) => PolicyState::Unavailable,
+        Ok(expires) => PolicyState::at(expires, now),
     }
 }
 
@@ -494,6 +526,29 @@ mod tests {
             ),
         };
         (object, ReaderIdentities::from_native(vec![identity]), row)
+    }
+
+    #[test]
+    fn policy_expiry_and_warning_boundaries_are_exact() {
+        let now = 100;
+        let week = 7 * 24 * 3600;
+        assert_eq!(PolicyState::at(now - 1, now), PolicyState::Expired(now - 1));
+        assert_eq!(PolicyState::at(now, now), PolicyState::Expired(now));
+        assert_eq!(
+            PolicyState::at(now + 1, now),
+            PolicyState::ExpiringSoon(now + 1)
+        );
+        assert_eq!(
+            PolicyState::at(now + week, now),
+            PolicyState::ExpiringSoon(now + week)
+        );
+        assert_eq!(
+            PolicyState::at(now + week + 1, now),
+            PolicyState::Valid(now + week + 1)
+        );
+        assert_eq!(PolicyState::at(u64::MAX, 0), PolicyState::Valid(u64::MAX));
+        assert_eq!(PolicyState::Expired(now).expires(), Some(now));
+        assert_eq!(PolicyState::Disabled.expires(), None);
     }
 
     #[test]

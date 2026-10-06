@@ -108,8 +108,9 @@ span can lose the local timing state needed for a later close.
 
 ## Checking health
 
-`gently status` reads local pending and quarantine counts, retained/pending raw
-object and encoded-byte counts, failure count,
+`gently status` reports capture outcomes, counts and degradation, authenticated
+recipient-policy validity and expiry, local pending and quarantine counts,
+retained/pending raw object and encoded-byte counts, failure count,
 export/success timestamps and the latest error. It does not query the collector
 or confirm that a particular trace is complete. Compare it with collector
 queries when verifying delivery.

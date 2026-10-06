@@ -699,3 +699,35 @@ fn failed_encrypted_and_metadata_transactions_record_capture_failure() {
     );
     assert_eq!(store.capture_snapshot().unwrap().counts["encrypted"], 0);
 }
+
+#[test]
+fn ciphertext_store_failure_preserves_metadata_and_is_not_a_sealing_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    enrollment(dir.path());
+    std::fs::create_dir_all(runtime(dir.path())).unwrap();
+    let db = runtime(dir.path()).join("state.db");
+    {
+        let _ = Store::open(&db).unwrap();
+    }
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection.execute_batch("CREATE TRIGGER fail_ciphertext BEFORE INSERT ON raw_objects BEGIN SELECT RAISE(FAIL, 'synthetic ciphertext write failure'); END;").unwrap();
+    run_hook_capture(
+        dir.path(),
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"synthetic","prompt":"store-failure-canary"}"#,
+        true,
+    );
+    let store = Store::open(&db).unwrap();
+    let health = store.capture_snapshot().unwrap();
+    assert_eq!(
+        health.last_outcome,
+        Some(gently_store::CaptureOutcome::CaptureFailed)
+    );
+    assert_eq!(health.counts["capture_failed"], 1);
+    assert_eq!(health.counts["seal_failed"], 0);
+    assert_eq!(health.counts["encrypted"], 0);
+    assert_eq!(store.raw_objects_len().unwrap(), 0);
+    let queued = store.outbox_take_batch(10).unwrap();
+    assert_eq!(queued.len(), 1);
+    assert!(!queued[0].1.contains(".raw_ref"));
+    assert!(!queued[0].1.contains("store-failure-canary"));
+}

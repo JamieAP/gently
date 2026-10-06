@@ -72,7 +72,7 @@ enum Command {
         #[command(subcommand)]
         command: cmd_raw::RawCommand,
     },
-    /// Show local exporter health and queue depth.
+    /// Show local capture, recipient-policy and export health.
     Status {
         /// Print health as machine-readable JSON without contacting the collector.
         #[arg(long)]
