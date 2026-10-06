@@ -255,6 +255,11 @@ fn lifecycle_gates_tools_until_initialized_and_allows_early_ping() {
     let init = handshake().lines().next().unwrap().to_owned();
     let input = format!("{{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"ping\"}}\n{{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/list\"}}\n{init}\n{{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/list\"}}\n{init}\n{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}}\n{{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/list\"}}\n");
     let rows = run_messages(input);
+    assert_eq!(
+        rows.len(),
+        6,
+        "one reply per request, none for the notification"
+    );
     assert_eq!(rows[0]["result"], serde_json::json!({}));
     assert_eq!(rows[1]["error"]["code"], -32600);
     assert_eq!(rows[3]["error"]["code"], -32600);

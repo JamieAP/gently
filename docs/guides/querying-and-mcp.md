@@ -39,8 +39,8 @@ See the [CLI reference](../reference/cli.md) for every command and flag.
 
 CLI trace-list and span-search limits cap at 1,000. Missing or non-positive CLI
 limits use the default. MCP accepts only schema-valid integer limits from 1 to
-1,000; out-of-range values produce `-32602`. There is no cursor or offset pagination. Equal ordering keys do
-not have a defined tie-breaker.
+1,000; out-of-range values produce `-32602`. There is no cursor or offset
+pagination. Equal ordering keys do not have a defined tie-breaker.
 
 Text filters use exact matches. `since` and `until` are inclusive bounds on raw
 `start_unix_nano`, supplied as decimal strings. Keep nanosecond values as strings
@@ -216,8 +216,11 @@ when a client proposes another version; clients must accept it or disconnect.
 After `initialize`, send `notifications/initialized` before tool requests. `ping`
 works during initialization. Tool argument errors use JSON-RPC `-32602`; collector
 or tool execution failures return content with `isError: true`. Fixed messages
-distinguish invalid jq filters, raw-resolution budget limits, unavailable readers
-and watcher failures, without exposing the underlying error chain.
+distinguish invalid jq filters, raw-resolution budget limits, unavailable
+readers, readers that cannot decrypt (a prompt not approved within 60 seconds,
+or a reader not enrolled for older objects), watcher failures and collector
+errors relayed by a healthy watcher, without exposing the underlying error
+chain.
 Messages are newline-delimited and limited to 1 MiB per input frame. Malformed or
 oversized frames receive a parse error (`-32700`) and are drained before reading
 the next frame. Well-formed JSON with an invalid RPC envelope receives

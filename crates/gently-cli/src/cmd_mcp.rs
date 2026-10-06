@@ -43,6 +43,8 @@ enum ToolFailure {
     #[error("Local jq filter failed; correct the filter syntax or operation.")]
     Filter,
 }
+const COLLECTOR_FAILURE: &str =
+    "Collector query failed; check collector availability, authorization and query arguments.";
 fn tool_failure(error: &anyhow::Error) -> String {
     if let Some(error) = error.downcast_ref::<ToolFailure>() {
         return error.to_string();
@@ -50,8 +52,7 @@ fn tool_failure(error: &anyhow::Error) -> String {
     if let Some(error) = error.downcast_ref::<crate::query_client::QueryFailure>() {
         return error.to_string();
     }
-    "Collector query failed; check collector availability, authorization and query arguments."
-        .into()
+    COLLECTOR_FAILURE.into()
 }
 
 fn valid_id(id: &Value) -> bool {
@@ -259,11 +260,21 @@ fn validate_tool(params: &Value) -> std::result::Result<(), RpcError> {
         .unwrap_or(&empty)
         .as_object()
         .ok_or(rpc_failure(-32602, "Expected object arguments"))?;
-    let schema = &spec["inputSchema"];
+    validate_arguments(&spec["inputSchema"], args)
+}
+
+// Messages may name schema keys and constraints; never echo caller-chosen keys.
+fn validate_arguments(
+    schema: &Value,
+    args: &serde_json::Map<String, Value>,
+) -> std::result::Result<(), RpcError> {
     if let Some(required) = schema.get("required").and_then(Value::as_array) {
-        for key in required {
-            if !args.contains_key(key.as_str().unwrap()) {
-                return Err(rpc_failure(-32602, "Missing required tool argument"));
+        for key in required.iter().filter_map(Value::as_str) {
+            if !args.contains_key(key) {
+                return Err(rpc_failure(
+                    -32602,
+                    format!("Missing required tool argument: {key}"),
+                ));
             }
         }
     }
@@ -293,21 +304,26 @@ fn validate_tool(params: &Value) -> std::result::Result<(), RpcError> {
                 .and_then(Value::as_array)
                 .is_some_and(|v| !v.contains(value))
         {
-            let expected = match property["type"].as_str() {
-                Some("integer") => format!(
-                    "integer from {} to {}",
-                    property["minimum"], property["maximum"]
-                ),
-                _ if property.get("enum").is_some() => format!("one of {}", property["enum"]),
-                _ => "string".into(),
-            };
             return Err(rpc_failure(
                 -32602,
-                format!("Invalid {key}: expected {expected}"),
+                format!("Invalid {key}: expected {}", expected(property)),
             ));
         }
     }
     Ok(())
+}
+
+fn expected(property: &Value) -> String {
+    match property["type"].as_str() {
+        Some("integer") => match (property.get("minimum"), property.get("maximum")) {
+            (Some(min), Some(max)) => format!("integer from {min} to {max}"),
+            (Some(min), None) => format!("integer of at least {min}"),
+            (None, Some(max)) => format!("integer of at most {max}"),
+            (None, None) => "integer".into(),
+        },
+        _ if property.get("enum").is_some() => format!("one of {}", property["enum"]),
+        _ => "string".into(),
+    }
 }
 
 fn call_tool(params: &Value, client: &QueryClient, rt: &tokio::runtime::Runtime) -> Result<Value> {
@@ -612,15 +628,71 @@ mod schema_tests {
     }
     #[test]
     fn fixed_tool_failures_do_not_echo_error_chains() {
+        use crate::query_client::QueryFailure;
         let private = "synthetic-private-error-canary";
         for error in [
             anyhow::anyhow!(private),
             anyhow::anyhow!(private).context(ToolFailure::Filter),
-            anyhow::anyhow!(private).context(crate::query_client::QueryFailure::RawBudget),
-            anyhow::anyhow!(private).context(crate::query_client::QueryFailure::ReaderUnavailable),
-            anyhow::anyhow!(private).context(crate::query_client::QueryFailure::WatcherUnavailable),
+            anyhow::anyhow!(private).context(QueryFailure::RawBudget),
+            anyhow::anyhow!(private).context(QueryFailure::ReaderUnavailable),
+            anyhow::anyhow!(private).context(QueryFailure::RawDecrypt),
+            anyhow::anyhow!(private).context(QueryFailure::WatcherUnavailable),
+            anyhow::anyhow!(private).context(QueryFailure::WatcherRelayed),
         ] {
             assert!(!tool_failure(&error).contains(private));
         }
+    }
+    #[test]
+    fn reader_failures_name_the_reader_not_the_collector() {
+        use crate::query_client::QueryFailure;
+        for reason in [
+            "trusted age reader timed out",
+            "trusted age reader failed",
+            "no matching reader identity",
+        ] {
+            let error = anyhow::Error::new(gently_raw::Error::Crypto(reason))
+                .context(QueryFailure::RawDecrypt);
+            let text = tool_failure(&error);
+            assert_eq!(text, QueryFailure::RawDecrypt.to_string());
+            assert_ne!(text, COLLECTOR_FAILURE);
+            assert!(!text.contains(reason));
+        }
+    }
+    #[test]
+    fn argument_errors_name_schema_keys_and_only_present_bounds() {
+        let schema = json!({"required": ["trace_id"], "properties": {
+            "trace_id": {"type": "string"},
+            "any": {"type": "integer"},
+            "floor": {"type": "integer", "minimum": 1},
+            "ceiling": {"type": "integer", "maximum": 9}
+        }});
+        let message = |args: Value| {
+            validate_arguments(&schema, args.as_object().unwrap())
+                .unwrap_err()
+                .1
+        };
+        assert_eq!(
+            message(json!({})),
+            "Missing required tool argument: trace_id"
+        );
+        for (args, text) in [
+            (json!({"any": 1.5}), "Invalid any: expected integer"),
+            (
+                json!({"floor": 0}),
+                "Invalid floor: expected integer of at least 1",
+            ),
+            (
+                json!({"ceiling": 10}),
+                "Invalid ceiling: expected integer of at most 9",
+            ),
+        ] {
+            let mut args = args;
+            args["trace_id"] = json!("t");
+            assert_eq!(message(args), text);
+        }
+        assert_eq!(
+            message(json!({"trace_id": "t", "caller-chosen-key": 1})),
+            "Unknown tool argument"
+        );
     }
 }
