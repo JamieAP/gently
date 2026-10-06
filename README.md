@@ -71,7 +71,7 @@ cd gently
 
 ```sh
 cd worker
-npm ci
+npm ci --ignore-scripts
 npx wrangler d1 create gently
 ```
 
@@ -136,7 +136,7 @@ gently status
 ```
 
 Replace `TRACE_ID` with an ID from `gently traces`. Trace queries read from the
-collector; `gently status` reports local queue and exporter health.
+collector; `gently status` reports local capture, recipient-policy and export health.
 
 To render a trace timeline with integrity checks:
 
@@ -252,7 +252,7 @@ state outside tracked files and review other confidential prose or code manually
 cargo test
 cargo clippy --all-targets -- -D warnings
 cd worker
-npm ci
+npm ci --ignore-scripts
 npm test
 npm run typecheck
 ```

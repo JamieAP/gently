@@ -7,6 +7,7 @@ mod cmd_init;
 mod cmd_mcp;
 mod cmd_query;
 mod cmd_raw;
+mod cmd_state;
 mod cmd_status;
 mod collector;
 mod config;
@@ -20,6 +21,7 @@ mod query_client;
 mod waterfall;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use cmd_init::Harness;
 use cmd_query::{Format, TraceFormat};
 use query_client::{SpanFilters, TraceFilters};
 
@@ -40,6 +42,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Back up or restore encrypted local state without unlocking a reader.
+    State {
+        #[command(subcommand)]
+        command: cmd_state::StateCommand,
+    },
+    /// Remove only this executable's managed hooks and MCP registrations.
+    Uninstall {
+        #[arg(long, required_unless_present = "codex", conflicts_with = "codex")]
+        claude: bool,
+        #[arg(long, required_unless_present = "claude", conflicts_with = "claude")]
+        codex: bool,
+    },
     /// Harness hook entrypoint (reads the event JSON on stdin). Never writes
     /// stdout and always exits 0.
     Hook {
@@ -72,8 +86,12 @@ enum Command {
         #[command(subcommand)]
         command: cmd_raw::RawCommand,
     },
-    /// Show local exporter health and queue depth.
-    Status,
+    /// Show local capture, recipient-policy and export health.
+    Status {
+        /// Print health as machine-readable JSON without contacting the collector.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the resolved public configuration for setup and local launchers.
     Config {
         #[arg(long, required_unless_present = "check", conflicts_with = "check")]
@@ -184,6 +202,10 @@ fn main() {
 
 fn dispatch(command: Command) -> anyhow::Result<()> {
     match command {
+        Command::State { command } => cmd_state::run(command),
+        Command::Uninstall { claude: true, .. } => cmd_init::run_uninstall(Harness::Claude),
+        Command::Uninstall { codex: true, .. } => cmd_init::run_uninstall(Harness::Codex),
+        Command::Uninstall { .. } => anyhow::bail!("choose --claude or --codex"),
         Command::Hook { .. } => unreachable!("handled in main"),
         Command::Export {
             watch,
@@ -204,7 +226,7 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
             }
         }
         Command::Raw { command } => cmd_raw::run(command),
-        Command::Status => cmd_status::run(),
+        Command::Status { json } => cmd_status::run(json),
         Command::Config { check, .. } => {
             if check {
                 config::check_setup()

@@ -10,7 +10,7 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --all -- --check
 cd worker
-npm ci
+npm ci --ignore-scripts
 npm test
 npm run typecheck
 cd ..

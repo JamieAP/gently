@@ -9,7 +9,7 @@ Use `gently --help` or `gently <command> --help` for command syntax;
 | Command | Collector URL and token required? |
 | --- | --- |
 | `hook` | No. Events queue locally without credentials. |
-| `init`, `status`, `raw` | No. These use local configuration and files. |
+| `init`, `uninstall`, `status`, `state`, `raw` | No. These use local configuration and files. |
 | `waterfall` | No. Reads stdin without loading configuration or local state. |
 | `export` | Yes. |
 | `traces`, `trace`, `spans`, `stats`, `whoami`, `mcp` | URL plus token, or a local query watcher on Unix. |
@@ -132,11 +132,38 @@ queue storage can grow without a limit. A tokenless queue can grow past this cap
 before export begins. See [reliability](../concepts/reliability.md) for delivery,
 retry, and quarantine behavior.
 
-## `gently status`
+## `gently status [--json]`
 
 Print local queue depth, quarantine count, configured collector URL, transport
 preference, consecutive failures, last attempt, last success, and last error.
-It does not contact the collector or verify that a token works.
+It does not contact the collector or verify that a token works. Capture health is
+separate from export health: it reports the last capture time and outcome, plus
+lifetime counts for each fixed outcome category:
+
+- `encrypted`, `metadata_only`: the event was kept as configured.
+- `policy_unavailable`, `policy_expired`, `oversized`, `raw_capacity`,
+  `seal_failed`, `raw_store_failed`: the metadata event was kept, but its
+  ciphertext was not, because of missing or expired recipient policy, content
+  over the size limit, a full raw byte budget, an encryption error, or a local
+  storage error while writing the ciphertext.
+- `invalid_hook`, `capture_failed`: the event was lost, because the hook payload
+  could not be parsed or the event could not be stored.
+
+`capture_degraded` is true when the last outcome is outside the first group, or
+when recipient policy is unavailable or expired. Recipient policy is verified
+using only public files, with a seven-day expiry warning; status never unlocks a
+reader.
+
+`--json` prints one object with `capture`, `policy`, `export` and `raw` sections,
+without raw payloads or exporter error strings. `raw` contains `objects`,
+`bytes`, `pending`, `pending_bytes`, `quarantined`, `quarantined_bytes`,
+`last_rejection_status` (HTTP status or `null`) and `budget_bytes`. The budget
+caps all ciphertext retained in the state database, so with a single tenant the
+remaining headroom is `budget_bytes - bytes`.
+
+The capture-health table is an additive encrypted-schema-2 extension and
+preserves existing queued state. Failures before the state database can be opened
+cannot be recorded there.
 
 ## `gently traces`
 
@@ -252,3 +279,18 @@ Tools, examples, local `jq` behavior, and raw-value resolution are documented in
 
 [Command parsing](https://github.com/JamieAP/gently/blob/main/crates/gently-cli/src/main.rs) and
 [query rendering](https://github.com/JamieAP/gently/blob/main/crates/gently-cli/src/cmd_query.rs) define this interface.
+
+## `gently state` and `gently uninstall`
+
+`state backup PATH` creates a consistent owner-only namespace-pinned backup,
+including live WAL state; `state restore PATH` accepts supported encrypted backups
+into a missing database in the same tenant/device namespace. Both operate without
+unlocking a reader. Backups contain private metadata and require private storage.
+Backup reports private temporaries left by an interrupted backup in the
+destination directory; `state backup --remove-stale PATH` deletes only exact
+owner-only Gently temporaries and leaves lookalikes for review.
+
+`uninstall --codex` and `uninstall --claude` remove only the current executable's
+exact managed registrations, preserving custom hooks, state and keys. Use the
+installed executable before removing its binary. See
+[installation and recovery](../guides/installation-and-recovery.md).
