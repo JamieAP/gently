@@ -1,6 +1,7 @@
 #!/bin/sh
 # Start the local collector with credentials inherited from a secret provider.
 set -eu
+umask 077
 
 case ${1-} in
   '') check_only=false ;;
@@ -52,6 +53,6 @@ fi
 export WRANGLER_SEND_METRICS=false
 # Prevent diagnostics from persisting secret bindings, even on startup failures.
 export WRANGLER_WRITE_LOGS=false
-export WRANGLER_LOG=log
+export WRANGLER_LOG=none
 exec "$python_bin" \
   "$repo_dir/scripts/collector-supervise.py" "$node_bin" "$gently_bin" "$repo_dir"

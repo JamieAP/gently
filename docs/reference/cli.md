@@ -11,7 +11,8 @@ Use `gently --help` or `gently <command> --help` for command syntax;
 | `hook` | No. Events queue locally without credentials. |
 | `init`, `status`, `raw` | No. These use local configuration and files. |
 | `waterfall` | No. Reads stdin without loading configuration or local state. |
-| `export`, `traces`, `trace`, `spans`, `stats`, `whoami`, `mcp` | Yes. |
+| `export` | Yes. |
+| `traces`, `trace`, `spans`, `stats`, `whoami`, `mcp` | URL plus token, or a local query watcher on Unix. |
 
 Set `GENTLY_COLLECTOR_URL` and supply `GENTLY_TOKEN` to the process that exports
 or queries. Installing hooks does not supply a token to agent processes.
@@ -34,7 +35,7 @@ Codex. Run the commands separately to install both integrations.
 | Integration | Files updated |
 | --- | --- |
 | Claude Code | `~/.claude/settings.json` hooks and `~/.claude.json` MCP server |
-| Codex | `~/.codex/config.toml` hooks, MCP server, and hook feature setting |
+| Codex | `~/.codex/config.toml` hooks, MCP server, and hook feature setting; covered legacy Gently handlers in `~/.codex/hooks.json` |
 
 Init also creates `<state_dir>/config.toml` if missing, with a localhost
 collector URL. It preserves an existing config and avoids duplicate hook
@@ -91,6 +92,8 @@ errors so it exits successfully; argument-parsing errors are separate.
 ```sh
 gently export
 gently export --watch --interval-secs 2
+# Enable tokenless desktop MCP and CLI queries on Unix:
+gently export --watch --serve-queries --preserve-backlog
 ```
 
 Without `--watch`, drain the queued envelopes and exit. With
@@ -105,6 +108,16 @@ The process needs an available collector token and never unlocks a secret store
 itself. A foreground launcher can unlock once and pass the token to the watcher,
 allowing hooks without tokens to keep recording locally.
 
+With `--serve-queries`, tokenless query clients automatically use the private
+`<state_dir>/tenants/<tenant_id>/devices/<device_id>/query.sock`. They must share
+the state directory, tenant, device and collector URL.
+The watcher forwards only read-only metadata queries and ciphertext downloads,
+and keeps its credential in memory. Reader decryption remains explicit.
+The flag requires `--watch` and Unix. Socket requests are limited to 64 KiB,
+collector metadata responses to 8 MiB and ciphertext responses to 1 MiB, with at most 16 concurrent requests and the
+configured query timeout. Ctrl+C removes the socket; a restart recovers stale
+sockets after abrupt termination. See [security and privacy](../concepts/security-and-privacy.md).
+
 Authentication failures (`401` or `403`) stop export and retain queued rows.
 Retryable failures use backoff: one-shot export attempts up to three drains;
 a watcher continues retrying, with delay capped at 30 seconds. Malformed queued
@@ -112,7 +125,10 @@ JSON and rejected envelopes can be quarantined. An envelope is quarantined as a
 whole, including any valid sibling spans it contains.
 
 The default outbox cap is 10,000 envelopes and is enforced when a drain starts,
-by dropping the oldest excess rows. A tokenless queue can grow past this cap
+by dropping the oldest excess rows. `--preserve-backlog` overrides that cap for
+this process, keeping all queued history, including before an authentication
+failure. Hook-spawned exporters and bundled local launchers set this option;
+queue storage can grow without a limit. A tokenless queue can grow past this cap
 before export begins. See [reliability](../concepts/reliability.md) for delivery,
 retry, and quarantine behavior.
 
@@ -165,7 +181,7 @@ gently trace TRACE_ID --json | gently waterfall
 ```
 
 Input must be a JSON span array in the `gently trace --json` format, rather than
-an OTLP export envelope. The pipeline's first command still needs credentials.
+an OTLP export envelope. The pipeline's first command needs a token or a local query watcher.
 
 The chart uses 56 timing columns, indented 26-column Unicode labels, ellipses
 for clipped names, and a status legend. It prefers effective bounds when present,
@@ -226,8 +242,8 @@ This command is unrelated to the Worker's `/v1/whoami` transport probe.
 ## `gently mcp`
 
 Run the newline-delimited JSON-RPC stdio server. Init registers this command
-with the harness. The process requires a collector URL and token at startup,
-even for the local `response_fields` helper.
+with the harness. The process requires a collector URL and either a token
+or, on Unix, the local query watcher at startup, even for `response_fields`.
 
 Tools, examples, local `jq` behavior, and raw-value resolution are documented in
 [querying and MCP](../guides/querying-and-mcp.md).

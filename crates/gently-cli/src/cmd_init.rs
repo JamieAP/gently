@@ -11,8 +11,9 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use toml_edit::{value, Array, ArrayOfTables, DocumentMut, Item, Table};
 
-/// Hook events gently models. Unmodeled events are still captured as markers if
-/// the user wires them, but these are the ones init installs by default.
+/// Observational Claude Code events checked through the 2.1.291 schema.
+/// WorktreeCreate/Remove replace Git operations and must remain user-owned.
+/// FileChanged observes existing watchers; the omitted matcher adds no files.
 const MODELED_EVENTS: &[&str] = &[
     "SessionStart",
     "SessionEnd",
@@ -29,6 +30,22 @@ const MODELED_EVENTS: &[&str] = &[
     "PostCompact",
     "PostToolBatch",
     "PostModelSwitch",
+    "Setup",
+    "UserPromptExpansion",
+    "MessageDisplay",
+    "Notification",
+    "PermissionDenied",
+    "TaskCreated",
+    "TaskCompleted",
+    "TeammateIdle",
+    "InstructionsLoaded",
+    "ConfigChange",
+    "CwdChanged",
+    "DirectoryAdded",
+    "FileChanged",
+    "PreModelSwitch",
+    "Elicitation",
+    "ElicitationResult",
 ];
 
 pub fn run_claude(resolve_raw_values: bool) -> Result<()> {
@@ -70,7 +87,7 @@ fn scaffold_config(cfg: &Config) -> Result<()> {
         # OPTIONAL tunables (shown with their defaults; uncomment to change):\n\
         #\n\
         # prefer_quic = true          # prefer HTTP/3 (QUIC) for export, fall back to HTTP/2\n\
-        # outbox_cap = 10000          # max buffered envelope rows before the oldest are dropped\n\
+        # outbox_cap = 10000          # manual export cap; --preserve-backlog bypasses trimming\n\
         # export_batch = 512          # OTLP envelope rows per export request\n\
         # export_timeout_secs = 15    # per-request export timeout\n\
         # query_timeout_secs = 30     # per-request query / MCP timeout\n\
@@ -102,6 +119,16 @@ fn install_hooks(home: &Path, exe: &Path) -> Result<usize> {
     for event in MODELED_EVENTS {
         let arr = hooks.entry(*event).or_insert_with(|| json!([]));
         let arr = arr.as_array_mut().context("hook event is not an array")?;
+        let legacy = format!("{} hook", legacy_shell_quote(exe));
+        for group in arr.iter_mut() {
+            if let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+                for handler in handlers {
+                    if handler["type"] == "command" && handler["command"] == legacy {
+                        handler["command"] = json!(command);
+                    }
+                }
+            }
+        }
         if hooks_contains_command(arr, &command) {
             continue;
         }
@@ -173,7 +200,7 @@ fn read_json(path: &Path) -> Result<Value> {
     harden_existing_file(path)?;
     match std::fs::read_to_string(path) {
         Ok(s) if !s.trim().is_empty() => {
-            serde_json::from_str(&s).with_context(|| format!("parsing {}", path.display()))
+            crate::json_fidelity::parse(&s).with_context(|| format!("parsing {}", path.display()))
         }
         Ok(_) => Ok(json!({})),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
@@ -234,13 +261,26 @@ pub fn run_codex(resolve_raw_values: bool) -> Result<()> {
 
     scaffold_config(&cfg)?;
 
+    // Codex merges JSON and inline TOML hooks. Previous installations could
+    // leave default-Claude handlers in hooks.json, duplicating and mislabeling
+    // capture alongside the current explicit-Codex handlers. Validate the old
+    // source before writing, then install the replacement before removing ours.
+    let json_path = home.join(".codex").join("hooks.json");
     let path = home.join(".codex").join("config.toml");
     let mut doc = read_toml_doc(&path)?;
     let command = format!("{} hook --harness codex", shell_quote(&exe));
-    let added = merge_codex_hooks(&mut doc, &command)?;
+    let legacy_command = format!("{} hook --harness codex", legacy_shell_quote(&exe));
+    let added = merge_codex_hooks_with_legacy(&mut doc, &command, Some(&legacy_command))?;
     ensure_codex_mcp(&mut doc, &exe.to_string_lossy(), resolve_raw_values)?;
     ensure_features_hooks(&mut doc)?;
+    let migrated = migrate_codex_json_hooks(&json_path, &exe, &doc)?;
     write_toml_doc(&path, &doc)?;
+    if let Some((json, removed)) = migrated {
+        write_json(&json_path, &json)?;
+        eprintln!(
+            "gently: migrated {removed} legacy Gently JSON hook handler(s) to inline Codex hooks"
+        );
+    }
 
     eprintln!(
         "gently: installed {added} Codex hook event(s) into {}",
@@ -260,13 +300,149 @@ pub fn run_codex(resolve_raw_values: bool) -> Result<()> {
     Ok(())
 }
 
+/// Remove only exact commands previously emitted for this executable, and only
+/// events supplied by the canonical TOML registration. Custom wrappers, other
+/// handlers, group metadata and unknown events remain user-owned.
+fn legacy_shell_quote(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    if s.contains(' ') {
+        format!("\"{s}\"")
+    } else {
+        s.into_owned()
+    }
+}
+
+fn migrate_codex_json_hooks(
+    path: &Path,
+    exe: &Path,
+    doc: &DocumentMut,
+) -> Result<Option<(Value, usize)>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => anyhow::bail!("cannot inspect legacy Codex hooks.json for optional migration"),
+    };
+    #[cfg(unix)]
+    let unsafe_owner_or_links = {
+        use std::os::unix::fs::MetadataExt;
+        metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1
+    };
+    #[cfg(not(unix))]
+    let unsafe_owner_or_links = false;
+    if !metadata.file_type().is_file() || unsafe_owner_or_links {
+        eprintln!("gently: skipped legacy Codex hooks.json migration: path is linked, not regular, or not owned by this user; review duplicate Gently handlers manually");
+        return Ok(None);
+    }
+    harden_existing_file(path)?;
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let mut json: Value = crate::json_fidelity::parse(&text)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    let commands: Vec<String> = [shell_quote(exe), legacy_shell_quote(exe)]
+        .into_iter()
+        .flat_map(|quoted| {
+            [
+                format!("{quoted} hook"),
+                format!("{quoted} hook --harness codex"),
+            ]
+        })
+        .collect();
+    let Some(hooks) = json.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return Ok(None);
+    };
+    let mut removed = 0;
+    for event in CODEX_MODELED_EVENTS {
+        let Some(groups) = hooks.get_mut(*event).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        groups.retain_mut(|group| {
+            if !codex_inline_covers(doc, event, group, &commands) {
+                return true;
+            }
+            let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                return true;
+            };
+            let before = handlers.len();
+            handlers.retain(|handler| {
+                !(handler["type"] == "command"
+                    && handler.get("commandWindows").is_none()
+                    && handler.get("command_windows").is_none()
+                    && handler["command"]
+                        .as_str()
+                        .is_some_and(|command| commands.iter().any(|owned| owned == command)))
+            });
+            removed += before - handlers.len();
+            before == handlers.len() || !handlers.is_empty()
+        });
+    }
+    Ok((removed > 0).then_some((json, removed)))
+}
+
+/// Match only proven coverage: an unfiltered command registration or the exact
+/// same matcher. Regex inclusion cannot be inferred safely from different text.
+fn codex_inline_covers(doc: &DocumentMut, event: &str, json: &Value, commands: &[String]) -> bool {
+    if json.get("matcher").is_some_and(|value| !value.is_string()) {
+        return false;
+    }
+    let requested = json.get("matcher").and_then(Value::as_str);
+    let Some(groups) = doc
+        .get("hooks")
+        .and_then(|hooks| hooks.get(event))
+        .and_then(Item::as_array_of_tables)
+    else {
+        return false;
+    };
+    groups.iter().any(|group| {
+        if group
+            .get("matcher")
+            .is_some_and(|value| value.as_str().is_none())
+        {
+            return false;
+        }
+        let matcher = group.get("matcher").and_then(Item::as_str);
+        let covers = matches!(matcher, None | Some("") | Some("*")) || matcher == requested;
+        covers
+            && group
+                .get("hooks")
+                .and_then(Item::as_array_of_tables)
+                .is_some_and(|handlers| {
+                    handlers.iter().any(|handler| {
+                        handler.get("type").and_then(Item::as_str) == Some("command")
+                            && handler.get("commandWindows").is_none()
+                            && handler.get("command_windows").is_none()
+                            && handler.get("command").and_then(Item::as_str).is_some_and(
+                                |command| {
+                                    command.ends_with(" hook --harness codex")
+                                        && commands.iter().any(|owned| owned == command)
+                                },
+                            )
+                    })
+                })
+    })
+}
+
 /// Add a `[[hooks.<Event>]]`/`[[hooks.<Event>.hooks]]` command handler for each
 /// modeled Codex event, skipping any event group that already runs our command.
 /// Returns the number of events newly added.
+#[cfg(test)]
 fn merge_codex_hooks(doc: &mut DocumentMut, command: &str) -> Result<usize> {
+    merge_codex_hooks_with_legacy(doc, command, None)
+}
+
+fn merge_codex_hooks_with_legacy(
+    doc: &mut DocumentMut,
+    command: &str,
+    legacy: Option<&str>,
+) -> Result<usize> {
     let mut added = 0;
     for event in CODEX_MODELED_EVENTS {
-        if add_codex_hook_group(doc, event, command)? {
+        if add_codex_hook_group(doc, event, command, legacy)? {
             added += 1;
         }
     }
@@ -340,7 +516,12 @@ fn require_groups<'a>(item: &'a mut Item, name: &str) -> Result<&'a mut ArrayOfT
 /// Append one command-handler group under `hooks.<event>`. No `matcher` is set,
 /// so tool events match every tool. Idempotent: returns false if a group already
 /// points at `command`.
-fn add_codex_hook_group(doc: &mut DocumentMut, event: &str, command: &str) -> Result<bool> {
+fn add_codex_hook_group(
+    doc: &mut DocumentMut,
+    event: &str,
+    command: &str,
+    legacy: Option<&str>,
+) -> Result<bool> {
     let hooks = require_root_table(doc, "hooks")?;
     let groups = require_groups(
         hooks
@@ -351,7 +532,7 @@ fn add_codex_hook_group(doc: &mut DocumentMut, event: &str, command: &str) -> Re
 
     let mut found = false;
     for group in groups.iter_mut() {
-        found |= group_has_command(group, command, event)?;
+        found |= group_has_command(group, command, event, legacy)?;
     }
     if found {
         return Ok(false);
@@ -370,7 +551,12 @@ fn add_codex_hook_group(doc: &mut DocumentMut, event: &str, command: &str) -> Re
 }
 
 /// Match managed handlers while preserving their matcher and options.
-fn group_has_command(group: &mut Table, command: &str, event: &str) -> Result<bool> {
+fn group_has_command(
+    group: &mut Table,
+    command: &str,
+    event: &str,
+    legacy: Option<&str>,
+) -> Result<bool> {
     let Some(inner) = group.get_mut("hooks") else {
         return Ok(false);
     };
@@ -380,7 +566,7 @@ fn group_has_command(group: &mut Table, command: &str, event: &str) -> Result<bo
         if handler
             .get("command")
             .and_then(Item::as_str)
-            .is_some_and(|existing| existing == command)
+            .is_some_and(|existing| existing == command || legacy == Some(existing))
         {
             handler["command"] = value(command);
             found = true;

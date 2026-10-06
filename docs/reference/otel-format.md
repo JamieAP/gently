@@ -109,6 +109,18 @@ verifying tenant/session/device and field-to-span bindings. It never adds them
 to exported OTLP. See [security and privacy](../concepts/security-and-privacy.md)
 and [raw enrollment](../guides/encrypted-raw-values.md).
 
+Every received hook also emits an immutable `hook:<Event>` internal span. Its
+`gently.hook_payload.bytes` describes the complete normalized JSON. Opt-in
+encrypted capture adds an opaque `gently.hook_payload.raw_ref` bound to this
+receipt inside the ciphertext.
+It carries correlation keys as `gently.hook.tool_use_id`, `.tool_name`,
+`.turn_id`, `.prompt_id` and `.agent_id` when supplied. It parents to the session
+or executing subagent. Resolution may add `gently.hook_payload` locally; payload
+content is never exported. These receipts preserve separate event observations
+while lifecycle aggregates continue to merge by their logical span IDs.
+Receipts also keep parsed event metadata, including model/source and cache
+estimates, so subsequent lifecycle updates do not erase earlier observations.
+
 ## Collector query shape
 
 The Worker flattens export fields into snake-case span rows. OTLP camel-case
@@ -131,10 +143,12 @@ logical span keys. Repeated reports of the same logical span reuse those IDs.
 This lets separate hook processes reconstruct parent links without relying on
 random IDs allocated by another process.
 
-Session, turn, and subagent spans can be emitted provisionally and later updated,
+Session, turn, tool and subagent spans can be emitted provisionally and later updated,
 instead of only emitting a finished span once. The included Worker merges these
 reports by span ID, retaining earliest start, latest end-or-start, and content
-from the latest-ending report. Conflicting content at equal ending timestamps
+from the latest-ending report. For tools, completed reports outrank provisional
+opens, and a completed report with a runtime duration retains both of its time
+bounds ahead of reports using inferred timing. Conflicting content at equal ending timestamps
 favors the incoming report. See [ingest behavior](worker.md#ingest-and-repeated-span-updates).
 
 A different backend must handle these repeated reports as intended; merely

@@ -14,9 +14,11 @@
 //! unified exec reports only output text through PostToolUse, even for nonzero
 //! exits (`codex-rs/core/src/tools/context.rs`). MCP results carry their typed
 //! isError flag. Classify those structured results; leave opaque status Unset.
-//! Prompt and tool content is recorded only as a digest and byte length.
+//! Prompt and tool content is recorded only as a byte length.
 
-use crate::hooks::{common_attrs, push_first_str_length, push_value_length, str_field};
+use crate::hooks::{
+    common_attrs, push_first_str_length, push_observed_tool_attrs, push_value_length, str_field,
+};
 use crate::{Attrs, Harness, HarnessError, Parsed, SpanOp};
 use gently_core::Status;
 
@@ -86,17 +88,18 @@ impl Harness for Codex {
                 }]
             }
             "PermissionRequest" => {
-                let tool_name = str_field(raw, "tool_name").unwrap_or_default();
+                let mut attrs = codex_attrs(raw, event);
+                push_observed_tool_attrs(&mut attrs, raw);
                 vec![SpanOp::Mark {
                     name: event.into(),
-                    attrs: tool_attrs(raw, event, &tool_name),
+                    attrs,
                 }]
             }
             "PreToolUse" => {
                 let tool_name = str_field(raw, "tool_name").unwrap_or_default();
                 let attrs = tool_attrs(raw, event, &tool_name);
                 vec![SpanOp::OpenTool {
-                    tool_use_id: str_field(raw, "tool_use_id"),
+                    tool_use_id: str_field(raw, "tool_use_id").filter(|id| !id.is_empty()),
                     tool_name,
                     attrs,
                 }]
@@ -109,7 +112,7 @@ impl Harness for Codex {
                     push_value_length(&mut attrs, "gently.tool_response", resp);
                 }
                 vec![SpanOp::CloseTool {
-                    tool_use_id: str_field(raw, "tool_use_id"),
+                    tool_use_id: str_field(raw, "tool_use_id").filter(|id| !id.is_empty()),
                     tool_name,
                     status,
                     duration_ms: None,
@@ -129,7 +132,7 @@ impl Harness for Codex {
                 };
                 vec![SpanOp::OpenAgent {
                     agent_id,
-                    parent_tool_use_id: str_field(raw, "tool_use_id"),
+                    parent_tool_use_id: str_field(raw, "tool_use_id").filter(|id| !id.is_empty()),
                     attrs: codex_attrs(raw, event),
                 }]
             }
@@ -608,7 +611,7 @@ mod tests {
         match &parsed.ops[..] {
             [SpanOp::Mark { name, attrs }] => {
                 assert_eq!(name, "PermissionRequest");
-                assert!(attrs.contains(&("gently.tool_name".into(), "Bash".into())));
+                assert!(attrs.contains(&("gently.hook.tool_name".into(), "Bash".into())));
                 let attrs = format!("{attrs:?}");
                 assert!(attrs.contains("gently.tool_input.bytes"));
                 assert!(!attrs.contains("private command"));

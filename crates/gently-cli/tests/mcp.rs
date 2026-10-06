@@ -7,7 +7,7 @@ use assert_cmd::Command;
 fn mcp_initialize_and_tools_list() {
     let dir = tempfile::tempdir().unwrap();
     let input = concat!(
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","_meta":{"$serde_json::private::Number":"ordinary metadata"}}}"#,
         "\n",
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
         "\n",

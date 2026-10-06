@@ -25,6 +25,7 @@
 ## Reference
 
 * [CLI](reference/cli.md)
+* [Coding-agent compatibility](reference/compatibility.md)
 * [Harness hooks](reference/hooks.md)
 * [OTel format](reference/otel-format.md)
 * [Collector & Worker](reference/worker.md)

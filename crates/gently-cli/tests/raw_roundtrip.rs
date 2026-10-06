@@ -78,7 +78,12 @@ fn command(state: &Path, device: &str, base: &str) -> Command {
 #[test]
 fn capture_export_remote_fetch_and_enrolled_reader_decrypt_without_plaintext_persistence() {
     let capture = tempfile::tempdir().unwrap();
-    let reader = tempfile::tempdir().unwrap();
+    let reader = tempfile::tempdir_in(if cfg!(target_os = "macos") {
+        std::path::PathBuf::from("/private/tmp")
+    } else {
+        std::env::temp_dir()
+    })
+    .unwrap();
     for state in [capture.path(), reader.path()] {
         std::fs::write(
             state.join("config.toml"),
@@ -127,9 +132,9 @@ fn capture_export_remote_fetch_and_enrolled_reader_decrypt_without_plaintext_per
     let base = format!("http://{}", listener.local_addr().unwrap());
     let cloud = Arc::new(Mutex::new(Cloud::default()));
     let shared = cloud.clone();
-    // One raw upload, one metadata upload, one query, one cache-miss fetch.
+    // Two event ciphertext uploads, one metadata upload, one query, two cache-miss downloads.
     let server = std::thread::spawn(move || {
-        for _ in 0..4 {
+        for _ in 0..6 {
             let (mut stream, _) = listener.accept().unwrap();
             let (method, path, body) = request(&mut stream);
             let mut cloud = shared.lock().unwrap();
@@ -191,7 +196,50 @@ fn capture_export_remote_fetch_and_enrolled_reader_decrypt_without_plaintext_per
         .env("GENTLY_SYNC_RAW_VALUES", "1")
         .assert()
         .success();
-    let result = command(reader.path(), "reader-host", &base)
+    #[cfg(unix)]
+    let _watcher = {
+        // An unlocked watcher supplies read-only transport to the tokenless reader.
+        struct Watcher(std::process::Child);
+        impl Drop for Watcher {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut watcher = Watcher(
+            std::process::Command::new(assert_cmd::cargo::cargo_bin!("gently"))
+                .args(["export", "--watch", "--serve-queries"])
+                .env("GENTLY_STATE_DIR", reader.path())
+                .env("GENTLY_TENANT_ID", "personal")
+                .env("GENTLY_DEVICE_ID", "reader-host")
+                .env("GENTLY_COLLECTOR_URL", &base)
+                .env("GENTLY_TOKEN", "synthetic-auth")
+                .env("GENTLY_CAPTURE_RAW_VALUES", "0")
+                .env("GENTLY_SYNC_RAW_VALUES", "0")
+                .env("GENTLY_RESOLVE_RAW_VALUES", "0")
+                .env_remove("GENTLY_RAW_IDENTITY")
+                .env_remove("GENTLY_RAW_MANIFEST")
+                .env_remove("GENTLY_RAW_TRUST")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let socket = reader
+            .path()
+            .join("tenants/personal/devices/reader-host/query.sock");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+            assert!(watcher.0.try_wait().unwrap().is_none());
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        watcher
+    };
+    let mut reader_command = command(reader.path(), "reader-host", &base);
+    #[cfg(unix)]
+    reader_command.env_remove("GENTLY_TOKEN");
+    let result = reader_command
         .args(["spans", "--json"])
         .env("GENTLY_RESOLVE_RAW_VALUES", "1")
         .env("GENTLY_RAW_IDENTITY", &identity_path)
@@ -204,8 +252,8 @@ fn capture_export_remote_fetch_and_enrolled_reader_decrypt_without_plaintext_per
     assert!(result.contains(CANARY));
     server.join().unwrap();
     let cloud = cloud.lock().unwrap();
-    assert_eq!(cloud.objects.len(), 1);
-    assert_eq!(cloud.fetched, 1);
+    assert_eq!(cloud.objects.len(), 2);
+    assert_eq!(cloud.fetched, 2);
     assert!(!serde_json::to_string(&cloud.objects)
         .unwrap()
         .contains(CANARY));
@@ -215,7 +263,7 @@ fn capture_export_remote_fetch_and_enrolled_reader_decrypt_without_plaintext_per
     ] {
         let runtime = state.join(format!("tenants/personal/devices/{device}"));
         let store = Store::open(&runtime.join("state.db")).unwrap();
-        assert_eq!(store.raw_objects_len().unwrap(), 1);
+        assert_eq!(store.raw_objects_len().unwrap(), 2);
         assert!(store.raw_objects_pending("personal", 1).unwrap().is_empty());
         for file in std::fs::read_dir(runtime).unwrap() {
             let file = file.unwrap();

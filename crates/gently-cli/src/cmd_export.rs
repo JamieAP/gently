@@ -17,20 +17,39 @@ const MAX_ATTEMPTS: u32 = 3;
 const BACKOFF_BASE: Duration = Duration::from_millis(250);
 const WATCH_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-pub fn run(retry_raw_quarantine: bool) -> Result<()> {
-    run_mode(None, retry_raw_quarantine)
+pub fn run(preserve_backlog: bool, retry_raw_quarantine: bool) -> Result<()> {
+    run_mode(None, false, preserve_backlog, retry_raw_quarantine)
 }
 
 /// Unlock credentials once in a foreground launcher, then drain new hook rows.
-pub fn watch(interval_secs: u64, retry_raw_quarantine: bool) -> Result<()> {
+pub fn watch(
+    interval_secs: u64,
+    serve_queries: bool,
+    preserve_backlog: bool,
+    retry_raw_quarantine: bool,
+) -> Result<()> {
     run_mode(
         Some(Duration::from_secs(interval_secs.max(1))),
+        serve_queries,
+        preserve_backlog,
         retry_raw_quarantine,
     )
 }
 
-fn run_mode(watch_interval: Option<Duration>, retry_raw_quarantine: bool) -> Result<()> {
+fn run_mode(
+    watch_interval: Option<Duration>,
+    serve_queries: bool,
+    preserve_backlog: bool,
+    retry_raw_quarantine: bool,
+) -> Result<()> {
+    #[cfg(not(unix))]
+    anyhow::ensure!(!serve_queries, "local query sockets require Unix");
     let cfg = Config::load()?;
+    let outbox_cap = if preserve_backlog {
+        i64::MAX as usize
+    } else {
+        cfg.outbox_cap
+    };
     cfg.ensure_state_dir()?;
     crate::logging::init_file_log(&cfg.runtime_dir().join("export.log"));
     cfg.require_collector()?;
@@ -58,6 +77,12 @@ fn run_mode(watch_interval: Option<Duration>, retry_raw_quarantine: bool) -> Res
         let objects = store.raw_objects_retry_quarantined(&cfg.tenant_id)?;
         tracing::info!(objects, "retained rejected ciphertext scheduled for retry");
     }
+    #[cfg(unix)]
+    let broker = if serve_queries {
+        Some(crate::query_broker::QueryBroker::bind(&cfg)?)
+    } else {
+        None
+    };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -107,21 +132,31 @@ fn run_mode(watch_interval: Option<Duration>, retry_raw_quarantine: bool) -> Res
         };
         if let Some(interval) = watch_interval {
             tracing::info!(?interval, "export watcher started");
-            watch_loop(
+            let watch = watch_loop(
                 &store,
                 &transport,
-                cfg.outbox_cap,
+                outbox_cap,
                 cfg.export_batch,
                 raw_sync.as_ref(),
                 interval,
                 tokio::signal::ctrl_c(),
-            )
-            .await
+            );
+            #[cfg(unix)]
+            if let Some(broker) = broker {
+                return tokio::select! {
+                    result = watch => result,
+                    result = broker.serve(&cfg) => {
+                        Err(ExportError::Unavailable(result.err()
+                            .map(|e| e.to_string()).unwrap_or_else(|| "query broker stopped".into())))
+                    }
+                };
+            }
+            watch.await
         } else {
             export_with_retry(
                 &store,
                 &transport,
-                cfg.outbox_cap,
+                outbox_cap,
                 cfg.export_batch,
                 raw_sync.as_ref(),
             )

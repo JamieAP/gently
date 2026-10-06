@@ -10,7 +10,7 @@
 use crate::config::Config;
 use crate::local_raw;
 use crate::HarnessKind;
-use gently_core::{OtlpRequest, Resource};
+use gently_core::{OtlpRequest, Resource, Span, SpanId, SpanKind, Status, TraceId};
 use gently_harness::{apply, ClaudeCode, Codex, Harness, Parsed};
 use gently_store::Store;
 use std::io::Read;
@@ -42,7 +42,7 @@ fn process(harness: HarnessKind) -> anyhow::Result<()> {
 
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw)?;
-    let value: serde_json::Value = serde_json::from_str(&raw)?;
+    let value = crate::json_fidelity::parse(&raw)?;
 
     let store = Store::open(&cfg.state_db())?;
 
@@ -68,14 +68,14 @@ fn process(harness: HarnessKind) -> anyhow::Result<()> {
 
     let capturing = prepared_raw.is_some();
     let result = store.transaction::<_, anyhow::Error>(|store| {
-        enqueue_event(store, &cfg, &parsed, &resource, prepared_raw)
+        enqueue_event(store, &cfg, &parsed, &value, &resource, prepared_raw)
     });
     if capturing && result.is_err() {
         // The ciphertext transaction has rolled back every lifecycle write and
         // ref. An oversized payload or expired policy must not lose telemetry.
         tracing::warn!("encrypted raw capture unavailable; preserving length-only telemetry");
         store.transaction::<_, anyhow::Error>(|store| {
-            enqueue_event(store, &cfg, &metadata_parsed, &resource, None)
+            enqueue_event(store, &cfg, &metadata_parsed, &value, &resource, None)
         })?;
     } else {
         result?;
@@ -105,10 +105,19 @@ fn enqueue_event(
     store: &Store,
     cfg: &Config,
     parsed: &Parsed,
+    value: &serde_json::Value,
     resource: &Resource,
     prepared_raw: Option<local_raw::PreparedRaw>,
 ) -> anyhow::Result<()> {
-    let spans = apply(store, parsed, now_nanos())?;
+    let now = now_nanos();
+    let mut spans = apply(store, parsed, now)?;
+    let mut receipt = hook_receipt(parsed, value, now)?;
+    if let Some(raw) = &prepared_raw {
+        receipt
+            .attributes
+            .push(("gently.hook_payload.raw_ref".into(), raw.reference().into()));
+    }
+    spans.push(receipt);
     if let Some(prepared_raw) = prepared_raw {
         store.raw_object_put(&prepared_raw.seal_for_spans(store, &spans)?)?;
     }
@@ -133,6 +142,62 @@ fn enqueue_event(
         store.outbox_enqueue(&serde_json::to_string(&req)?)?;
     }
     Ok(())
+}
+
+fn hook_receipt(parsed: &Parsed, value: &serde_json::Value, now: u64) -> anyhow::Result<Span> {
+    let bytes = serde_json::to_vec(value)?;
+    let event = value["hook_event_name"].as_str().unwrap_or_default();
+    let mut attrs = vec![
+        ("gently.event".into(), event.into()),
+        ("gently.hook_payload.bytes".into(), bytes.len().to_string()),
+    ];
+    for key in [
+        "tool_name",
+        "tool_use_id",
+        "turn_id",
+        "prompt_id",
+        "agent_id",
+    ] {
+        if let Some(v) = value.get(key).and_then(serde_json::Value::as_str) {
+            attrs.push((format!("gently.hook.{key}"), v.into()));
+        }
+    }
+    // Retain queryable event metadata even when a later lifecycle update
+    // replaces the aggregate's attrs (for example, resume cache estimates).
+    // Correlation keys stay namespaced so receipts never enter tool rollups.
+    for op in &parsed.ops {
+        for (key, value) in op.observation_attrs() {
+            let key = match key.as_str() {
+                "gently.tool_name" | "gently.tool_use_id" | "gently.turn_id"
+                | "gently.prompt_id" | "gently.agent_id" => {
+                    key.replacen("gently.", "gently.hook.", 1)
+                }
+                _ => key.clone(),
+            };
+            if !attrs.iter().any(|(existing, _)| existing == &key) {
+                attrs.push((key, value.clone()));
+            }
+        }
+    }
+    let parent_key = parsed
+        .agent_id
+        .as_ref()
+        .map(|id| format!("agent:{id}"))
+        .unwrap_or_else(|| "session".into());
+    Ok(Span {
+        trace_id: TraceId::from_session(&parsed.session_id),
+        span_id: SpanId::derive(
+            &parsed.session_id,
+            &format!("hook:{now}:{}", std::process::id()),
+        ),
+        parent_span_id: Some(SpanId::derive(&parsed.session_id, &parent_key)),
+        name: format!("hook:{event}"),
+        kind: SpanKind::Internal,
+        start_unix_nano: now,
+        end_unix_nano: now,
+        status: Status::Unset,
+        attributes: attrs,
+    })
 }
 
 /// Terminal events flush the exporter unconditionally so the last spans always
@@ -199,6 +264,7 @@ fn spawn_detached_export() {
     };
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("export")
+        .arg("--preserve-backlog")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());

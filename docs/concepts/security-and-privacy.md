@@ -23,7 +23,7 @@ remain visible. Encryption does not make that metadata anonymous.
 
 | Control | Process | Effect |
 | --- | --- | --- |
-| `capture_raw_values` / `GENTLY_CAPTURE_RAW_VALUES` | Hook | Encrypt selected content to approved public recipients, then retain ciphertext locally. |
+| `capture_raw_values` / `GENTLY_CAPTURE_RAW_VALUES` | Hook | Encrypt selected content and complete hook JSON to approved public recipients, then retain ciphertext locally. |
 | `sync_raw_values` / `GENTLY_SYNC_RAW_VALUES` | Exporter | Upload retained ciphertext without a reader identity. |
 | `resolve_raw_values` / `GENTLY_RESOLVE_RAW_VALUES` | CLI/MCP reader | Explicitly unlock a reader identity and hydrate referenced fields in memory. |
 
@@ -150,3 +150,15 @@ An export watcher does not authorize a separate CLI or MCP process. Each needs
 its own inherited read credential and, for raw output, an enrolled reader
 identity. See [local setup](../getting-started/local-collector.md) and
 [architecture](architecture.md).
+
+## Local desktop query delegation
+
+On Unix, an unlocked `gently export --watch --serve-queries` can serve tokenless
+CLI/MCP processes through a 0600 socket in the private tenant/device runtime
+directory. Requests must match the watcher's collector URL and tenant. Socket ownership
+and both peers must match the current effective user ID; mode bits alone do not
+exclude extended ACL access. The
+watcher permits only bounded metadata queries and encrypted-object downloads;
+it never returns its token or decrypts content. Reader resolution still requires
+an explicit enrolled reader identity and verifies all ciphertext bindings.
+Processes running as the same local user can access this read-only delegation.

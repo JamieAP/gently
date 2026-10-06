@@ -285,12 +285,18 @@ impl Config {
         Ok(())
     }
 
-    /// Validate that a collector URL + token are configured (for export/query).
-    pub fn require_collector(&self) -> Result<()> {
+    /// Queries need the public collector location even when using a local broker.
+    pub fn require_collector_url(&self) -> Result<()> {
         anyhow::ensure!(
             !self.collector_url.is_empty(),
             "collector_url is not configured (set GENTLY_COLLECTOR_URL or config.toml)"
         );
+        validate_collector_url(&self.collector_url)
+    }
+
+    /// Validate that a collector URL + token are configured (for export/query).
+    pub fn require_collector(&self) -> Result<()> {
+        self.require_collector_url()?;
         anyhow::ensure!(
             !self.token.is_empty(),
             "token is not configured (supply GENTLY_TOKEN through your secret provider)"

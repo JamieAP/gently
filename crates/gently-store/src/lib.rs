@@ -58,7 +58,7 @@ impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         // Precreate and harden the database before SQLite creates WAL sidecars.
         // Do not change the caller's parent directory (it may be a shared /tmp).
-        drop(private_fs::open_private_file(path, false)?);
+        private_fs::prepare_sqlite_file(path)?;
         let sidecars: Vec<std::path::PathBuf> = ["-wal", "-shm", "-journal"]
             .iter()
             .map(|suffix| {
@@ -198,6 +198,81 @@ CREATE TABLE IF NOT EXISTS health (
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_panic_rolls_back_all_tables_and_connection_can_commit_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).unwrap();
+        let span = OpenSpan {
+            session_id: "s".into(),
+            logical_key: "tool:u".into(),
+            span_id: "abcd".into(),
+            parent_span_id: None,
+            name: "Bash".into(),
+            kind: 3,
+            start_unix_nano: 42,
+            attrs_json: "[]".into(),
+        };
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<()> = store.transaction(|s| {
+                s.next_turn_index("s")?;
+                s.turn_ordinal("s", "t")?;
+                s.open_span(&span)?;
+                s.outbox_enqueue("{}")?;
+                panic!("fixture capture panic");
+            });
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(store.outbox_len().unwrap(), 0);
+        assert_eq!(store.current_turn("s").unwrap(), 0);
+        assert!(store.peek_open("s", "tool:u").unwrap().is_none());
+        store
+            .transaction(|s| -> Result<()> {
+                assert_eq!(s.next_turn_index("s")?, 1);
+                assert_eq!(s.turn_ordinal("s", "t")?, (1, true));
+                s.open_span(&span)?;
+                s.outbox_enqueue("{}")
+            })
+            .unwrap();
+        assert_eq!(store.outbox_len().unwrap(), 1);
+        assert_eq!(store.peek_open("s", "tool:u").unwrap(), Some(span));
+    }
+
+    #[test]
+    fn concurrent_transactions_keep_each_counter_with_its_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        Store::open(&path).unwrap();
+        let writers: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let store = Store::open(&path).unwrap();
+                    for _ in 0..50 {
+                        store
+                            .transaction(|s| -> Result<()> {
+                                let turn = s.next_turn_index("shared")?;
+                                std::thread::yield_now();
+                                assert_eq!(s.current_turn("shared")?, turn);
+                                s.outbox_enqueue(&turn.to_string())
+                            })
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let turns: Vec<u64> = store
+            .outbox_take_batch(500)
+            .unwrap()
+            .iter()
+            .map(|(_, json)| json.parse().unwrap())
+            .collect();
+        assert_eq!(turns, (1..=400).collect::<Vec<_>>());
+    }
 
     #[test]
     fn legacy_plaintext_schema_requires_an_explicit_reset() {

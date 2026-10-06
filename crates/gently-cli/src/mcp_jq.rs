@@ -65,7 +65,7 @@ fn val_to_json(value: &Val) -> Result<Value> {
     let mut bytes = Vec::new();
     write::write(&mut bytes, &write::Pp::default(), 0, value)
         .context("encoding jq output as JSON")?;
-    serde_json::from_slice(&bytes).context("parsing jq JSON output")
+    crate::json_fidelity::parse_bytes(&bytes).context("parsing jq JSON output")
 }
 
 #[cfg(test)]
@@ -85,6 +85,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(out, json!([{"id": "a"}, {"id": "b"}]));
+    }
+
+    #[test]
+    fn filters_preserve_literal_transport_marker_objects() {
+        let payload = json!({"nested": [
+            {"$serde_json::private::Number": "ordinary data"},
+            {"$serde_json::private::RawValue": "ordinary data"}
+        ]});
+        assert_eq!(apply(payload.clone(), Some(".")).unwrap(), payload);
     }
 
     #[test]

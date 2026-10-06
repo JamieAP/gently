@@ -127,15 +127,18 @@ pub fn apply(
                     &mut emitted,
                 )?;
                 let parent = SpanId::derive(session, &turn_lkey);
-                store.open_span(&open(
+                let attrs = tool_metadata(attrs.clone(), tool_name, tool_use_id.as_deref(), "open");
+                emitted.push(open_provisional(
+                    store,
+                    session,
+                    trace_id,
                     &key,
                     Some(parent),
                     tool_name,
                     SpanKind::Client,
                     now_nanos,
-                    attrs,
-                    session,
-                ))?;
+                    &attrs,
+                )?);
             }
             SpanOp::CloseTool {
                 tool_use_id,
@@ -172,6 +175,12 @@ pub fn apply(
                     attrs,
                     *duration_ms,
                 )?;
+                span.attributes =
+                    tool_metadata(span.attributes, tool_name, tool_use_id.as_deref(), "closed");
+                if let Some(ms) = duration_ms {
+                    span.attributes
+                        .push(("gently.tool_duration_ms".into(), ms.to_string()));
+                }
                 span.parent_span_id = span
                     .parent_span_id
                     .or(Some(SpanId::derive(session, &turn_lkey)));
@@ -266,6 +275,19 @@ pub fn apply(
                 }
                 emitted.push(span);
             }
+            SpanOp::MarkContext { name, attrs } => {
+                emitted.push(Span {
+                    trace_id,
+                    span_id: SpanId::derive(session, &format!("mark:{name}:{now_nanos}")),
+                    parent_span_id: Some(context_parent),
+                    name: name.clone(),
+                    kind: SpanKind::Internal,
+                    start_unix_nano: now_nanos,
+                    end_unix_nano: now_nanos,
+                    status: Status::Unset,
+                    attributes: attrs.clone(),
+                });
+            }
             SpanOp::Mark { name, attrs } => {
                 let (turn_lkey, turn_name, first_sight) =
                     resolve_turn(store, session, parsed.turn_id.as_deref(), false)?;
@@ -325,15 +347,12 @@ fn resolve_turn(
             ))
         }
         None => {
-            // Claude's counter turns are always opened explicitly by
-            // `UserPromptSubmit`, which fires reliably - so there is no
-            // first-sight-via-a-tool case to back-fill here.
-            let n = if opening {
-                store.next_turn_index(session)?
+            let (n, first_sight) = if opening {
+                (store.next_turn_index(session)?, false)
             } else {
-                store.current_turn(session)?
+                store.observe_current_turn(session)?
             };
-            Ok((turn_key(n), turn_key(n), false))
+            Ok((turn_key(n), turn_key(n), first_sight))
         }
     }
 }
@@ -343,9 +362,10 @@ fn resolve_turn(
 /// continuation turns (a new `task_started` right after the previous
 /// `task_complete`, with no user input) that fire no `UserPromptSubmit` hook - so
 /// without this, every tool under such a turn parents to a `turn:<id>` span that
-/// never exists and dangles. The span is marked `TurnInferred`; the collector
-/// may derive display bounds from available child observations. Those bounds
-/// do not prove capture completeness or actual turn completion.
+/// never exists and dangles. The span is marked `TurnInferred` for honesty; its
+/// true bounds come from the collector's effective_start/end over its children.
+/// A missing prompt/turn ID uses the same mechanism for counter turn zero when
+/// capture starts before any observed prompt.
 #[allow(clippy::too_many_arguments)]
 fn ensure_turn_span(
     store: &Store,
@@ -388,11 +408,24 @@ fn merge_attrs(mut base: Attrs, overrides: &Attrs) -> Attrs {
     base
 }
 
+fn tool_metadata(mut attrs: Attrs, name: &str, id: Option<&str>, state: &str) -> Attrs {
+    let mut metadata = vec![
+        ("gently.tool_name".into(), name.into()),
+        ("gently.tool_state".into(), state.into()),
+    ];
+    if let Some(id) = id.filter(|id| !id.is_empty()) {
+        metadata.push(("gently.tool_use_id".into(), id.into()));
+    } else {
+        attrs.retain(|(key, _)| key != "gently.tool_use_id");
+    }
+    merge_attrs(attrs, &metadata)
+}
+
 /// Stable tool span key: prefer the harness `tool_use_id`; without one, fall
 /// back to the tool name (collides only for concurrent same-name anon tools - a
 /// logged, bounded degradation, never a correctness hazard for keyed tools).
 fn tool_key(tool_use_id: Option<&str>, tool_name: &str) -> String {
-    match tool_use_id {
+    match tool_use_id.filter(|id| !id.is_empty()) {
         Some(id) => format!("tool:{id}"),
         None => format!("tool:{tool_name}:anon"),
     }
@@ -539,6 +572,101 @@ mod tests {
     }
 
     #[test]
+    fn session_observers_do_not_invent_missing_turn_parents() {
+        let (_d, s) = store();
+        for event in [
+            "Setup",
+            "Notification",
+            "InstructionsLoaded",
+            "ConfigChange",
+            "CwdChanged",
+            "DirectoryAdded",
+            "FileChanged",
+            "MessageDisplay",
+            "PreModelSwitch",
+            "PostModelSwitch",
+            "TeammateIdle",
+        ] {
+            let parsed = ClaudeCode
+                .parse(&json!({"hook_event_name":event,"session_id":"s"}))
+                .unwrap();
+            let spans = apply(&s, &parsed, 10).unwrap();
+            assert_eq!(spans.len(), 1);
+            assert_eq!(
+                spans[0].parent_span_id,
+                Some(SpanId::derive("s", "session")),
+                "{event}"
+            );
+        }
+        let parsed = ClaudeCode
+            .parse(&json!({"hook_event_name":"Notification", "session_id":"s", "agent_id":"child"}))
+            .unwrap();
+        let spans = apply(&s, &parsed, 20).unwrap();
+        assert_eq!(
+            spans[0].parent_span_id,
+            Some(SpanId::derive("s", "agent:child"))
+        );
+    }
+
+    #[test]
+    fn empty_invocation_ids_use_distinct_tool_name_fallbacks() {
+        for adapter in [&ClaudeCode as &dyn Harness, &Codex as &dyn Harness] {
+            let (_d, s) = store();
+            let prompt = adapter.parse(&json!({"hook_event_name":"UserPromptSubmit","session_id":"empty-id","turn_id":"t","prompt_id":"t"})).unwrap();
+            apply(&s, &prompt, 100).unwrap();
+            let event = |event: &str, name: &str| {
+                adapter.parse(&json!({"hook_event_name":event,"session_id":"empty-id","turn_id":"t","prompt_id":"t","tool_use_id":"","tool_name":name})).unwrap()
+            };
+            let read = apply(&s, &event("PreToolUse", "Read"), 200)
+                .unwrap()
+                .pop()
+                .unwrap();
+            let write = apply(&s, &event("PreToolUse", "Write"), 300)
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_ne!(
+                read.span_id, write.span_id,
+                "empty IDs must not merge unrelated tool names"
+            );
+            assert_eq!(read.span_id, SpanId::derive("empty-id", "tool:Read:anon"));
+            assert!(!read
+                .attributes
+                .iter()
+                .any(|(key, _)| key == "gently.tool_use_id"));
+            let read_closed = apply(&s, &event("PostToolUse", "Read"), 400)
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(read_closed.span_id, read.span_id);
+            assert_eq!(read_closed.start_unix_nano, 200);
+            let write_closed = apply(&s, &event("PostToolUse", "Write"), 500)
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(write_closed.span_id, write.span_id);
+            assert_eq!(write_closed.start_unix_nano, 300);
+        }
+    }
+
+    #[test]
+    fn empty_parent_tool_id_uses_the_turn_fallback_for_subagents() {
+        for adapter in [&ClaudeCode as &dyn Harness, &Codex as &dyn Harness] {
+            let (_d, s) = store();
+            let prompt = adapter.parse(&json!({"hook_event_name":"UserPromptSubmit","session_id":"empty-parent","turn_id":"p","prompt_id":"p"})).unwrap();
+            let turn = apply(&s, &prompt, 100).unwrap().pop().unwrap();
+            let start = adapter.parse(&json!({"hook_event_name":"SubagentStart","session_id":"empty-parent","turn_id":"p","prompt_id":"p","agent_id":"child","tool_use_id":""})).unwrap();
+            let agent = apply(&s, &start, 200).unwrap().pop().unwrap();
+            assert_eq!(
+                agent.parent_span_id,
+                Some(turn.span_id),
+                "empty caller ID is not an identifiable tool"
+            );
+            assert_eq!(agent.span_id, SpanId::derive("empty-parent", "agent:child"));
+        }
+    }
+
+    #[test]
     fn tool_span_parents_to_current_turn_and_uses_duration() {
         let (_d, s) = store();
         let h = ClaudeCode;
@@ -552,12 +680,18 @@ mod tests {
         assert_eq!(prov[0].name, "turn:1");
         assert_eq!(prov[0].end_unix_nano, prov[0].start_unix_nano);
 
-        // pre tool - tools stay close-only, so nothing emitted yet
+        // The tool opens provisionally, so an interrupted call stays visible.
         let p = h
             .parse(&json!({"hook_event_name":"PreToolUse","session_id":"s",
             "tool_name":"Bash","tool_use_id":"tu_1","tool_input":{"command":"ls"}}))
             .unwrap();
-        assert!(apply(&s, &p, 2_000).unwrap().is_empty());
+        let pre = apply(&s, &p, 2_000).unwrap();
+        assert_eq!(pre.len(), 1);
+        assert_eq!(pre[0].name, "Bash");
+        assert_eq!(pre[0].status, Status::Unset);
+        assert!(pre[0]
+            .attributes
+            .contains(&("gently.tool_state".into(), "open".into())));
 
         // post tool with duration_ms=1 (=1_000_000 ns)
         let p = h
@@ -569,12 +703,90 @@ mod tests {
         let span = &spans[0];
         assert_eq!(span.name, "Bash");
         assert_eq!(span.kind, SpanKind::Client);
+        assert!(span
+            .attributes
+            .contains(&("gently.tool_state".into(), "closed".into())));
+        assert!(span
+            .attributes
+            .contains(&("gently.tool_duration_ms".into(), "1".into())));
         assert_eq!(span.status, Status::Ok);
         // duration_ms overrode the start
         assert_eq!(span.end_unix_nano - span.start_unix_nano, 1_000_000);
         // parent is turn:1
         let expected_parent = SpanId::derive("s", "turn:1");
         assert_eq!(span.parent_span_id, Some(expected_parent));
+    }
+
+    #[test]
+    fn events_without_turn_ids_infer_one_parent_before_the_first_prompt() {
+        for adapter in [&ClaudeCode as &dyn Harness, &Codex as &dyn Harness] {
+            for first_event in [
+                "PreToolUse",
+                "PostToolUse",
+                "SubagentStart",
+                "PermissionRequest",
+            ] {
+                let (_d, s) = store();
+                let event =
+                    |name: &str| {
+                        adapter.parse(&json!({
+                    "hook_event_name":name, "session_id":"legacy",
+                    "tool_name":"Read",
+                    "tool_use_id":if name == "SubagentStart" { None } else { Some("t1") },
+                    "agent_id":if name == "SubagentStart" { Some("child") } else { None }
+                })).unwrap()
+                    };
+                // A child without a caller ID also needs an observed turn parent.
+                let first = apply(&s, &event(first_event), 100).unwrap();
+                assert_eq!(first.len(), 2, "{first_event} must emit its missing parent");
+                assert_eq!(first[0].name, "turn:0");
+                assert!(first[0]
+                    .attributes
+                    .contains(&("gently.event".into(), "TurnInferred".into())));
+                assert_eq!(first[1].parent_span_id, Some(first[0].span_id));
+                let repeat = apply(&s, &event(first_event), 200).unwrap();
+                assert_eq!(repeat.len(), 1, "{first_event} must not reopen its parent");
+                assert_eq!(repeat[0].parent_span_id, Some(first[0].span_id));
+                let prompt = apply(&s, &event("UserPromptSubmit"), 300).unwrap();
+                assert_eq!(prompt[0].name, "turn:1");
+                assert_ne!(prompt[0].span_id, first[0].span_id);
+            }
+        }
+    }
+
+    #[test]
+    fn no_id_turns_remain_scoped_and_closed_turns_are_not_reopened() {
+        for adapter in [&ClaudeCode as &dyn Harness, &Codex as &dyn Harness] {
+            let (_d, s) = store();
+            let event = |name: &str, agent: Option<&str>| {
+                adapter
+                    .parse(&json!({
+                        "hook_event_name":name, "session_id":"scoped",
+                        "agent_id":agent, "tool_name":"Read", "tool_use_id":"t1"
+                    }))
+                    .unwrap()
+            };
+            // A close as the first observation supplies the parent itself.
+            let closed = apply(&s, &event("Stop", None), 100).unwrap();
+            assert_eq!(closed.len(), 1);
+            let main_tool = apply(&s, &event("PreToolUse", None), 200).unwrap();
+            assert_eq!(main_tool.len(), 1);
+            assert_eq!(main_tool[0].parent_span_id, Some(closed[0].span_id));
+            // The child has independent first-sight bookkeeping and a turn
+            // under its agent, even though the root counter already exists.
+            let child = apply(&s, &event("PreToolUse", Some("child")), 300).unwrap();
+            assert_eq!(child.len(), 2);
+            assert_eq!(
+                child[0].parent_span_id,
+                Some(SpanId::derive("scoped", "agent:child"))
+            );
+            assert_eq!(child[1].parent_span_id, Some(child[0].span_id));
+            assert_ne!(child[0].span_id, closed[0].span_id);
+            for agent in [None, Some("child")] {
+                let prompt = apply(&s, &event("UserPromptSubmit", agent), 400).unwrap();
+                assert_eq!(prompt[0].name, "turn:1");
+            }
+        }
     }
 
     #[test]
@@ -587,11 +799,13 @@ mod tests {
             "tool_name":"Read","tool_use_id":"tu_x","tool_response":{}}))
             .unwrap();
         let spans = apply(&s, &p, 9_000).unwrap();
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].start_unix_nano, 9_000);
-        assert_eq!(spans[0].end_unix_nano, 9_000);
+        assert_eq!(spans.len(), 2);
+        let tool = &spans[1];
+        assert_eq!(tool.start_unix_nano, 9_000);
+        assert_eq!(tool.end_unix_nano, 9_000);
+        assert_eq!(tool.parent_span_id, Some(spans[0].span_id));
         // still belongs to the trace
-        assert_eq!(spans[0].trace_id, TraceId::from_session("s"));
+        assert_eq!(tool.trace_id, TraceId::from_session("s"));
     }
 
     #[test]
@@ -817,7 +1031,11 @@ mod tests {
             100,
         )
         .unwrap();
-        assert_eq!(pre.len(), 1, "first-sight tool back-fills its turn span");
+        assert_eq!(
+            pre.len(),
+            2,
+            "first-sight tool emits itself and its inferred turn"
+        );
         assert_eq!(pre[0].name, "turn:1");
         assert_eq!(pre[0].span_id, SpanId::derive("cx", "turn:auto1"));
         assert_eq!(
@@ -849,10 +1067,8 @@ mod tests {
             300,
         )
         .unwrap();
-        assert!(
-            pre2.is_empty(),
-            "turn already exists; no duplicate turn span"
-        );
+        assert_eq!(pre2.len(), 1, "only the tool; no duplicate turn span");
+        assert_eq!(pre2[0].name, "Read");
     }
 
     #[test]

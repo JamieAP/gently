@@ -47,8 +47,8 @@ pub struct Parsed {
     pub transcript_path: Option<String>,
     /// The harness-reported turn id, when the payload carries one (Codex's
     /// `turn_id`). Drives turn-span identity in `apply` so out-of-order turn
-    /// lifecycle events resolve the correct turn. `None` for harnesses that
-    /// don't supply one (Claude), which fall back to the monotonic counter.
+    /// lifecycle events resolve the correct turn. Claude's `prompt_id` supplies
+    /// the same lifecycle identity. Missing IDs use the monotonic counter.
     pub turn_id: Option<String>,
     /// Current execution subagent, distinct from a lifecycle event subject.
     /// Keeps child turn/tool state separate while sharing the parent trace.
@@ -102,6 +102,29 @@ pub enum SpanOp {
         name: String,
         attrs: Attrs,
     },
+    /// A session or execution-agent observer that does not imply a turn.
+    MarkContext {
+        name: String,
+        attrs: Attrs,
+    },
+}
+
+impl SpanOp {
+    /// Parsed event metadata, before mutable lifecycle aggregation.
+    pub fn observation_attrs(&self) -> &Attrs {
+        match self {
+            Self::OpenSession { attrs }
+            | Self::CloseSession { attrs, .. }
+            | Self::OpenTurn { attrs }
+            | Self::CloseTurn { attrs, .. }
+            | Self::OpenTool { attrs, .. }
+            | Self::CloseTool { attrs, .. }
+            | Self::OpenAgent { attrs, .. }
+            | Self::CloseAgent { attrs, .. }
+            | Self::Mark { attrs, .. }
+            | Self::MarkContext { attrs, .. } => attrs,
+        }
+    }
 }
 
 /// String-valued span attributes, kept as ordered pairs for stable encoding.

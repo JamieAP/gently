@@ -38,7 +38,7 @@ appears in the collector.
 | No new local activity | Run `gently init` for the intended agent, restart it, and make sure it uses the installed hooks. Review/trust Codex hooks inside Codex. |
 | Queue grows, with no export attempts | Tokenless hooks only queue. Start a token-bearing export watcher or use the local collector launcher. |
 | `collector_url is not configured` | Set the base URL in the active state directory's config, or supply `GENTLY_COLLECTOR_URL`. |
-| `token is not configured` | Supply `GENTLY_TOKEN` to this command or MCP server through your secret manager. A separate watcher's token does not apply here. |
+| `token is not configured` | Export needs a token supplied through your secret manager. Unix CLI/MCP queries can use an unlocked watcher with `--serve-queries`, provided the state directory and collector URL match. |
 | Export or query returns `401`/`403` | Confirm the process and collector use the same token without displaying it. Export stops on rejection and retains the queue; correct the token and restart the watcher. |
 | Local connection refused | Start `./scripts/collector-local` and leave its terminal open. Check that the configured URL is `http://127.0.0.1:8787`. |
 | Raw retention is missing | Verify capture opt-in, signed manifest, owner pin, minimum epoch, exact policy digest and expiry; check the raw byte budget. Metadata continues when policy or capacity prevents raw retention. |
@@ -48,7 +48,9 @@ appears in the collector.
 | Cloudflare database errors | Replace `REPLACE_AFTER_CREATE` with the created D1 ID and execute `schema.sql` against the intended local or remote database. |
 | Quarantine count increases | Check the recorded error and payload/schema compatibility. Fixing the cause does not automatically replay quarantined envelopes. |
 | Export works but queries are empty | Check the target URL, query filters and state directory. Queries read the collector, not the local outbox. Generate fresh activity and list unfiltered traces. |
-| MCP is absent or fails | Re-run init and restart the client. Check registration and provide the token to the MCP process, not just the exporter. |
+| MCP is absent or fails | Re-run init and restart the client. Check registration and provide a token or start the watcher with `--serve-queries` on Unix. |
+| Codex capture is duplicated or labeled `claude-code` | Check both `~/.codex/hooks.json` and inline TOML hooks. Run `gently init --codex` to remove covered legacy Gently handlers, then restart Codex. Custom registrations should invoke `gently hook --harness codex`. |
+| The local launcher stops both services | Its exit diagnostic identifies the exporter or collector and exit status or signal. Check that cause before restarting; queued hooks remain available for a later drain. |
 
 For retry and queue behavior, see [Reliability](../concepts/reliability.md).
 For settings and file locations, see [Configuration](../getting-started/configuration.md).
@@ -56,10 +58,11 @@ For settings and file locations, see [Configuration](../getting-started/configur
 ## Desktop capture and MCP
 
 Desktop hooks can record without inheriting a token. A foreground-unlocked
-watcher can export those records, but it cannot authenticate a separately
-launched desktop MCP server. Authenticated desktop MCP access and Claude
-Chat/Cowork integration remain incomplete. Verify capture and export separately
-instead of treating a running collector as proof that desktop queries work.
+watcher can export those records and, with `--serve-queries` on Unix, serve
+read-only queries for tokenless desktop MCP clients. Restart older watchers
+and ensure both processes use the same state directory and collector URL.
+A stale socket is recovered when the watcher restarts; a non-socket path is
+refused. Verify actual queries as well as export health.
 
 For Claude Code, inspect the registration with `claude mcp get gently` after
 restarting the client. For Codex, check the installed hook and MCP entries in its

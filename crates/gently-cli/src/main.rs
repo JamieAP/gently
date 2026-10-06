@@ -10,9 +10,12 @@ mod cmd_raw;
 mod cmd_status;
 mod collector;
 mod config;
+mod json_fidelity;
 mod local_raw;
 mod logging;
 mod mcp_jq;
+#[cfg(unix)]
+mod query_broker;
 mod query_client;
 mod waterfall;
 
@@ -49,6 +52,14 @@ enum Command {
         /// Keep draining new hook events after one secret-store unlock.
         #[arg(long)]
         watch: bool,
+        /// Serve read-only queries for tokenless local CLI and desktop MCP
+        /// clients over an owner-only Unix socket. Requires --watch.
+        #[arg(long, requires = "watch")]
+        serve_queries: bool,
+        /// Keep queued envelopes even above outbox_cap; do not trim history
+        /// before exporting. Queue storage can grow without a limit.
+        #[arg(long)]
+        preserve_backlog: bool,
         /// Seconds between drains in watch mode.
         #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=60))]
         interval_secs: u64,
@@ -176,13 +187,20 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Hook { .. } => unreachable!("handled in main"),
         Command::Export {
             watch,
+            serve_queries,
+            preserve_backlog,
             interval_secs,
             retry_raw_quarantine,
         } => {
             if watch {
-                cmd_export::watch(interval_secs, retry_raw_quarantine)
+                cmd_export::watch(
+                    interval_secs,
+                    serve_queries,
+                    preserve_backlog,
+                    retry_raw_quarantine,
+                )
             } else {
-                cmd_export::run(retry_raw_quarantine)
+                cmd_export::run(preserve_backlog, retry_raw_quarantine)
             }
         }
         Command::Raw { command } => cmd_raw::run(command),

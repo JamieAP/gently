@@ -35,8 +35,12 @@ toml = "0.8"
 toml_edit = "0.22"
 zeroize = "1.8"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 age = "=0.12.1"
+rusqlite.workspace = true
 assert_cmd = "2"
 tempfile = "3"
 predicates = "3"

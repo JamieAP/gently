@@ -106,10 +106,11 @@ Restart the agent to load its registration. Claude Code registration can be
 checked with `claude mcp get gently`. Codex hooks also need to be trusted through
 `/hooks` inside Codex.
 
-The MCP server uses stdio and read-only tools. Its process must have collector
-credentials when it starts. Authenticated desktop MCP access and Claude
-Chat/Cowork integration remain partial; hook capture and a token-bearing watcher
-do not by themselves complete desktop query setup.
+The MCP server uses stdio and read-only tools. It needs either collector
+credentials or, on Unix, an unlocked `gently export --watch --serve-queries --preserve-backlog`
+using the same state directory, tenant, device and collector URL. Tokenless desktop clients
+automatically delegate queries through the private socket. Restart older
+watchers to enable this; the bundled local launchers pass the flag.
 
 | Tool | Arguments | Result |
 | --- | --- | --- |
@@ -122,7 +123,7 @@ do not by themselves complete desktop query setup.
 | `span_attr_keys` | Same filters as `search_spans`, plus `jq?` | `span_attrs`, `resource_attrs`, and `spans_scanned` |
 
 `response_fields` does not fetch collector data, although server startup still
-requires credentials. `span_attr_keys` inspects only the returned search window;
+requires credentials or a local query socket. `span_attr_keys` inspects only the returned search window;
 it is not an inventory of every attribute ever captured. When the harness emits
 tool hooks for MCP calls, a Gently query can itself appear as a tool span.
 

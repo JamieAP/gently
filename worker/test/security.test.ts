@@ -247,7 +247,7 @@ describe("opaque encrypted raw objects", () => {
 
 describe("metadata ingest plaintext guards", () => {
   it("rejects known plaintext raw attributes in spans and resources", async () => {
-    for (const key of ["gently.prompt", "gently.tool_input", "gently.tool_response", "gently.user", "gently.assistant", "gently.input", "gently.output", "gently.compact_instructions", "gently.compact_summary", "gently.tool_calls", "gently.error", "gently.error_details", "prompt", "tool_input", "assistant_message"]) {
+    for (const key of ["gently.prompt", "gently.tool_input", "gently.tool_response", "gently.user", "gently.assistant", "gently.input", "gently.output", "gently.compact_instructions", "gently.compact_summary", "gently.tool_calls", "gently.error", "gently.error_details", "prompt", "tool_input", "assistant_message", "hook_payload", "gently.hook_payload", "message.delta", "gently.message.delta", "instruction_file", "gently.instruction_file"]) {
       const attrs = [{ key, value: { stringValue: "synthetic-private-plaintext" } }];
       expect((await postSpans(otlp(attrs))).status).toBe(400);
       expect((await postSpans(otlp([], attrs))).status).toBe(400);

@@ -76,7 +76,7 @@ function attrString(attrs: OtlpKeyValue[] | undefined, key: string): string | nu
 const RAW_FIELDS = new Set([
   "prompt", "user", "user_prompt", "assistant", "assistant_message", "last_assistant_message",
   "tool_input", "tool_response", "input", "output", "tool_output", "tool_result", "response", "raw",
-  "compact_instructions", "compact_summary", "custom_instructions", "tool_calls", "error", "error_details",
+  "compact_instructions", "compact_summary", "custom_instructions", "tool_calls", "error", "error_details", "hook_payload", "message.delta", "instruction_file",
 ]);
 
 const SAFE_REASONS = new Set(["clear", "logout", "prompt_input_exit", "bypass_permissions_disabled", "other", "exit", "shutdown"]);

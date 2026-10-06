@@ -123,8 +123,10 @@ when supplied. It lifts tool name and tool-use ID from span attributes. Lifted
 span keys are removed from `attrs_json`; resource attributes remain intact.
 
 Trace `error_count` counts status-2 spans with a non-null `tool_name`, excluding
-failed turns and roots. Tool statistics also count only tool rows. Their average
-uses raw start/end values for rows with an end, not effective bounds; it is a
+failed turns, roots and historical permission markers. Tool statistics also
+exclude `PermissionRequest` and `PermissionDenied` observations. Their average
+uses raw start/end values for rows with an end, excluding tools marked
+`gently.tool_state = "open"`, not effective bounds; it is a
 floating-point mean, not a percentile or exact nanosecond calculation. A missing
 mean is null. `last_activity` is maximum raw end, falling back to start for a row
 without an end, rather than last ingestion time.

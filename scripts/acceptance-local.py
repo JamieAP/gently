@@ -291,7 +291,7 @@ def main():
                 with sqlite3.connect(db_path) as db:
                     return db.execute(sql).fetchone()[0]
 
-            require(scalar("SELECT count(*) FROM raw_objects") == 2, "both harness raw captures missing")
+            require(scalar("SELECT count(*) FROM raw_objects") == 4, "both harness raw captures missing")
             export_env = {**capture, "GENTLY_TOKEN": TOKENS[0], "GENTLY_SYNC_RAW_VALUES": "1",
                           "GENTLY_RAW_IDENTITY": str(root / "deliberately-missing-reader")}
             denied = command([binary, "export"], {**export_env, "GENTLY_TOKEN": "invented-invalid"}, ok=False)
@@ -299,7 +299,7 @@ def main():
                     "authentication failure lost queued metadata")
             stop_group(worker)
             outage = command([binary, "export"], export_env, ok=False)
-            require(outage.returncode != 0 and scalar("SELECT count(*) FROM raw_objects WHERE synced=0") == 2,
+            require(outage.returncode != 0 and scalar("SELECT count(*) FROM raw_objects WHERE synced=0") == 4,
                     "outage lost queued ciphertext")
             worker = start_worker()
             command([binary, "export"], export_env)

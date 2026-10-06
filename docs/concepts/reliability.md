@@ -10,7 +10,8 @@ queued or eventually delivered.
 A hook with a collector URL and token may start a detached one-shot exporter.
 Terminal events request a final drain; other events skip startup when an
 exporter lock is already held. Tokenless hooks only queue records and never
-request interactive credential unlock.
+request interactive credential unlock. Hook-spawned exporters pass
+`--preserve-backlog` to avoid deleting accumulated history.
 
 A one-shot exporter drains until the queue is empty or a failure stops the run.
 It exits if another exporter already holds the file lock. A watcher retains the
@@ -75,18 +76,32 @@ creating duplicate rows within the tenant. A different capture device cannot
 update a span owned by another host, and even its owner cannot change the trace
 identity. Cross-device parent links are allowed.
 
-Merging keeps the earliest reported start and the latest reported endpoint.
-Status, attributes and parent metadata come from the report with the latest
-ending timestamp; equal timestamps favor the newly received report. Conflicting
-metadata with tied timestamps can therefore depend on delivery order.
+Lifecycle merging keeps the earliest reported start and latest endpoint. For
+tools, completed reports outrank provisional opens; completed reports with a
+runtime `duration_ms` outrank timings inferred from hook timestamps and retain
+their start and end together. Among reports of equal precedence, status,
+attributes and parent metadata come from the latest ending timestamp; equal
+timestamps favor the newly received report. Conflicting metadata with tied
+timestamps can therefore depend on delivery order.
 
-SQLite WAL and a busy timeout support concurrent hook writers. Hooks contain
-ordinary errors and caught panics, so exit status alone cannot establish that a
-record was stored. Process termination, storage faults, missing hook events and
-capacity trimming can still cause incomplete traces.
+SQLite WAL and a busy timeout support concurrent hook writers. Each hook commits
+its lifecycle changes, opt-in encrypted raw object and outbox envelope in one immediate
+transaction. A failed write or caught panic rolls back those SQLite changes,
+preserving prior open-span state and inferred-turn bookkeeping for a retry.
+Database and sidecar permission checks preserve SQLite's POSIX locks: opening
+and closing an unrelated ordinary descriptor for the same file can release
+those locks, as described in [SQLite's locking guidance](https://www.sqlite.org/howtocorrupt.html).
+Linux permission changes use an `O_PATH` descriptor through procfs; systems
+without procfs must provide files already restricted to owner-only access.
+Hooks contain ordinary
+errors and caught panics, so exit status alone cannot establish that a record was
+stored. Process termination, storage faults, missing hook events and capacity
+trimming can still cause incomplete traces; Gently cannot replay an event the
+harness does not resend.
 
-Session, turn and subagent opens emit provisional reports; tools emit on close.
-Missing closes leave provisional records or omit tools. During later hook
+Session, turn, tool and subagent opens emit provisional reports. Missing closes
+leave provisional records with unset status, alongside independent `hook:<Event>`
+receipts of the received events. During later hook
 processing, local open-span bookkeeping with a start more than 24 hours old is
 reaped. This does not remove emitted collector records, but a very long-lived
 span can lose the local timing state needed for a later close.

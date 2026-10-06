@@ -311,6 +311,260 @@ fn run_init(home: &std::path::Path, harness: &str) {
 }
 
 #[test]
+fn installers_preserve_literal_transport_keys_and_precise_custom_numbers() {
+    use serde_json::value::RawValue;
+    use std::collections::BTreeMap;
+    let custom = serde_json::json!({
+        "number_object": {"$serde_json::private::Number": "123"},
+        "raw_object": {"$serde_json::private::RawValue": "123"},
+        "literal_object": {"$serde_json::private::Number": "ordinary object data"},
+    });
+    let custom_json = custom.to_string();
+    let exe = assert_cmd::cargo::cargo_bin("gently");
+    for harness in ["--claude", "--codex"] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = if harness == "--claude" {
+            vec![
+                dir.path().join(".claude/settings.json"),
+                dir.path().join(".claude.json"),
+            ]
+        } else {
+            vec![dir.path().join(".codex/hooks.json")]
+        };
+        for path in &paths {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let hooks = serde_json::json!({"PreToolUse":[{"hooks":[{"type":"command", "command":format!("{} hook", exe.display())}]}]});
+            let content = format!(
+                r#"{{"custom":{custom_json},"precise":0.123456789012345678901234567890,"hooks":{hooks}}}"#
+            );
+            std::fs::write(path, content).unwrap();
+        }
+        for _ in 0..2 {
+            run_init(dir.path(), harness);
+            for path in &paths {
+                let text = std::fs::read_to_string(path).unwrap();
+                let root: BTreeMap<String, Box<RawValue>> = serde_json::from_str(&text).unwrap();
+                let members: BTreeMap<String, Box<RawValue>> =
+                    serde_json::from_str(root["custom"].get()).unwrap();
+                for (key, marker, expected) in [
+                    ("number_object", "$serde_json::private::Number", "123"),
+                    ("raw_object", "$serde_json::private::RawValue", "123"),
+                    (
+                        "literal_object",
+                        "$serde_json::private::Number",
+                        "ordinary object data",
+                    ),
+                ] {
+                    let object: BTreeMap<String, String> =
+                        serde_json::from_str(members[key].get()).unwrap();
+                    assert_eq!(object[marker], expected);
+                }
+                assert_eq!(root["precise"].get(), "0.123456789012345678901234567890");
+            }
+        }
+    }
+}
+
+#[test]
+fn codex_migrates_exact_legacy_json_handlers_without_removing_user_hooks() {
+    let dir = tempfile::tempdir().unwrap();
+    let codex = dir.path().join(".codex");
+    std::fs::create_dir(&codex).unwrap();
+    let exe = assert_cmd::cargo::cargo_bin("gently");
+    let claude_command = format!("{} hook", exe.display());
+    let codex_command = format!("{} hook --harness codex", exe.display());
+    let policy = serde_json::json!({"type":"command", "command":"user-policy", "timeout":7});
+    let custom =
+        serde_json::json!({"type":"command", "command":format!("CUSTOM=1 {} hook", exe.display())});
+    let legacy = serde_json::json!({"description":"user metadata", "hooks":{
+        "PreToolUse":[{"matcher":"Read", "hooks":[{"type":"command","command":claude_command},policy]}],
+        "PostToolUse":[{"hooks":[{"type":"command","command":codex_command}]}],
+        "Stop":[{"hooks":[custom]}],
+        "FutureEvent":[{"hooks":[{"type":"command","command":claude_command}]}]
+    }});
+    let path = codex.join("hooks.json");
+    std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    run_init(dir.path(), "--codex");
+    let migrated: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(migrated["description"], legacy["description"]);
+    assert_eq!(migrated["hooks"]["PreToolUse"][0]["matcher"], "Read");
+    assert_eq!(
+        migrated["hooks"]["PreToolUse"][0]["hooks"],
+        serde_json::json!([policy])
+    );
+    assert_eq!(migrated["hooks"]["PostToolUse"], serde_json::json!([]));
+    assert_eq!(migrated["hooks"]["Stop"], legacy["hooks"]["Stop"]);
+    assert_eq!(
+        migrated["hooks"]["FutureEvent"],
+        legacy["hooks"]["FutureEvent"]
+    );
+    let canonical: toml::Value =
+        toml::from_str(&std::fs::read_to_string(codex.join("config.toml")).unwrap()).unwrap();
+    assert_eq!(
+        canonical["hooks"]["PreToolUse"].as_array().unwrap().len(),
+        1
+    );
+    run_init(dir.path(), "--codex");
+    let again: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(again, migrated);
+}
+
+#[test]
+fn codex_preserves_legacy_json_coverage_missing_from_a_narrow_inline_matcher() {
+    let dir = tempfile::tempdir().unwrap();
+    let codex = dir.path().join(".codex");
+    std::fs::create_dir(&codex).unwrap();
+    let exe = assert_cmd::cargo::cargo_bin("gently");
+    let inline = format!("[[hooks.PreToolUse]]\nmatcher = 'Read'\n[[hooks.PreToolUse.hooks]]\ntype = 'command'\ncommand = '{} hook --harness codex'\n", exe.display());
+    std::fs::write(codex.join("config.toml"), inline).unwrap();
+    let legacy = serde_json::json!({"hooks":{"PreToolUse":[{"matcher":"Write","hooks":[{"type":"command","command":format!("{} hook",exe.display())}]}]}});
+    let path = codex.join("hooks.json");
+    std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    run_init(dir.path(), "--codex");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&std::fs::read(path).unwrap()).unwrap(),
+        legacy
+    );
+    let canonical: toml::Value =
+        toml::from_str(&std::fs::read_to_string(codex.join("config.toml")).unwrap()).unwrap();
+    assert_eq!(
+        canonical["hooks"]["PreToolUse"][0]["matcher"].as_str(),
+        Some("Read")
+    );
+}
+
+#[test]
+fn codex_preserves_json_when_inline_has_a_custom_windows_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let codex = dir.path().join(".codex");
+    std::fs::create_dir(&codex).unwrap();
+    let exe = assert_cmd::cargo::cargo_bin("gently");
+    let inline = format!("[[hooks.PreToolUse]]\n[[hooks.PreToolUse.hooks]]\ntype = 'command'\ncommand = '{} hook --harness codex'\ncommand_windows = 'custom-windows-handler'\n", exe.display());
+    std::fs::write(codex.join("config.toml"), inline).unwrap();
+    let legacy = serde_json::json!({"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":format!("{} hook",exe.display())}]}]}});
+    let path = codex.join("hooks.json");
+    std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    run_init(dir.path(), "--codex");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&std::fs::read(path).unwrap()).unwrap(),
+        legacy
+    );
+}
+
+#[test]
+fn codex_leaves_custom_json_handlers_and_platform_overrides_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let codex = dir.path().join(".codex");
+    std::fs::create_dir(&codex).unwrap();
+    let exe = assert_cmd::cargo::cargo_bin("gently");
+    let custom = serde_json::json!({"hooks":{"PreToolUse":[{"hooks":[
+        {"type":"command", "command":format!("{} hook", exe.display()), "commandWindows":"custom-windows-handler"},
+        {"type":"command", "command":format!("CUSTOM=1 {} hook", exe.display())}
+    ]}]}});
+    let text = serde_json::to_string(&custom).unwrap();
+    let path = codex.join("hooks.json");
+    std::fs::write(&path, &text).unwrap();
+    run_init(dir.path(), "--codex");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), text);
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_skips_symlinked_legacy_json_and_finishes_inline_setup() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let codex = dir.path().join(".codex");
+    std::fs::create_dir(&codex).unwrap();
+    let target = dir.path().join("user-settings.json");
+    std::fs::write(&target, "{\"user\":true}").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::os::unix::fs::symlink(&target, codex.join("hooks.json")).unwrap();
+    let inline = "model = 'user-choice'\n";
+    std::fs::write(codex.join("config.toml"), inline).unwrap();
+    Command::cargo_bin("gently")
+        .unwrap()
+        .args(["init", "--codex"])
+        .env("HOME", dir.path())
+        .env("GENTLY_STATE_DIR", dir.path().join(".gently"))
+        .assert()
+        .success()
+        .stderr(predicates::str::contains(
+            "skipped legacy Codex hooks.json migration",
+        ));
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"user\":true}");
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    assert!(std::fs::symlink_metadata(codex.join("hooks.json"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    let updated = std::fs::read_to_string(codex.join("config.toml")).unwrap();
+    assert!(updated.contains("model = 'user-choice'"));
+    assert!(updated.contains("hook --harness codex"));
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_skips_hardlinked_legacy_json_without_changing_target() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    let codex = dir.path().join(".codex");
+    std::fs::create_dir(&codex).unwrap();
+    let target = dir.path().join("user-settings.json");
+    // Invalid JSON proves the optional path is skipped without being parsed.
+    std::fs::write(&target, "synthetic linked user configuration").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::hard_link(&target, codex.join("hooks.json")).unwrap();
+    run_init(dir.path(), "--codex");
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "synthetic linked user configuration"
+    );
+    let metadata = std::fs::metadata(&target).unwrap();
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o644);
+    assert_eq!(metadata.nlink(), 2);
+    assert!(std::fs::read_to_string(codex.join("config.toml"))
+        .unwrap()
+        .contains("hook --harness codex"));
+}
+
+#[test]
+fn claude_installs_observational_hooks_without_taking_over_worktrees() {
+    let dir = tempfile::tempdir().unwrap();
+    run_init(dir.path(), "--claude");
+    let settings: Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap(),
+    )
+    .unwrap();
+    for event in [
+        "Setup",
+        "UserPromptExpansion",
+        "MessageDisplay",
+        "Notification",
+        "PermissionDenied",
+        "TaskCreated",
+        "TaskCompleted",
+        "TeammateIdle",
+        "InstructionsLoaded",
+        "ConfigChange",
+        "CwdChanged",
+        "DirectoryAdded",
+        "FileChanged",
+        "PreModelSwitch",
+        "Elicitation",
+        "ElicitationResult",
+    ] {
+        assert!(settings["hooks"][event].is_array(), "missing {event}");
+    }
+    // These handlers replace git's create/remove behavior; a silent observer
+    // must never register them as if they were ordinary lifecycle callbacks.
+    assert!(settings["hooks"]["WorktreeCreate"].is_null());
+    assert!(settings["hooks"]["WorktreeRemove"].is_null());
+}
+
+#[test]
 fn claude_refresh_registers_current_events_and_preserves_preferences() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
@@ -354,8 +608,8 @@ fn claude_refresh_registers_current_events_and_preserves_preferences() {
         settings["hooks"]["PreToolUse"][0]
     );
     assert_eq!(
-        first["hooks"]["Notification"],
-        settings["hooks"]["Notification"]
+        first["hooks"]["Notification"][0],
+        settings["hooks"]["Notification"][0]
     );
     let installed: Value =
         serde_json::from_str(&std::fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();

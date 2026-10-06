@@ -105,7 +105,9 @@ Restart the agent so it loads the hooks and MCP registration, then run a short
 task that uses a tool. Hooks with a token can start a detached exporter. Hooks
 without a token only queue locally; a token-bearing `gently export --watch`
 process can drain their queue. The local collector launcher starts that watcher
-for you. Neither approach supplies a token to other CLI or MCP query processes.
+for you. The local launchers enable `--serve-queries` on Unix, allowing tokenless
+CLI/MCP processes to delegate read-only queries through the private watcher
+socket. The token remains in the watcher.
 
 ## 4. Verify capture and export
 

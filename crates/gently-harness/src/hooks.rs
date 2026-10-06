@@ -14,7 +14,8 @@ pub(crate) fn common_attrs(raw: &serde_json::Value, event: &str) -> Attrs {
     // `model` is a common field on every Codex hook event (≥0.136) and is the
     // only in-band source of the model that produced the work - captured here so
     // a model breakdown is queryable straight from a span, without parsing
-    // transcripts. Claude omits it from the payload, so this is a no-op there.
+    // transcripts. Current Claude SessionStart can also supply an optional
+    // model; events that omit it leave the attribute unset.
     if let Some(model) = str_field(raw, "model") {
         attrs.push(("gently.model".into(), model));
     }
@@ -79,6 +80,19 @@ pub(crate) fn str_field(raw: &serde_json::Value, key: &str) -> Option<String> {
 
 pub(crate) fn u64_field(raw: &serde_json::Value, key: &str) -> Option<u64> {
     raw.get(key).and_then(serde_json::Value::as_u64)
+}
+
+/// A permission observation refers to a tool without being an execution span.
+/// Namespace correlation metadata so collector tool rollups stay accurate.
+pub(crate) fn push_observed_tool_attrs(attrs: &mut Attrs, raw: &serde_json::Value) {
+    for field in ["tool_name", "tool_use_id"] {
+        if let Some(value) = str_field(raw, field).filter(|v| !v.is_empty()) {
+            attrs.push((format!("gently.hook.{field}"), value));
+        }
+    }
+    if let Some(input) = raw.get("tool_input") {
+        push_value_length(attrs, "gently.tool_input", input);
+    }
 }
 
 /// Append a `<key>.bytes` attribute for an arbitrary JSON value.
