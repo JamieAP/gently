@@ -9,7 +9,7 @@ Use `gently --help` or `gently <command> --help` for command syntax;
 | Command | Collector URL and token required? |
 | --- | --- |
 | `hook` | No. Events queue locally without credentials. |
-| `init`, `uninstall`, `status`, `state`, `raw` | No. These use local configuration and files. |
+| `init`, `uninstall`, `status`, `state`, `raw`, `quarantine` | No. These use local configuration and files. |
 | `waterfall` | No. Reads stdin without loading configuration or local state. |
 | `export` | Yes. |
 | `traces`, `trace`, `spans`, `stats`, `whoami`, `mcp` | URL plus token, or a local query watcher on Unix. |
@@ -93,7 +93,7 @@ errors so it exits successfully; argument-parsing errors are separate.
 gently export
 gently export --watch --interval-secs 2
 # Enable tokenless desktop MCP and CLI queries on Unix:
-gently export --watch --serve-queries --preserve-backlog
+gently export --watch --serve-queries
 ```
 
 Without `--watch`, drain the queued envelopes and exit. With
@@ -124,13 +124,30 @@ a watcher continues retrying, with delay capped at 30 seconds. Malformed queued
 JSON and rejected envelopes can be quarantined. An envelope is quarantined as a
 whole, including any valid sibling spans it contains.
 
-The default outbox cap is 10,000 envelopes and is enforced when a drain starts,
-by dropping the oldest excess rows. `--preserve-backlog` overrides that cap for
-this process, keeping all queued history, including before an authentication
-failure. Hook-spawned exporters and bundled local launchers set this option;
-queue storage can grow without a limit. A tokenless queue can grow past this cap
-before export begins. See [reliability](../concepts/reliability.md) for delivery,
-retry, and quarantine behavior.
+All exporters preserve the complete backlog by default. `--discard-oldest` opts
+into permanently dropping oldest excess envelopes above `outbox_cap` (default
+10,000) before each drain, including one that subsequently fails authentication.
+Storage can grow without a limit under an outage; monitor queue depth and disk use.
+
+Earlier versions trimmed to `outbox_cap` unless `--preserve-backlog` was passed.
+The option is hidden but still accepted, and it conflicts with `--discard-oldest`.
+A launcher that might run an earlier version should keep passing it; the bundled
+hook and local launchers do.
+
+## `gently quarantine`
+
+`gently quarantine list --limit 100 --after-id 0` returns bounded JSON summaries
+for the current local tenant/device namespace: `id`, `bytes`,
+`quarantined_unix_nano`, `category` and `http_status`. The category is
+`invalid_json` (malformed queued bytes), `collector_rejection` (the collector
+returned the `http_status`, such as 409 or 413) or `other` (a reason this version
+does not recognize); `http_status` is `null` unless the collector rejected the
+row. It never prints retained payloads or stored reason text. Use the
+last ID as `--after-id` to continue. `gently quarantine retry --id 1` atomically
+requeues one envelope without sending or decrypting it. Correct the underlying
+issue, then use `gently export`; collector authentication and tenant checks still
+apply. Retry of an absent/already retried row fails explicitly. Ciphertext retry
+remains `gently export --retry-raw-quarantine`.
 
 ## `gently status [--json]`
 
