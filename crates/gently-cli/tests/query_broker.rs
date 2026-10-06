@@ -162,9 +162,14 @@ fn tokenless_cli_and_mcp_query_through_unlocked_watcher() {
         .env("GENTLY_STATE_DIR", dir.path())
         .env("GENTLY_TENANT_ID", "personal").env("GENTLY_DEVICE_ID", "capture-host").env_remove("GENTLY_TOKEN")
         .env("GENTLY_COLLECTOR_URL", &url)
-        .write_stdin("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"list_traces\",\"arguments\":{}}}\n")
+        .write_stdin(concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"synthetic\",\"version\":\"1\"}}}\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"list_traces\",\"arguments\":{}}}\n"
+        ))
         .assert().success().get_output().stdout.clone();
-    let response: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let response: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&output).lines().last().unwrap()).unwrap();
     assert!(response.get("error").is_none(), "{response}");
     assert!(!String::from_utf8(output)
         .unwrap()

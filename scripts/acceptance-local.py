@@ -316,7 +316,10 @@ def main():
                                         query_env(device_env, identity), reader_prompts(index))
                 require(CANARIES[0] in text, "enrolled reader failed remote historical decryption")
             mcp_requests = [
-                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                    "protocolVersion": "2025-06-18", "capabilities": {},
+                    "clientInfo": {"name": "synthetic-acceptance", "version": "1"}}},
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
                 {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
                 {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "search_spans",
                  "arguments": {"session_id": "acceptance-codex"}}},
