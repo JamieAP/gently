@@ -136,7 +136,7 @@ gently status
 ```
 
 Replace `TRACE_ID` with an ID from `gently traces`. Trace queries read from the
-collector; `gently status` reports local queue and exporter health.
+collector; `gently status` reports local capture, recipient-policy and export health.
 
 To render a trace timeline with integrity checks:
 
