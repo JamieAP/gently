@@ -143,9 +143,23 @@ fn call_tool(params: &Value, client: &QueryClient, rt: &tokio::runtime::Runtime)
     let payload = mcp_jq::apply(payload, jq.as_deref())?;
 
     // MCP tool results return content blocks; embed the JSON as text.
-    Ok(json!({
-        "content": [{"type": "text", "text": serde_json::to_string_pretty(&payload)?}]
-    }))
+    Ok(json!({"content": [{"type": "text", "text": bounded_text(&payload)?}]}))
+}
+
+/// One tool result is at most this many bytes of text. `get_trace` can
+/// assemble far more (up to 32 MiB of rows) than a client can use in context.
+const MAX_TOOL_RESULT_BYTES: usize = 8 * 1024 * 1024;
+
+fn bounded_text(payload: &Value) -> Result<String> {
+    let text = serde_json::to_string_pretty(payload)?;
+    anyhow::ensure!(
+        text.len() <= MAX_TOOL_RESULT_BYTES,
+        "tool result is {} bytes, over the {MAX_TOOL_RESULT_BYTES}-byte limit; \
+         select fields with jq (for example map({{span_id, name, tool_name, status}})) \
+         or use search_spans with trace_id and limit",
+        text.len()
+    );
+    Ok(text)
 }
 
 fn str_arg(args: &Value, key: &str) -> Option<String> {
@@ -266,7 +280,7 @@ fn tool_specs() -> Value {
         },
         {
             "name": "get_trace",
-            "description": "Get all spans for a trace id (for tree reconstruction).",
+            "description": "Get all spans for a trace id (for tree reconstruction). Results over 8 MiB of text are refused; use jq to select fields.",
             "inputSchema": {"type": "object", "required": ["trace_id"], "properties": {
                 "trace_id": {"type": "string"},
                 "jq": {"type": "string", "description": "local jq filter applied to this tool's JSON result before returning"}
@@ -324,4 +338,19 @@ fn tool_specs() -> Value {
             }}
         }
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_results_over_the_text_limit_are_refused_with_a_way_forward() {
+        let small = json!([{"name": "synthetic"}]);
+        assert!(bounded_text(&small).is_ok());
+        let large = json!(["x".repeat(MAX_TOOL_RESULT_BYTES)]);
+        let error = bounded_text(&large).unwrap_err().to_string();
+        assert!(error.contains("over the 8388608-byte limit"));
+        assert!(error.contains("select fields with jq"));
+    }
 }

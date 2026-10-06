@@ -11,6 +11,17 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+/// A watcher rejected a query parameter. Watchers started before paged trace
+/// queries reject `page`, so the trace reader falls back to the legacy query.
+#[derive(Debug)]
+pub struct UnsupportedQueryParameter;
+impl std::fmt::Display for UnsupportedQueryParameter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("unsupported query parameter")
+    }
+}
+impl std::error::Error for UnsupportedQueryParameter {}
+
 const MAX_REQUEST: u64 = 64 * 1024;
 const MAX_RESPONSE: u64 = 64 * 1024 * 1024;
 
@@ -291,7 +302,13 @@ pub async fn query<T: for<'de> Deserialize<'de>>(
         let response =
             crate::json_fidelity::parse_bytes(&read_line(&mut stream, MAX_RESPONSE).await?)?;
         if let Some(error) = response.get("error").and_then(Value::as_str) {
-            anyhow::bail!("{error}");
+            // The watcher reports errors as text; restore the two that the
+            // trace reader acts on.
+            return Err(match error {
+                "unsupported query parameter" => UnsupportedQueryParameter.into(),
+                crate::collector::TraceChanged::MESSAGE => crate::collector::TraceChanged.into(),
+                other => anyhow::anyhow!("{other}"),
+            });
         }
         serde_json::from_value(
             response
