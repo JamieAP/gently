@@ -152,7 +152,7 @@ fn decrypt_external(
     let status = loop {
         if overflow.load(Ordering::Acquire) {
             kill_reader(&mut child);
-            break Err(Error::Invalid("decrypted data exceeds size limit"));
+            break Err(Error::Oversized("decrypted data"));
         }
         if parent_status.is_none() {
             match child.try_wait() {
@@ -190,7 +190,7 @@ fn decrypt_external(
     write_result?.map_err(|_| Error::Crypto("reader input failed"))?;
     let plaintext = read_result?.map_err(|_| Error::Crypto("reader output failed"))?;
     if plaintext.len() > max_bytes {
-        return Err(Error::Invalid("decrypted data exceeds size limit"));
+        return Err(Error::Oversized("decrypted data"));
     }
     Ok(plaintext)
 }
@@ -213,6 +213,10 @@ pub use age::x25519::Identity as DeviceIdentity;
 pub enum Error {
     #[error("invalid raw encryption data: {0}")]
     Invalid(&'static str),
+    /// Data larger than its fixed limit. The display text keeps the former
+    /// `Invalid` wording; callers classify on the variant, never the message.
+    #[error("invalid raw encryption data: {0} exceeds size limit")]
+    Oversized(&'static str),
     #[error("raw encryption operation failed: {0}")]
     Crypto(&'static str),
     #[error(transparent)]
@@ -473,7 +477,7 @@ pub fn open(
 /// capture and key-generation paths never execute a plugin or prompt for keys.
 pub fn encrypt_bytes(recipients: &[String], plaintext: &[u8]) -> Result<String> {
     if plaintext.len() > MAX_PLAINTEXT_BYTES {
-        return Err(Error::Invalid("plaintext exceeds size limit"));
+        return Err(Error::Oversized("plaintext"));
     }
     let recipients = native_recipients(recipients)?;
     let encryptor =
@@ -484,7 +488,7 @@ pub fn encrypt_bytes(recipients: &[String], plaintext: &[u8]) -> Result<String> 
     writer.write_all(plaintext)?;
     writer.finish()?;
     if bytes.len() > MAX_CIPHERTEXT_BYTES {
-        return Err(Error::Invalid("ciphertext exceeds size limit"));
+        return Err(Error::Oversized("ciphertext"));
     }
     Ok(STANDARD.encode(bytes))
 }
@@ -517,7 +521,7 @@ pub fn decrypt_bytes(
         .read_to_end(&mut output)
         .map_err(|_| Error::Crypto("ciphertext authentication failed"))?;
     if output.len() > max_bytes {
-        return Err(Error::Invalid("decrypted data exceeds size limit"));
+        return Err(Error::Oversized("decrypted data"));
     }
     Ok(output)
 }
@@ -563,7 +567,7 @@ fn load_identities_with_callbacks<C: age::Callbacks>(
         .take(MAX_IDENTITY_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() > MAX_IDENTITY_BYTES {
-        return Err(Error::Invalid("reader identity exceeds size limit"));
+        return Err(Error::Oversized("reader identity"));
     }
     let file = if bytes.starts_with(b"age-encryption.org/v1\n")
         || bytes.starts_with(b"-----BEGIN AGE ENCRYPTED FILE-----")
@@ -819,7 +823,7 @@ fn validate_payload(payload: &RawPayload) -> Result<()> {
 
 fn decode_ciphertext(ciphertext_b64: &str) -> Result<Vec<u8>> {
     if ciphertext_b64.len() > MAX_CIPHERTEXT_BYTES.div_ceil(3) * 4 {
-        return Err(Error::Invalid("ciphertext exceeds size limit"));
+        return Err(Error::Oversized("ciphertext"));
     }
     let bytes = STANDARD
         .decode(ciphertext_b64)

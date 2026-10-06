@@ -97,8 +97,12 @@ enum Command {
         #[command(subcommand)]
         command: cmd_raw::RawCommand,
     },
-    /// Show local exporter health and queue depth.
-    Status,
+    /// Show local capture, recipient-policy and export health.
+    Status {
+        /// Print health as machine-readable JSON without contacting the collector.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the resolved public configuration for setup and local launchers.
     Config {
         #[arg(long, required_unless_present = "check", conflicts_with = "check")]
@@ -235,7 +239,7 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         }
         Command::Quarantine { command } => cmd_quarantine::run(command),
         Command::Raw { command } => cmd_raw::run(command),
-        Command::Status => cmd_status::run(),
+        Command::Status { json } => cmd_status::run(json),
         Command::Config { check, .. } => {
             if check {
                 config::check_setup()

@@ -20,7 +20,7 @@ mod quarantine;
 mod raw_objects;
 
 pub use backup::{recovery_leftovers, remove_recovery_leftovers, Leftover};
-pub use health::Health;
+pub use health::{CaptureHealth, CaptureOutcome, Health};
 pub use open_spans::OpenSpan;
 pub use quarantine::{QuarantineReason, QuarantineSummary};
 pub use raw_objects::RawObjectStats;
@@ -195,6 +195,11 @@ CREATE TABLE IF NOT EXISTS raw_objects (
   PRIMARY KEY (tenant_id, raw_ref)
 );
 CREATE INDEX IF NOT EXISTS raw_objects_pending ON raw_objects (tenant_id, synced, created_unix_nano);
+CREATE TABLE IF NOT EXISTS capture_health (
+  outcome TEXT PRIMARY KEY,
+  count INTEGER NOT NULL,
+  last_unix_nano INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS health (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   last_attempt_unix_nano INTEGER,

@@ -8,11 +8,11 @@
 //! log, but never surface a fault that could disrupt the harness.
 
 use crate::config::Config;
-use crate::local_raw;
+use crate::local_raw::{self, PolicyState};
 use crate::HarnessKind;
 use gently_core::{OtlpRequest, Resource, Span, SpanId, SpanKind, Status, TraceId};
 use gently_harness::{apply, ClaudeCode, Codex, Harness, Parsed};
-use gently_store::Store;
+use gently_store::{CaptureOutcome, Store, StoreError};
 use std::io::Read;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -42,20 +42,42 @@ fn process(harness: HarnessKind) -> anyhow::Result<()> {
 
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw)?;
-    let value = crate::json_fidelity::parse(&raw)?;
-
     let store = Store::open(&cfg.state_db())?;
+    let value = match crate::json_fidelity::parse(&raw) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = store.capture_record(CaptureOutcome::InvalidHook, now_nanos());
+            return Err(error);
+        }
+    };
 
     let adapter: &dyn Harness = match harness {
         HarnessKind::Claude => &ClaudeCode,
         HarnessKind::Codex => &Codex,
     };
-    let mut parsed = adapter.parse(&value)?;
+    let mut parsed = match adapter.parse(&value) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let _ = store.capture_record(CaptureOutcome::InvalidHook, now_nanos());
+            return Err(error.into());
+        }
+    };
     let mut metadata_parsed = parsed.clone();
     local_raw::metadata_only(&mut metadata_parsed);
+    let mut outcome = CaptureOutcome::MetadataOnly;
     let prepared_raw = match local_raw::prepare(&cfg, &value, &mut parsed, adapter.name()) {
-        Ok(prepared) => prepared,
+        Ok(prepared) => {
+            if prepared.is_some() {
+                outcome = CaptureOutcome::Encrypted;
+            }
+            prepared
+        }
         Err(_) => {
+            outcome = if matches!(local_raw::policy_health(&cfg), PolicyState::Expired(_)) {
+                CaptureOutcome::PolicyExpired
+            } else {
+                CaptureOutcome::PolicyUnavailable
+            };
             tracing::warn!("encrypted raw capture unavailable; preserving length-only telemetry");
             None
         }
@@ -68,17 +90,28 @@ fn process(harness: HarnessKind) -> anyhow::Result<()> {
 
     let capturing = prepared_raw.is_some();
     let result = store.transaction::<_, anyhow::Error>(|store| {
-        enqueue_event(store, &cfg, &parsed, &value, &resource, prepared_raw)
+        enqueue_event(store, &cfg, &parsed, &value, &resource, prepared_raw)?;
+        store.capture_record(outcome, now_nanos())?;
+        Ok(())
     });
-    if capturing && result.is_err() {
+    if let Err(error) = result {
+        if !capturing {
+            let _ = store.capture_record(CaptureOutcome::CaptureFailed, now_nanos());
+            return Err(error);
+        }
+        outcome = fallback_outcome(&error, local_raw::policy_health(&cfg));
         // The ciphertext transaction has rolled back every lifecycle write and
         // ref. An oversized payload or expired policy must not lose telemetry.
         tracing::warn!("encrypted raw capture unavailable; preserving length-only telemetry");
-        store.transaction::<_, anyhow::Error>(|store| {
-            enqueue_event(store, &cfg, &metadata_parsed, &value, &resource, None)
-        })?;
-    } else {
-        result?;
+        let fallback = store.transaction::<_, anyhow::Error>(|store| {
+            enqueue_event(store, &cfg, &metadata_parsed, &value, &resource, None)?;
+            store.capture_record(outcome, now_nanos())?;
+            Ok(())
+        });
+        if let Err(error) = fallback {
+            let _ = store.capture_record(CaptureOutcome::CaptureFailed, now_nanos());
+            return Err(error);
+        }
     }
 
     // Reap provisional spans after crashes, older harness releases or missing
@@ -99,6 +132,25 @@ fn process(harness: HarnessKind) -> anyhow::Result<()> {
         .unwrap_or("");
     maybe_spawn_export(&cfg, is_terminal_event(harness, event));
     Ok(())
+}
+
+/// Classify a failed encrypted transaction. First match wins. The label commits
+/// with the metadata fallback, so each one means metadata was kept and only the
+/// ciphertext was dropped; if the fallback fails too, `CaptureFailed` is
+/// recorded instead.
+fn fallback_outcome(error: &anyhow::Error, policy: PolicyState) -> CaptureOutcome {
+    match (
+        error.downcast_ref::<StoreError>(),
+        error.downcast_ref::<gently_raw::Error>(),
+        policy,
+    ) {
+        (Some(StoreError::RawCapacity), _, _) => CaptureOutcome::RawCapacity,
+        (Some(_), _, _) => CaptureOutcome::RawStoreFailed,
+        (_, Some(gently_raw::Error::Oversized(_)), _) => CaptureOutcome::Oversized,
+        (_, _, PolicyState::Expired(_)) => CaptureOutcome::PolicyExpired,
+        (_, Some(_), _) => CaptureOutcome::SealFailed,
+        (None, None, _) => CaptureOutcome::RawStoreFailed,
+    }
 }
 
 fn enqueue_event(
@@ -281,4 +333,67 @@ fn spawn_detached_export() {
     // Spawn and forget: do not wait. A failed spawn is non-fatal - the next
     // hook will try again and the outbox is durable.
     let _ = cmd.spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallback_outcome_priority_is_store_then_size_then_policy_then_sealing() {
+        let expired = PolicyState::Expired(1);
+        let valid = PolicyState::Valid(u64::MAX);
+        let store = |e: StoreError| anyhow::Error::from(e);
+        let raw = |e: gently_raw::Error| anyhow::Error::from(e);
+        let cases = [
+            (
+                store(StoreError::RawCapacity),
+                expired,
+                CaptureOutcome::RawCapacity,
+            ),
+            (
+                store(StoreError::RawCapacity).context("synthetic context"),
+                valid,
+                CaptureOutcome::RawCapacity,
+            ),
+            (
+                store(StoreError::Io(std::io::Error::other("synthetic"))),
+                expired,
+                CaptureOutcome::RawStoreFailed,
+            ),
+            (
+                raw(gently_raw::Error::Oversized("ciphertext")),
+                expired,
+                CaptureOutcome::Oversized,
+            ),
+            (
+                raw(gently_raw::Error::Crypto("synthetic")),
+                expired,
+                CaptureOutcome::PolicyExpired,
+            ),
+            (
+                raw(gently_raw::Error::Crypto("synthetic")),
+                valid,
+                CaptureOutcome::SealFailed,
+            ),
+            (
+                raw(gently_raw::Error::Invalid("synthetic")),
+                PolicyState::Unavailable,
+                CaptureOutcome::SealFailed,
+            ),
+            (
+                anyhow::anyhow!("synthetic"),
+                expired,
+                CaptureOutcome::PolicyExpired,
+            ),
+            (
+                anyhow::anyhow!("synthetic"),
+                valid,
+                CaptureOutcome::RawStoreFailed,
+            ),
+        ];
+        for (error, policy, expected) in cases {
+            assert_eq!(fallback_outcome(&error, policy), expected, "{error:#}");
+        }
+    }
 }
