@@ -2,8 +2,9 @@
 //!
 //! The exporter sends queued OTLP envelopes to the collector, including any
 //! provisional spans. Failed retryable sends leave rows queued for a later drain.
-//! A drain trims oldest rows above the configured cap before attempting delivery,
-//! so an outage can cause data loss. Queueing and delivery do not prove capture
+//! By default a drain keeps every queued row; only an explicit
+//! [`Retention::DiscardOldest`] trims history, and it does so before delivery,
+//! so an outage then loses data. Queueing and delivery do not prove capture
 //! completeness. Delivery uses the Worker's tenant/span upsert with immutable
 //! source-device ownership.
 
@@ -24,7 +25,7 @@ pub const USER_AGENT: &str = concat!(
 );
 
 use gently_core::OtlpRequest;
-use gently_store::Store;
+use gently_store::{QuarantineReason, Store};
 
 // Bound aggregation memory and wire batches. An individual larger envelope is
 // still sent alone so the collector decides whether it is acceptable.
@@ -66,6 +67,16 @@ impl ExportError {
     }
 }
 
+/// What a drain may do with queued history before delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retention {
+    /// Keep every queued envelope. Storage grows during an outage.
+    Preserve,
+    /// Permanently drop the oldest envelopes above `cap` before each drain,
+    /// even if the delivery that follows fails.
+    DiscardOldest { cap: usize },
+}
+
 /// A pluggable wire transport for OTLP batches. The HTTP/2 implementation ships
 /// today; an HTTP/3 implementation can be added behind this trait without
 /// touching the drain loop.
@@ -79,20 +90,19 @@ pub trait Transport {
 
 /// Drain the outbox into `transport` until it is empty or a batch fails.
 ///
-/// Returns the number of spans successfully delivered. Trims the outbox to
-/// `cap` first, logging any drops. Queue length can exceed the cap between
-/// drains. Coalesces up to `batch_size` envelopes per wire request, with a
-/// 1 MiB aggregation limit. A larger individual envelope is sent alone.
+/// Returns the number of spans successfully delivered. Applies `retention`
+/// first: [`Retention::Preserve`] keeps every row, while
+/// [`Retention::DiscardOldest`] trims to its cap and logs any drops (queue
+/// length can exceed the cap between drains). Coalesces up to `batch_size`
+/// envelopes per wire request, with a 1 MiB aggregation limit. A larger
+/// individual envelope is sent alone.
 pub async fn drain<T: Transport>(
     store: &Store,
     transport: &T,
-    cap: usize,
+    retention: Retention,
     batch_size: usize,
 ) -> Result<usize, ExportError> {
-    let dropped = store.outbox_trim(cap)?;
-    if dropped > 0 {
-        tracing::warn!(dropped, "outbox over capacity; dropped oldest envelopes");
-    }
+    apply_retention(store, retention)?;
 
     let mut delivered = 0usize;
     loop {
@@ -111,7 +121,7 @@ pub async fn drain<T: Transport>(
                 Err(_) => {
                     // Keep malformed bytes for inspection, with a fixed reason
                     // that cannot echo the payload or a credential it contains.
-                    store.outbox_quarantine(&[id], "invalid queued OTLP envelope JSON")?;
+                    store.outbox_quarantine(&[id], QuarantineReason::InvalidJson)?;
                     tracing::warn!(id, "invalid queued OTLP envelope; quarantined");
                 }
             }
@@ -150,24 +160,48 @@ pub async fn drain<T: Transport>(
                     store.outbox_delete(&ids)?;
                     delivered += span_count;
                 }
-                Err(e) if !matches!(e, ExportError::Rejected(_)) => {
-                    tracing::warn!(error = %e, pending = slice.len(), "export paused; rows remain queued");
-                    return Err(e);
-                }
-                Err(e) if hi - lo == 1 => {
+                Err(ExportError::Rejected(status)) if slice.len() == 1 => {
                     let id = slice[0].id;
-                    tracing::error!(error = %e, id, "collector rejected envelope; quarantining (poison)");
-                    store.outbox_quarantine(&[id], &e.to_string())?;
+                    tracing::error!(
+                        status,
+                        id,
+                        "collector rejected envelope; quarantining (poison)"
+                    );
+                    store.outbox_quarantine(
+                        &[id],
+                        QuarantineReason::CollectorRejection { status },
+                    )?;
                 }
-                Err(_rejected) => {
+                Err(ExportError::Rejected(_)) => {
                     let mid = lo + (hi - lo) / 2;
                     stack.push((lo, mid));
                     stack.push((mid, hi));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, pending = slice.len(), "export paused; rows remain queued");
+                    return Err(e);
                 }
             }
         }
     }
     Ok(delivered)
+}
+
+fn apply_retention(store: &Store, retention: Retention) -> Result<(), ExportError> {
+    match retention {
+        Retention::Preserve => Ok(()),
+        Retention::DiscardOldest { cap } => {
+            let dropped = store.outbox_trim(cap)?;
+            if dropped > 0 {
+                tracing::warn!(
+                    dropped,
+                    cap,
+                    "retention discarded oldest envelopes above cap"
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Merge parsed envelopes and count the actual spans in the serialized request.
@@ -246,7 +280,7 @@ mod tests {
             fail_n: 0,
             spans_received: AtomicUsize::new(0),
         };
-        assert_eq!(drain(&s, &t, 10_000, 512).await.unwrap(), 5);
+        assert_eq!(drain(&s, &t, Retention::Preserve, 512).await.unwrap(), 5);
         assert_eq!(t.spans_received.load(Ordering::SeqCst), 5);
         assert_eq!(t.calls.load(Ordering::SeqCst), 1);
         assert_eq!(s.outbox_len().unwrap(), 0);
@@ -265,7 +299,12 @@ mod tests {
             fail_n: 0,
             spans_received: AtomicUsize::new(0),
         };
-        assert_eq!(drain(&store, &transport, 10_000, 512).await.unwrap(), 3);
+        assert_eq!(
+            drain(&store, &transport, Retention::Preserve, 512)
+                .await
+                .unwrap(),
+            3
+        );
         assert_eq!(store.outbox_len().unwrap(), 0);
         assert_eq!(store.quarantine_len().unwrap(), 1);
         assert_eq!(transport.spans_received.load(Ordering::SeqCst), 3);
@@ -293,7 +332,12 @@ mod tests {
             calls: AtomicUsize::new(0),
             largest_body: AtomicUsize::new(0),
         };
-        assert_eq!(drain(&store, &transport, 10_000, 512).await.unwrap(), 2);
+        assert_eq!(
+            drain(&store, &transport, Retention::Preserve, 512)
+                .await
+                .unwrap(),
+            2
+        );
         assert_eq!(transport.calls.load(Ordering::SeqCst), 2);
         assert!(transport.largest_body.load(Ordering::SeqCst) <= 1024 * 1024);
         assert_eq!(store.outbox_len().unwrap(), 0);
@@ -318,7 +362,7 @@ mod tests {
             calls: AtomicUsize::new(0),
         };
         assert!(matches!(
-            drain(&s, &t, 10_000, 512).await,
+            drain(&s, &t, Retention::Preserve, 512).await,
             Err(ExportError::Authentication(401))
         ));
         assert_eq!(t.calls.load(Ordering::SeqCst), 1);
@@ -326,8 +370,8 @@ mod tests {
         assert_eq!(s.quarantine_len().unwrap(), 0);
     }
 
-    /// Rejects (400) any batch containing a span named "poison".
-    struct PoisonRejector;
+    /// Rejects with this status any batch containing a span named "poison".
+    struct PoisonRejector(u16);
     impl Transport for PoisonRejector {
         async fn send(&self, body: Vec<u8>) -> Result<(), ExportError> {
             let req: OtlpRequest = serde_json::from_slice(&body).unwrap();
@@ -338,7 +382,7 @@ mod tests {
                 .flat_map(|ss| ss.spans.iter())
                 .any(|sp| sp.name == "poison");
             if has_poison {
-                Err(ExportError::Rejected(400))
+                Err(ExportError::Rejected(self.0))
             } else {
                 Ok(())
             }
@@ -354,7 +398,9 @@ mod tests {
 
         // One batch contains the poison span -> drain bisects, quarantines it,
         // and delivers the two good spans, returning Ok (not an error).
-        let delivered = drain(&s, &PoisonRejector, 10_000, 512).await.unwrap();
+        let delivered = drain(&s, &PoisonRejector(400), Retention::Preserve, 512)
+            .await
+            .unwrap();
         assert_eq!(delivered, 2);
         assert_eq!(s.outbox_len().unwrap(), 0, "queue drained");
         assert_eq!(s.quarantine_len().unwrap(), 1, "poison span quarantined");
@@ -365,7 +411,9 @@ mod tests {
         let (_directory, store) = store();
         enqueue_envelope(&store, &["good1", "poison", "good2"]);
         assert_eq!(
-            drain(&store, &PoisonRejector, 10_000, 512).await.unwrap(),
+            drain(&store, &PoisonRejector(400), Retention::Preserve, 512)
+                .await
+                .unwrap(),
             0
         );
         assert_eq!(store.outbox_len().unwrap(), 0);
@@ -385,15 +433,65 @@ mod tests {
         };
 
         // first two drains fail -> rows survive for a later retry
-        assert!(drain(&s, &t, 10_000, 512).await.is_err());
+        assert!(drain(&s, &t, Retention::Preserve, 512).await.is_err());
         assert_eq!(s.outbox_len().unwrap(), 2);
-        assert!(drain(&s, &t, 10_000, 512).await.is_err());
+        assert!(drain(&s, &t, Retention::Preserve, 512).await.is_err());
         assert_eq!(s.outbox_len().unwrap(), 2);
 
         // third drain succeeds -> rows gone, 2 spans delivered in one batch
-        let delivered = drain(&s, &t, 10_000, 512).await.unwrap();
+        let delivered = drain(&s, &t, Retention::Preserve, 512).await.unwrap();
         assert_eq!(delivered, 2);
         assert_eq!(s.outbox_len().unwrap(), 0);
         assert_eq!(t.spans_received.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn quarantine_records_a_typed_reason_for_each_drain_outcome() {
+        let (_directory, store) = store();
+        store
+            .outbox_enqueue("malformed synthetic-sensitive-payload")
+            .unwrap();
+        enqueue_span(&store, "poison");
+        enqueue_span(&store, "good");
+        assert_eq!(
+            drain(&store, &PoisonRejector(413), Retention::Preserve, 512)
+                .await
+                .unwrap(),
+            1
+        );
+        let reasons: Vec<_> = store
+            .quarantine_summaries(0, 10)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.reason)
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                Some(QuarantineReason::InvalidJson),
+                Some(QuarantineReason::CollectorRejection { status: 413 }),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn preserve_keeps_history_and_discard_trims_before_failed_delivery() {
+        for (retention, expected) in [
+            (Retention::Preserve, 3),
+            (Retention::DiscardOldest { cap: 1 }, 1),
+        ] {
+            let (_directory, store) = store();
+            for key in ["one", "two", "three"] {
+                enqueue_span(&store, key);
+            }
+            let transport = AuthenticationRejector {
+                calls: AtomicUsize::new(0),
+            };
+            assert!(matches!(
+                drain(&store, &transport, retention, 512).await,
+                Err(ExportError::Authentication(401))
+            ));
+            assert_eq!(store.outbox_len().unwrap(), expected, "{retention:?}");
+        }
     }
 }

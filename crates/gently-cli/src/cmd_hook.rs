@@ -263,6 +263,9 @@ fn spawn_detached_export() {
         return;
     };
     let mut cmd = std::process::Command::new(exe);
+    // This build preserves history by default, but `exe` names a path that a
+    // reinstall can repoint at an older version before the child starts, and
+    // those versions trim queued history unless this flag is passed.
     cmd.arg("export")
         .arg("--preserve-backlog")
         .stdin(std::process::Stdio::null())

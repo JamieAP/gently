@@ -1,12 +1,13 @@
 //! Exporter health and outbox quarantine.
 //!
 //! The exporter records its latest drain outcome in a health row. Its error
-//! policy selects rejected or invalid queued envelopes for quarantine; this
-//! storage helper does not classify HTTP responses. Each quarantine row retains
+//! policy selects rejected or invalid queued envelopes for quarantine and names
+//! a typed [`QuarantineReason`]; this storage helper does not classify HTTP
+//! responses. Each quarantine row retains
 //! the whole queued envelope, which may contain multiple spans. `gently status`
 //! reads health and quarantine counts without requiring a daemon.
 
-use crate::{Result, Store};
+use crate::{QuarantineReason, Result, Store};
 
 /// A snapshot of the exporter's last-known health.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -18,9 +19,10 @@ pub struct Health {
 }
 
 impl Store {
-    /// Move whole queued envelopes into quarantine with a reason.
+    /// Move whole queued envelopes into quarantine with a typed reason.
     /// Returns how many outbox rows were quarantined.
-    pub fn outbox_quarantine(&self, ids: &[i64], reason: &str) -> Result<usize> {
+    pub fn outbox_quarantine(&self, ids: &[i64], reason: QuarantineReason) -> Result<usize> {
+        let reason = reason.encode();
         let tx = self.conn.unchecked_transaction()?;
         let mut moved = 0;
         for id in ids {
@@ -28,7 +30,7 @@ impl Store {
                 "INSERT INTO quarantine (span_json, reason, quarantined_unix_nano)
                  SELECT span_json, ?2, strftime('%s','now') * 1000000000
                  FROM outbox WHERE id = ?1",
-                rusqlite::params![id, reason],
+                rusqlite::params![id, &reason],
             )?;
             tx.execute("DELETE FROM outbox WHERE id = ?1", rusqlite::params![id])?;
         }
@@ -95,7 +97,7 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-    use crate::Store;
+    use crate::{QuarantineReason, Store};
 
     fn store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
@@ -114,7 +116,12 @@ mod tests {
             .iter()
             .map(|(id, _)| *id)
             .collect();
-        let moved = s.outbox_quarantine(&ids[..1], "rejected 400").unwrap();
+        let moved = s
+            .outbox_quarantine(
+                &ids[..1],
+                QuarantineReason::CollectorRejection { status: 400 },
+            )
+            .unwrap();
         assert_eq!(moved, 1);
         assert_eq!(s.outbox_len().unwrap(), 1);
         assert_eq!(s.quarantine_len().unwrap(), 1);

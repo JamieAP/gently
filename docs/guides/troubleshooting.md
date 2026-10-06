@@ -46,7 +46,7 @@ appears in the collector.
 | Span ownership conflict (`409`) | A different device or trace owns that span ID. Use fresh capture IDs for a new device/trace; do not spoof its owner. |
 | Incompatible development state | Stop Gently and explicitly reset disposable old application state and sidecars; preserve the credential vault. |
 | Cloudflare database errors | Replace `REPLACE_AFTER_CREATE` with the created D1 ID and execute `schema.sql` against the intended local or remote database. |
-| Quarantine count increases | Check the recorded error and payload/schema compatibility. Fixing the cause does not automatically replay quarantined envelopes. |
+| Quarantine count increases | Run `gently quarantine list` for each row's category and collector HTTP status, then check payload/schema compatibility or collector limits. Fixing the cause does not replay envelopes automatically; requeue each with `gently quarantine retry --id ID`. |
 | Export works but queries are empty | Check the target URL, query filters and state directory. Queries read the collector, not the local outbox. Generate fresh activity and list unfiltered traces. |
 | MCP is absent or fails | Re-run init and restart the client. Check registration and provide a token or start the watcher with `--serve-queries` on Unix. |
 | Codex capture is duplicated or labeled `claude-code` | Check both `~/.codex/hooks.json` and inline TOML hooks. Run `gently init --codex` to remove covered legacy Gently handlers, then restart Codex. Custom registrations should invoke `gently hook --harness codex`. |

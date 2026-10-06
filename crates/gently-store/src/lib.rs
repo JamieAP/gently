@@ -20,7 +20,7 @@ mod raw_objects;
 
 pub use health::Health;
 pub use open_spans::OpenSpan;
-pub use quarantine::QuarantineSummary;
+pub use quarantine::{QuarantineReason, QuarantineSummary};
 pub use raw_objects::RawObjectStats;
 
 use std::path::Path;

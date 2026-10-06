@@ -57,7 +57,9 @@ enum Command {
         /// clients over an owner-only Unix socket. Requires --watch.
         #[arg(long, requires = "watch")]
         serve_queries: bool,
-        /// Compatibility option: preserving all queued history is now the default.
+        /// Compatibility option: history is preserved by default. Launchers
+        /// keep passing it because versions before that default trim queued
+        /// history to outbox_cap without it, so a downgrade stays lossless.
         #[arg(long, hide = true, conflicts_with = "discard_oldest")]
         preserve_backlog: bool,
         /// Explicitly discard oldest queued envelopes above outbox_cap before
@@ -202,15 +204,15 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
             interval_secs,
             retry_raw_quarantine,
         } => {
-            if watch {
-                cmd_export::watch(
-                    interval_secs,
-                    serve_queries,
-                    !discard_oldest,
-                    retry_raw_quarantine,
-                )
+            let history = if discard_oldest {
+                cmd_export::History::DiscardOldest
             } else {
-                cmd_export::run(!discard_oldest, retry_raw_quarantine)
+                cmd_export::History::Preserve
+            };
+            if watch {
+                cmd_export::watch(interval_secs, serve_queries, history, retry_raw_quarantine)
+            } else {
+                cmd_export::run(history, retry_raw_quarantine)
             }
         }
         Command::Quarantine { command } => cmd_quarantine::run(command),

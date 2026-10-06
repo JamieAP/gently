@@ -107,7 +107,7 @@ checked with `claude mcp get gently`. Codex hooks also need to be trusted throug
 `/hooks` inside Codex.
 
 The MCP server uses stdio and read-only tools. It needs either collector
-credentials or, on Unix, an unlocked `gently export --watch --serve-queries --preserve-backlog`
+credentials or, on Unix, an unlocked `gently export --watch --serve-queries`
 using the same state directory, tenant, device and collector URL. Tokenless desktop clients
 automatically delegate queries through the private socket. Restart older
 watchers to enable this; the bundled local launchers pass the flag.

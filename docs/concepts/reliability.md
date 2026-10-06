@@ -11,7 +11,7 @@ A hook with a collector URL and token may start a detached one-shot exporter.
 Terminal events request a final drain; other events skip startup when an
 exporter lock is already held. Tokenless hooks only queue records and never
 request interactive credential unlock. All exporters retain queued history by default. Hook-spawned exporters still pass
-`--preserve-backlog` for compatibility.
+`--preserve-backlog`, because earlier versions trim queued history without it.
 
 A one-shot exporter drains until the queue is empty or a failure stops the run.
 It exits if another exporter already holds the file lock. A watcher retains the
@@ -37,7 +37,7 @@ needed to flush an idle queue.
 | --- | --- | --- |
 | Authentication, `401` or `403` | Stop the run without retrying, falling back or quarantining the rejected send. Pending rows remain unless explicit destructive trimming is selected. | Correct the token and restart export or the watcher. |
 | Network error, timeout, 5xx or other endpoint rejection such as `404`, `405`, `408` or `429` | Back off; undelivered rows remain queued. | Check the endpoint and connectivity, then retry. |
-| Payload rejection, `400`, `409`, `413` or `422` | Split batches to isolate rejected envelopes and retain them in quarantine. | Inspect the rejected envelope and collector limits. |
+| Payload rejection, `400`, `409`, `413` or `422` | Split batches to isolate rejected envelopes and retain them in quarantine. | Check the HTTP status in `gently quarantine list` against collector limits. |
 | Malformed queued JSON | Move that envelope to quarantine with a fixed diagnostic reason. | Inspect local storage and the producing version. |
 
 One-shot export makes up to three attempts for retryable failures. A watcher
@@ -55,8 +55,9 @@ the bytes; moving a row there does not mean it reached the collector.
 
 Export preserves the complete backlog by default. `--discard-oldest` explicitly
 drops oldest queued envelopes beyond `outbox_cap` before each drain, even if
-authentication subsequently fails. `--preserve-backlog` remains a compatibility
-no-op. Monitor disk space during outages; encrypted object capture has its own
+authentication subsequently fails. The hidden `--preserve-backlog` changes
+nothing in this version but keeps a launcher lossless if it runs an earlier one,
+which trims to `outbox_cap` by default. Monitor disk space during outages; encrypted object capture has its own
 non-evicting byte budget. Quarantine is retained and may be summarized or retried
 with `gently quarantine`; no automatic local or collector retention is provided.
 
