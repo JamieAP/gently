@@ -651,6 +651,13 @@ fn capture_health_json_is_keyless_and_contains_no_payloads() {
     assert_eq!(health["capture"]["counts"]["policy_expired"], 1);
     assert_eq!(health["policy"]["state"], "expired");
     assert_eq!(health["policy"]["expires_unix_secs"], 1);
+    assert_eq!(health["raw"]["pending_bytes"], 0);
+    assert_eq!(health["raw"]["quarantined_bytes"], 0);
+    assert!(health["raw"]["last_rejection_status"].is_null());
+    assert_eq!(
+        health["raw"]["budget_bytes"],
+        gently_store::RAW_OBJECT_CAP_BYTES as u64
+    );
     assert!(health["capture"]["last_capture_unix_nano"]
         .as_u64()
         .is_some());
@@ -693,11 +700,14 @@ fn failed_encrypted_and_metadata_transactions_record_capture_failure() {
     let store = Store::open(&db).unwrap();
     assert_eq!(store.outbox_len().unwrap(), 0);
     assert_eq!(store.raw_objects_len().unwrap(), 0);
+    let health = store.capture_snapshot().unwrap();
     assert_eq!(
-        store.capture_snapshot().unwrap().counts["capture_failed"],
-        1
+        health.last_outcome,
+        Some(gently_store::CaptureOutcome::CaptureFailed)
     );
-    assert_eq!(store.capture_snapshot().unwrap().counts["encrypted"], 0);
+    assert_eq!(health.counts["capture_failed"], 1);
+    assert_eq!(health.counts["raw_store_failed"], 0);
+    assert_eq!(health.counts["encrypted"], 0);
 }
 
 #[test]
@@ -720,9 +730,10 @@ fn ciphertext_store_failure_preserves_metadata_and_is_not_a_sealing_failure() {
     let health = store.capture_snapshot().unwrap();
     assert_eq!(
         health.last_outcome,
-        Some(gently_store::CaptureOutcome::CaptureFailed)
+        Some(gently_store::CaptureOutcome::RawStoreFailed)
     );
-    assert_eq!(health.counts["capture_failed"], 1);
+    assert_eq!(health.counts["raw_store_failed"], 1);
+    assert_eq!(health.counts["capture_failed"], 0);
     assert_eq!(health.counts["seal_failed"], 0);
     assert_eq!(health.counts["encrypted"], 0);
     assert_eq!(store.raw_objects_len().unwrap(), 0);

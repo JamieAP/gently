@@ -137,14 +137,33 @@ retry, and quarantine behavior.
 Print local queue depth, quarantine count, configured collector URL, transport
 preference, consecutive failures, last attempt, last success, and last error.
 It does not contact the collector or verify that a token works. Capture health is
-separate from export health: last capture time/outcome and lifetime fixed-category
-counts reveal metadata fallback, expired/missing policy, oversized payloads,
-ciphertext budget exhaustion and invalid hooks. `--json` exposes these fields for
-monitoring without raw payloads or exporter error strings. Recipient policy is
-verified using only public files, with a seven-day expiry warning; status never
-unlocks a reader. The capture-health table is an additive encrypted-schema-2
-extension and preserves existing queued state. Failures before the state database
-can be opened cannot be recorded there.
+separate from export health: it reports the last capture time and outcome, plus
+lifetime counts for each fixed outcome category:
+
+- `encrypted`, `metadata_only`: the event was kept as configured.
+- `policy_unavailable`, `policy_expired`, `oversized`, `raw_capacity`,
+  `seal_failed`, `raw_store_failed`: the metadata event was kept, but its
+  ciphertext was not, because of missing or expired recipient policy, content
+  over the size limit, a full raw byte budget, an encryption error, or a local
+  storage error while writing the ciphertext.
+- `invalid_hook`, `capture_failed`: the event was lost, because the hook payload
+  could not be parsed or the event could not be stored.
+
+`capture_degraded` is true when the last outcome is outside the first group, or
+when recipient policy is unavailable or expired. Recipient policy is verified
+using only public files, with a seven-day expiry warning; status never unlocks a
+reader.
+
+`--json` prints one object with `capture`, `policy`, `export` and `raw` sections,
+without raw payloads or exporter error strings. `raw` contains `objects`,
+`bytes`, `pending`, `pending_bytes`, `quarantined`, `quarantined_bytes`,
+`last_rejection_status` (HTTP status or `null`) and `budget_bytes`. The budget
+caps all ciphertext retained in the state database, so with a single tenant the
+remaining headroom is `budget_bytes - bytes`.
+
+The capture-health table is an additive encrypted-schema-2 extension and
+preserves existing queued state. Failures before the state database can be opened
+cannot be recorded there.
 
 ## `gently traces`
 

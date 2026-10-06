@@ -55,7 +55,11 @@ pub fn run(json: bool) -> Result<()> {
                     "last_attempt_unix_nano": h.last_attempt_unix_nano,
                     "last_ok_unix_nano": h.last_ok_unix_nano},
                 "raw": {"objects": raw.objects, "bytes": raw.bytes,
-                    "pending": raw.pending_objects, "quarantined": raw.quarantined_objects}
+                    "pending": raw.pending_objects, "pending_bytes": raw.pending_bytes,
+                    "quarantined": raw.quarantined_objects,
+                    "quarantined_bytes": raw.quarantined_bytes,
+                    "last_rejection_status": raw.last_rejection_status,
+                    "budget_bytes": gently_store::RAW_OBJECT_CAP_BYTES}
             })
         );
         return Ok(());

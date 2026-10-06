@@ -197,13 +197,23 @@ fn object_rejects_plaintext_malformed_data_unknown_fields_and_excess_size() {
 fn ciphertext_decrypt_limit_and_field_bindings_are_enforced() {
     let (object, ids, manifest) = object();
     let identities = ReaderIdentities::from_native(vec![ids.into_iter().next().unwrap()]);
-    assert!(decrypt_bytes(&object.ciphertext_b64, &identities, 1).is_err());
+    assert!(matches!(
+        decrypt_bytes(&object.ciphertext_b64, &identities, 1),
+        Err(Error::Oversized("decrypted data"))
+    ));
     let (fields, mut bindings) = payload_fields();
     bindings.insert("gently.assistant".into(), vec!["span".into()]);
     assert!(seal(&manifest, context(), fields, bindings).is_err());
     let fields = BTreeMap::from([("gently.prompt".into(), "x".repeat(MAX_PLAINTEXT_BYTES + 1))]);
     let bindings = BTreeMap::from([("gently.prompt".into(), vec!["span".into()])]);
-    assert!(seal(&manifest, context(), fields, bindings).is_err());
+    assert!(matches!(
+        seal(&manifest, context(), fields, bindings),
+        Err(Error::Oversized("plaintext"))
+    ));
+    assert_eq!(
+        Error::Oversized("plaintext").to_string(),
+        "invalid raw encryption data: plaintext exceeds size limit"
+    );
 }
 
 #[test]

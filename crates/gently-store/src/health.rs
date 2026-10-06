@@ -18,6 +18,7 @@ pub struct Health {
 }
 
 /// Fixed categories only: capture health never stores payloads or error strings.
+/// Labels are stored as text, so adding a category needs no schema change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureOutcome {
     MetadataOnly,
@@ -27,11 +28,14 @@ pub enum CaptureOutcome {
     Oversized,
     RawCapacity,
     SealFailed,
+    /// Metadata was kept; the ciphertext could not be stored.
+    RawStoreFailed,
     InvalidHook,
+    /// Nothing was kept: the event itself was lost.
     CaptureFailed,
 }
 impl CaptureOutcome {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::MetadataOnly,
         Self::Encrypted,
         Self::PolicyUnavailable,
@@ -39,6 +43,7 @@ impl CaptureOutcome {
         Self::Oversized,
         Self::RawCapacity,
         Self::SealFailed,
+        Self::RawStoreFailed,
         Self::InvalidHook,
         Self::CaptureFailed,
     ];
@@ -51,6 +56,7 @@ impl CaptureOutcome {
             Self::Oversized => "oversized",
             Self::RawCapacity => "raw_capacity",
             Self::SealFailed => "seal_failed",
+            Self::RawStoreFailed => "raw_store_failed",
             Self::InvalidHook => "invalid_hook",
             Self::CaptureFailed => "capture_failed",
         }
