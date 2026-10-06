@@ -41,6 +41,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Back up or restore encrypted local state without unlocking a reader.
+    State {
+        #[command(subcommand)]
+        command: cmd_state::StateCommand,
+    },
+    /// Remove only this executable's managed hooks and MCP registrations.
+    Uninstall {
+        #[arg(long, required_unless_present = "codex", conflicts_with = "codex")]
+        claude: bool,
+        #[arg(long, required_unless_present = "claude", conflicts_with = "claude")]
+        codex: bool,
+    },
     /// Harness hook entrypoint (reads the event JSON on stdin). Never writes
     /// stdout and always exits 0.
     Hook {
@@ -67,18 +79,6 @@ enum Command {
         /// Retry retained ciphertext previously rejected by the collector.
         #[arg(long)]
         retry_raw_quarantine: bool,
-    },
-    /// Back up or restore encrypted local state without unlocking a reader.
-    State {
-        #[command(subcommand)]
-        command: cmd_state::StateCommand,
-    },
-    /// Remove only this executable's managed hooks and MCP registrations.
-    Uninstall {
-        #[arg(long, required_unless_present = "codex", conflicts_with = "codex")]
-        claude: bool,
-        #[arg(long, required_unless_present = "claude", conflicts_with = "claude")]
-        codex: bool,
     },
     /// Manage encrypted raw-value reader enrollment and public trust policy.
     Raw {
@@ -197,6 +197,8 @@ fn main() {
 
 fn dispatch(command: Command) -> anyhow::Result<()> {
     match command {
+        Command::State { command } => cmd_state::run(command),
+        Command::Uninstall { codex, .. } => cmd_init::run_uninstall(codex),
         Command::Hook { .. } => unreachable!("handled in main"),
         Command::Export {
             watch,
@@ -216,8 +218,6 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
                 cmd_export::run(preserve_backlog, retry_raw_quarantine)
             }
         }
-        Command::State { command } => cmd_state::run(command),
-        Command::Uninstall { codex, .. } => cmd_init::run_uninstall(codex),
         Command::Raw { command } => cmd_raw::run(command),
         Command::Status => cmd_status::run(),
         Command::Config { check, .. } => {

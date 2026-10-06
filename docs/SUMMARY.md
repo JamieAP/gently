@@ -17,10 +17,10 @@
 
 ## Guides
 
+* [Installation and recovery](guides/installation-and-recovery.md)
 * [Querying and MCP](guides/querying-and-mcp.md)
 * [Encrypted raw values](guides/encrypted-raw-values.md)
 * [Encrypted raw validation](guides/encrypted-raw-validation.md)
-* [Installation and recovery](guides/installation-and-recovery.md)
 * [Troubleshooting](guides/troubleshooting.md)
 
 ## Reference
