@@ -56,15 +56,22 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-For Worker changes:
+For Worker changes (Node.js 22.12 or later):
 
 ```sh
 cd worker
 npm ci
+npm run audit
 npm test
 npm run typecheck
 cd ..
 ```
+
+The Worker test suite uses the Cloudflare Vitest plugin and Vitest 4. Each test
+resets its synthetic D1 tables because storage isolation now applies per file.
+Use `npm ci` to reproduce the lockfile and resolve advisories before publishing;
+CI runs the dependency audit as a release guard. For migration details see the
+[Cloudflare test-plugin guide](https://developers.cloudflare.com/workers/testing/vitest-integration/migration-guides/migrate-to-vitest-plugin/).
 
 For local launcher changes:
 

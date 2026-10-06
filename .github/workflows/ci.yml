@@ -49,6 +49,7 @@ jobs:
         working-directory: worker
         run: |
           npm ci
+          npm run audit
           npm test
           npm run typecheck
       - name: Launcher regression tests

@@ -1,5 +1,5 @@
 import { env, SELF } from "cloudflare:test";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index";
 import type { Env } from "../src/d1";
 import schemaSql from "../schema.sql?raw";
@@ -47,7 +47,11 @@ function postSpans(body: unknown, token = TOKEN, tenant = "personal") {
   });
 }
 
-beforeAll(async () => {
+beforeEach(async () => {
+  // Vitest 4 isolates storage per file. Reset every test explicitly so data and
+  // authorization assertions do not depend on execution order.
+  await env.DB.prepare("DROP TABLE IF EXISTS spans").run();
+  await env.DB.prepare("DROP TABLE IF EXISTS raw_values").run();
   for (const statement of schemaSql.split(";").map(s => s.trim()).filter(Boolean)) {
     await env.DB.prepare(statement).run();
   }
