@@ -482,8 +482,8 @@ fn validate_public_attributes(blob: &str) -> Result<()> {
         }
         Ok(())
     }
-    let attrs: Value =
-        serde_json::from_str(blob).map_err(|_| anyhow::anyhow!("invalid collector attributes"))?;
+    let attrs: Value = crate::json_fidelity::parse(blob)
+        .map_err(|_| anyhow::anyhow!("invalid collector attributes"))?;
     anyhow::ensure!(attrs.is_array(), "invalid collector attribute shape");
     visit(&attrs, 0)
 }
@@ -492,6 +492,14 @@ fn validate_public_attributes(blob: &str) -> Result<()> {
 mod raw_guard_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn collector_validation_preserves_literal_private_json_keys() {
+        assert!(validate_public_attributes(
+            r#"[{"key":"gently.synthetic_metadata","value":{"$serde_json::private::Number":"literal-key"}}]"#
+        )
+        .is_ok());
+    }
 
     fn client() -> QueryClient {
         QueryClient {

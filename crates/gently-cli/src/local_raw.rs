@@ -341,7 +341,7 @@ pub(crate) fn resolve_payload(
         .attrs_json
         .as_ref()
         .context("raw row attributes are missing")?;
-    let mut attrs: Value = serde_json::from_str(blob).context("invalid span attributes")?;
+    let mut attrs: Value = crate::json_fidelity::parse(blob).context("invalid span attributes")?;
     let arr = attrs
         .as_array_mut()
         .context("invalid span attribute shape")?;
@@ -472,6 +472,21 @@ mod tests {
             .iter()
             .any(|attr| attr["key"] == "gently.prompt"
                 && attr["value"]["stringValue"] == "private fixture"));
+    }
+
+    #[test]
+    fn hydration_preserves_literal_private_json_keys() {
+        let (object, identities, mut row) = fixture();
+        let mut attrs = crate::json_fidelity::parse(row.attrs_json.as_deref().unwrap()).unwrap();
+        let literal = json!({
+            "key": "gently.synthetic_metadata",
+            "value": {"$serde_json::private::Number": "literal-key"}
+        });
+        attrs.as_array_mut().unwrap().push(literal.clone());
+        row.attrs_json = Some(attrs.to_string());
+        resolve_row("personal", &mut row, &object, &identities).unwrap();
+        let resolved = crate::json_fidelity::parse(row.attrs_json.as_deref().unwrap()).unwrap();
+        assert!(resolved.as_array().unwrap().contains(&literal));
     }
 
     #[test]
