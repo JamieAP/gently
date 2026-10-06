@@ -291,8 +291,12 @@ fn stale_socket_recovers_and_invalid_queries_do_not_disable_the_broker() {
 }
 
 #[test]
-fn preserve_backlog_retains_over_cap_rows_after_authentication_failure() {
-    for preserve in [true, false] {
+fn retention_is_default_and_discard_is_explicit_after_authentication_failure() {
+    for (flag, expected) in [
+        (None, 3),
+        (Some("--preserve-backlog"), 3),
+        (Some("--discard-oldest"), 1),
+    ] {
         let dir = tempfile::tempdir_in(if cfg!(target_os = "macos") {
             std::path::PathBuf::from("/private/tmp")
         } else {
@@ -327,8 +331,8 @@ fn preserve_backlog_retains_over_cap_rows_after_authentication_failure() {
         });
         let mut cmd = assert_cmd::Command::cargo_bin("gently").unwrap();
         cmd.arg("export");
-        if preserve {
-            cmd.arg("--preserve-backlog");
+        if let Some(flag) = flag {
+            cmd.arg(flag);
         }
         cmd.env("GENTLY_STATE_DIR", dir.path())
             .env("GENTLY_TENANT_ID", "personal")
@@ -339,7 +343,7 @@ fn preserve_backlog_retains_over_cap_rows_after_authentication_failure() {
             .failure()
             .stderr(predicates::str::contains("401"));
         collector.join().unwrap();
-        assert_eq!(store.outbox_len().unwrap(), if preserve { 3 } else { 1 });
+        assert_eq!(store.outbox_len().unwrap(), expected);
     }
 }
 

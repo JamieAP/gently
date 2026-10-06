@@ -440,7 +440,9 @@ mod tests {
         store.outbox_enqueue("synthetic metadata one").unwrap();
         store.outbox_enqueue("synthetic metadata two").unwrap();
         let id = store.outbox_take_batch(1).unwrap()[0].0;
-        store.outbox_quarantine(&[id], "synthetic reason").unwrap();
+        store
+            .outbox_quarantine(&[id], crate::QuarantineReason::InvalidJson)
+            .unwrap();
         store.next_turn_index("synthetic-session").unwrap();
         let backup = dir.path().join("backup.db");
         store
@@ -451,6 +453,10 @@ mod tests {
         let recovered = Store::open(&restored).unwrap();
         assert_eq!(recovered.outbox_len().unwrap(), 1);
         assert_eq!(recovered.quarantine_len().unwrap(), 1);
+        assert_eq!(
+            recovered.quarantine_summaries(0, 10).unwrap()[0].reason,
+            Some(crate::QuarantineReason::InvalidJson)
+        );
         assert_eq!(recovered.next_turn_index("synthetic-session").unwrap(), 2);
         assert!(
             Store::restore_backup(&backup, &restored, "synthetic-tenant", "synthetic-device")

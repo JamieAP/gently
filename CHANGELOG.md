@@ -7,6 +7,11 @@ The project is pre-1.0; pending changes appear under Unreleased.
 
 ### Added
 
+- Add `gently export --discard-oldest`, the only way to trim queued history to
+  `outbox_cap`; it drops the oldest envelopes before each drain, even if delivery fails.
+- Add `gently quarantine list`, which prints bounded, payload-free JSON summaries
+  of metadata quarantine with a typed category and the collector's HTTP status,
+  and `gently quarantine retry --id ID`, which atomically requeues one envelope.
 - Add tenant-bound tokenless local query delegation and backlog-preserving launchers.
 - Require explicit public-repository review through commit, message and push hooks;
   inspect stored Git objects despite replacement refs and reject captured telemetry,
@@ -36,6 +41,11 @@ The project is pre-1.0; pending changes appear under Unreleased.
 
 ### Changed
 
+- Preserve every queued envelope by default: `gently export` no longer trims to
+  `outbox_cap`. `--preserve-backlog` is hidden but still accepted. Downgrading to
+  an earlier binary brings back default trimming unless `--preserve-backlog` is
+  passed, so keep it in launchers until earlier binaries are retired; the bundled
+  hook and local launchers still pass it.
 - Refresh all 31 observational Claude Code and 12 Codex command-hook registrations,
   including desktop coding runtimes; safely migrate covered legacy Codex JSON handlers.
 - Retain immutable event receipts and useful display, instruction, model/cache metadata;

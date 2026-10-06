@@ -109,7 +109,7 @@ checked with `claude mcp get gently`. Codex hooks also need to be trusted throug
 `/hooks` inside Codex.
 
 The MCP server uses stdio and read-only tools. It needs either collector
-credentials or, on Unix, an unlocked `gently export --watch --serve-queries --preserve-backlog`
+credentials or, on Unix, an unlocked `gently export --watch --serve-queries`
 using the same state directory, tenant, device and collector URL. Tokenless desktop clients
 automatically delegate queries through the private socket. Restart older
 watchers to enable this; the bundled local launchers pass the flag.
@@ -118,7 +118,7 @@ watchers to enable this; the bundled local launchers pass the flag.
 | --- | --- | --- |
 | `list_traces` | `limit?`, `harness?`, `session_id?`, `since?`, `until?`, `order?`, `jq?` | Trace summaries |
 | `sessions` | Same as `list_traces` | Alias for `list_traces` |
-| `get_trace` | `trace_id`, `jq?` | All rows for one trace |
+| `get_trace` | `trace_id`, `jq?` | All rows for one trace, read in bounded pages |
 | `search_spans` | `trace_id?`, `session_id?`, `harness?`, `tool_name?`, `name?`, `status?`, `kind?`, `since?`, `until?`, `limit?`, `order?`, `jq?` | Matching span rows |
 | `trace_stats` | `jq?` | Per-tool counts, errors, and mean duration |
 | `response_fields` | `tool?`, `jq?` | Common response fields and filter examples |
@@ -161,6 +161,9 @@ Then inspect failed tool spans in the selected trace:
   }
 }
 ```
+
+A tool result is at most 8 MiB of text, after `jq`. A larger result returns an
+error; select fields with `jq`, or use `search_spans` with `trace_id` and `limit`.
 
 Use `response_fields` with `{"tool":"get_trace"}` to discover common row fields,
 or `span_attr_keys` with `{"trace_id":"TRACE_ID","limit":1000}` to inspect

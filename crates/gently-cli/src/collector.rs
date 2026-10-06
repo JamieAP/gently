@@ -4,6 +4,20 @@ use gently_export::ExportError;
 use gently_raw::RawObject;
 use serde::de::DeserializeOwned;
 
+/// The collector reported (HTTP 409) that a trace changed while it was being
+/// read page by page. The whole read can be repeated.
+#[derive(Debug)]
+pub struct TraceChanged;
+impl TraceChanged {
+    pub const MESSAGE: &'static str = "trace changed during pagination; repeat the query";
+}
+impl std::fmt::Display for TraceChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(Self::MESSAGE)
+    }
+}
+impl std::error::Error for TraceChanged {}
+
 pub struct CollectorClient {
     base: String,
     token: String,
@@ -46,11 +60,17 @@ impl CollectorClient {
             .send()
             .await
             .map_err(|_| anyhow::anyhow!("collector query transport failed"))?;
-        anyhow::ensure!(
-            response.status().is_success(),
-            "collector query returned HTTP {}",
-            response.status().as_u16()
-        );
+        match response.status().as_u16() {
+            200..=299 => {}
+            409 => return Err(TraceChanged.into()),
+            // The Worker's client errors carry fixed, non-sensitive messages
+            // (for example which page budget a trace exceeds); pass them on.
+            status @ (400 | 413) => match worker_error(response).await {
+                Some(message) => anyhow::bail!("collector query returned HTTP {status}: {message}"),
+                None => anyhow::bail!("collector query returned HTTP {status}"),
+            },
+            status => anyhow::bail!("collector query returned HTTP {status}"),
+        }
         let bytes = bounded_response(response, 8 * 1024 * 1024).await?;
         serde_json::from_slice(&bytes)
             .map_err(|_| anyhow::anyhow!("invalid collector query response"))
@@ -116,6 +136,15 @@ impl CollectorClient {
             )))
         }
     }
+}
+
+/// The `error` field of a small JSON error body, if it is short printable ASCII.
+async fn worker_error(response: reqwest::Response) -> Option<String> {
+    let body = bounded_response(response, 1024).await.ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&body).ok()?;
+    let message = value.get("error")?.as_str()?;
+    (message.len() <= 200 && message.bytes().all(|b| (b' '..=b'~').contains(&b)))
+        .then(|| message.to_owned())
 }
 
 async fn bounded_response(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
@@ -215,6 +244,45 @@ pub(crate) mod tests {
                 env!("CARGO_PKG_VERSION"),
                 " (+https://github.com/JamieAP/gently)"
             ))));
+    }
+    #[tokio::test]
+    async fn query_errors_carry_the_workers_budget_message() {
+        let (base, task) = server(
+            "413 Payload Too Large",
+            r#"{"error":"Trace requires cursor pagination (page=1)"}"#,
+        );
+        let client = CollectorClient::new(&base, "synthetic-token", "lab", 2).unwrap();
+        let error = client
+            .query::<serde_json::Value>(&[("op", "trace".into())])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "collector query returned HTTP 413: Trace requires cursor pagination (page=1)"
+        );
+        task.join().unwrap();
+    }
+    #[tokio::test]
+    async fn trace_changes_are_typed_and_other_bodies_stay_unread() {
+        let (base, task) = server("409 Conflict", r#"{"error":"anything"}"#);
+        let client = CollectorClient::new(&base, "synthetic-token", "lab", 2).unwrap();
+        let error = client
+            .query::<serde_json::Value>(&[("op", "trace".into())])
+            .await
+            .unwrap_err();
+        assert!(error.is::<TraceChanged>());
+        task.join().unwrap();
+        let (base, task) = server(
+            "500 Internal Server Error",
+            r#"{"error":"synthetic-detail"}"#,
+        );
+        let client = CollectorClient::new(&base, "synthetic-token", "lab", 2).unwrap();
+        let error = client
+            .query::<serde_json::Value>(&[("op", "trace".into())])
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "collector query returned HTTP 500");
+        task.join().unwrap();
     }
     #[tokio::test]
     async fn missing_ciphertext_remains_an_opaque_reference() {

@@ -470,7 +470,7 @@ fn scaffold_config(cfg: &Config) -> Result<()> {
         # OPTIONAL tunables (shown with their defaults; uncomment to change):\n\
         #\n\
         # prefer_quic = true          # prefer HTTP/3 (QUIC) for export, fall back to HTTP/2\n\
-        # outbox_cap = 10000          # manual export cap; --preserve-backlog bypasses trimming\n\
+        # outbox_cap = 10000          # opt-in trim threshold for export --discard-oldest; history retained by default\n\
         # export_batch = 512          # OTLP envelope rows per export request\n\
         # export_timeout_secs = 15    # per-request export timeout\n\
         # query_timeout_secs = 30     # per-request query / MCP timeout\n\

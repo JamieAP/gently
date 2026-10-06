@@ -8,7 +8,9 @@
 use crate::config::Config;
 use anyhow::{Context, Result};
 use fs4::fs_std::FileExt;
-use gently_export::{drain, ExportError, Http2Transport, PreferQuic, QuicTransport, Transport};
+use gently_export::{
+    drain, ExportError, Http2Transport, PreferQuic, QuicTransport, Retention, Transport,
+};
 use gently_store::Store;
 use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -17,21 +19,38 @@ const MAX_ATTEMPTS: u32 = 3;
 const BACKOFF_BASE: Duration = Duration::from_millis(250);
 const WATCH_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-pub fn run(preserve_backlog: bool, retry_raw_quarantine: bool) -> Result<()> {
-    run_mode(None, false, preserve_backlog, retry_raw_quarantine)
+/// Queue history policy chosen on the command line. Preserving is the default;
+/// discarding needs `--discard-oldest`, and its cap comes from configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum History {
+    Preserve,
+    DiscardOldest,
+}
+
+impl History {
+    fn retention(self, outbox_cap: usize) -> Retention {
+        match self {
+            History::Preserve => Retention::Preserve,
+            History::DiscardOldest => Retention::DiscardOldest { cap: outbox_cap },
+        }
+    }
+}
+
+pub fn run(history: History, retry_raw_quarantine: bool) -> Result<()> {
+    run_mode(None, false, history, retry_raw_quarantine)
 }
 
 /// Unlock credentials once in a foreground launcher, then drain new hook rows.
 pub fn watch(
     interval_secs: u64,
     serve_queries: bool,
-    preserve_backlog: bool,
+    history: History,
     retry_raw_quarantine: bool,
 ) -> Result<()> {
     run_mode(
         Some(Duration::from_secs(interval_secs.max(1))),
         serve_queries,
-        preserve_backlog,
+        history,
         retry_raw_quarantine,
     )
 }
@@ -39,17 +58,13 @@ pub fn watch(
 fn run_mode(
     watch_interval: Option<Duration>,
     serve_queries: bool,
-    preserve_backlog: bool,
+    history: History,
     retry_raw_quarantine: bool,
 ) -> Result<()> {
     #[cfg(not(unix))]
     anyhow::ensure!(!serve_queries, "local query sockets require Unix");
     let cfg = Config::load()?;
-    let outbox_cap = if preserve_backlog {
-        i64::MAX as usize
-    } else {
-        cfg.outbox_cap
-    };
+    let retention = history.retention(cfg.outbox_cap);
     cfg.ensure_state_dir()?;
     crate::logging::init_file_log(&cfg.runtime_dir().join("export.log"));
     cfg.require_collector()?;
@@ -135,7 +150,7 @@ fn run_mode(
             let watch = watch_loop(
                 &store,
                 &transport,
-                outbox_cap,
+                retention,
                 cfg.export_batch,
                 raw_sync.as_ref(),
                 interval,
@@ -156,7 +171,7 @@ fn run_mode(
             export_with_retry(
                 &store,
                 &transport,
-                outbox_cap,
+                retention,
                 cfg.export_batch,
                 raw_sync.as_ref(),
             )
@@ -185,12 +200,12 @@ fn run_mode(
 async fn export_with_retry<T: Transport>(
     store: &Store,
     transport: &T,
-    cap: usize,
+    retention: Retention,
     batch_size: usize,
     raw_sync: Option<&RawSync>,
 ) -> Result<usize, ExportError> {
     for attempt in 0..MAX_ATTEMPTS {
-        match drain_all(store, transport, cap, batch_size, raw_sync).await {
+        match drain_all(store, transport, retention, batch_size, raw_sync).await {
             Ok(outcome) => return Ok(outcome.spans),
             Err(e) => {
                 if !e.retryable() || attempt + 1 == MAX_ATTEMPTS {
@@ -208,7 +223,7 @@ async fn export_with_retry<T: Transport>(
 async fn watch_loop<T: Transport, F: Future<Output = std::io::Result<()>>>(
     store: &Store,
     transport: &T,
-    cap: usize,
+    retention: Retention,
     batch_size: usize,
     raw_sync: Option<&RawSync>,
     interval: Duration,
@@ -232,7 +247,7 @@ async fn watch_loop<T: Transport, F: Future<Output = std::io::Result<()>>>(
                     stopped.map_err(|e| ExportError::Unavailable(format!("waiting for Ctrl-C: {e}")))?;
                     return Ok(delivered_total);
                 }
-                result = drain_all(store, transport, cap, batch_size, raw_sync) => result,
+                result = drain_all(store, transport, retention, batch_size, raw_sync) => result,
             };
             match result {
                 Ok(outcome) => {
@@ -288,7 +303,7 @@ struct DrainOutcome {
 async fn drain_all<T: Transport>(
     store: &Store,
     transport: &T,
-    cap: usize,
+    retention: Retention,
     batch_size: usize,
     raw_sync: Option<&RawSync>,
 ) -> Result<DrainOutcome, ExportError> {
@@ -297,7 +312,7 @@ async fn drain_all<T: Transport>(
     } else {
         0
     };
-    let spans = drain(store, transport, cap, batch_size).await?;
+    let spans = drain(store, transport, retention, batch_size).await?;
     Ok(DrainOutcome { spans, raw_objects })
 }
 
@@ -423,7 +438,7 @@ mod tests {
             watch_loop(
                 &store,
                 &transport,
-                100,
+                Retention::Preserve,
                 10,
                 Some(&raw),
                 Duration::from_millis(5),
@@ -454,7 +469,7 @@ mod tests {
             tenant_id: "tenant-a".into(),
         };
         let transport = recorder(false, false);
-        drain_all(&store, &transport, 100, 10, Some(&raw))
+        drain_all(&store, &transport, Retention::Preserve, 10, Some(&raw))
             .await
             .unwrap();
         rejected_server.join().unwrap();
@@ -502,6 +517,31 @@ mod tests {
         assert_eq!(store.raw_objects_pending("tenant-a", 16).unwrap().len(), 1);
     }
 
+    #[tokio::test]
+    async fn default_history_keeps_rows_beyond_the_configured_cap_on_auth_failure() {
+        let (_directory, store) = fixture();
+        for _ in 0..gently_store::OUTBOX_CAP {
+            enqueue(&store);
+        }
+        let retention = History::Preserve.retention(gently_store::OUTBOX_CAP);
+        let transport = recorder(true, false);
+        assert!(matches!(
+            export_with_retry(&store, &transport, retention, 100, None).await,
+            Err(ExportError::Authentication(401))
+        ));
+        assert_eq!(store.outbox_len().unwrap(), gently_store::OUTBOX_CAP + 1);
+        assert_eq!(store.quarantine_len().unwrap(), 0);
+    }
+
+    #[test]
+    fn only_explicit_discard_carries_a_trim_cap() {
+        assert_eq!(History::Preserve.retention(7), Retention::Preserve);
+        assert_eq!(
+            History::DiscardOldest.retention(7),
+            Retention::DiscardOldest { cap: 7 }
+        );
+    }
+
     struct Recorder {
         calls: AtomicUsize,
         auth_failure: bool,
@@ -545,7 +585,7 @@ mod tests {
         let (_directory, store) = fixture();
         let transport = recorder(true, false);
         assert!(matches!(
-            export_with_retry(&store, &transport, 1000, 100, None).await,
+            export_with_retry(&store, &transport, Retention::Preserve, 100, None).await,
             Err(ExportError::Authentication(401))
         ));
         assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
@@ -558,9 +598,11 @@ mod tests {
         let (_directory, store) = fixture();
         let transport = recorder(false, true);
         let started = std::time::Instant::now();
-        assert!(export_with_retry(&store, &transport, 1000, 100, None)
-            .await
-            .is_err());
+        assert!(
+            export_with_retry(&store, &transport, Retention::Preserve, 100, None)
+                .await
+                .is_err()
+        );
         assert_eq!(transport.calls.load(Ordering::SeqCst), 3);
         assert_eq!(store.outbox_len().unwrap(), 1);
         // Two sleeps total 750ms; the old final sleep made this 1750ms.
@@ -580,7 +622,7 @@ mod tests {
         watch_loop(
             &store,
             &transport,
-            1000,
+            Retention::Preserve,
             100,
             None,
             Duration::from_millis(5),
@@ -616,7 +658,7 @@ mod tests {
             watch_loop(
                 &store,
                 &transport,
-                1000,
+                Retention::Preserve,
                 100,
                 None,
                 Duration::from_millis(5),
@@ -639,7 +681,7 @@ mod tests {
             watch_loop(
                 &store,
                 &transport,
-                1000,
+                Retention::Preserve,
                 100,
                 None,
                 Duration::from_millis(5),

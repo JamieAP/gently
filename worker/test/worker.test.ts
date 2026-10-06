@@ -2,8 +2,9 @@ import { env, SELF } from "cloudflare:test";
 import { describe, it, expect, beforeEach } from "vitest";
 import worker from "../src/index";
 import type { Env } from "../src/d1";
-import { insertSpans } from "../src/d1";
+import { insertSpans, tracePage, tracePageSql } from "../src/d1";
 import { flatten } from "../src/otlp";
+import { applySchema } from "./schema";
 import { resetDatabase } from "./reset";
 
 const BEARER = "Bearer test-token-secret";
@@ -833,5 +834,288 @@ describe("GET /v1/query", () => {
       headers: { Authorization: BEARER },
     });
     expect(res.status).toBe(404);
+  });
+});
+
+
+describe("bounded trace pages", () => {
+  const T = "9876543210abcdef9876543210abcdef";
+  async function seed(count: number) {
+    const rows = Array.from({length: count}, (_, i) => ({
+      tenant_id: "personal", device_id: "mac-main", trace_id: T,
+      span_id: i.toString(16).padStart(16, "0"), parent_span_id: i ? "0000000000000000" : null,
+      name: "synthetic", kind: 1, start_unix_nano: "1700000000000000000",
+      end_unix_nano: String(1700000000000000000n + BigInt(i)), status: 0,
+      session_id: "synthetic", harness: "codex", tool_name: null, tool_use_id: null,
+      attrs_json: "[]", resource_json: "[]", ingested_unix_nano: "1700000000000000000"
+    }));
+    for (let i = 0; i < count; i += 32) await insertSpans(env, "personal", "mac-main", rows.slice(i, i + 32));
+  }
+  const get = (extra = "") => SELF.fetch(`https://x/v1/query?tenant_id=personal&op=trace&trace_id=${T}&page=1${extra}`, {headers: {Authorization: BEARER}});
+  const legacy = () => SELF.fetch(`https://x/v1/query?tenant_id=personal&op=trace&trace_id=${T}`, {headers: {Authorization: BEARER}});
+  const ingest = async (body: unknown) => {
+    const response = await SELF.fetch("https://x/v1/traces?tenant_id=personal", {method: "POST", headers: {Authorization: BEARER, "Content-Type": "application/json"}, body: JSON.stringify(body)});
+    expect(response.status).toBe(200);
+  };
+  const span = (id: string, start: string) => makeSingleSpanTrace(T, id.padStart(16, "0"), "synthetic", start, start);
+  type Page = {rows: Array<{span_id: string; start_unix_nano: string; effective_end_unix_nano: string}>; next_cursor: string | null; complete: boolean};
+  async function readAll(extra = ""): Promise<{pages: string[][]; bytes: number[]}> {
+    const pages: string[][] = []; const bytes: number[] = []; let cursor: string | null = null;
+    do {
+      const response = await get(`${extra}${cursor ? `&cursor=${cursor}` : ""}`);
+      expect(response.status).toBe(200);
+      const text = await response.text();
+      const page = JSON.parse(text) as Page;
+      pages.push(page.rows.map(row => row.span_id)); bytes.push(new TextEncoder().encode(text).byteLength);
+      expect(page.complete).toBe(page.next_cursor === null);
+      cursor = page.next_cursor;
+    } while (cursor);
+    return {pages, bytes};
+  }
+
+  it("reconstructs a long trace with timestamp ties and trace-wide root bounds", async () => {
+    await seed(205);
+    let cursor: string | null = null; const ids: string[] = [];
+    for (let page = 0; page < 3; page++) {
+      const res = await get(cursor ? `&cursor=${cursor}` : ""); expect(res.status).toBe(200);
+      const body = await res.json() as Page;
+      if (page === 0) expect(body.rows[0].effective_end_unix_nano).toBe("1700000000000000204");
+      ids.push(...body.rows.map(row => row.span_id)); cursor = body.next_cursor;
+      expect(body.complete).toBe(page === 2);
+    }
+    expect(ids).toHaveLength(205); expect(new Set(ids).size).toBe(205); expect(ids).toEqual([...ids].sort());
+    // Unpaged clients keep their previous allowance: a complete array up to 10,000 rows / 8 MiB.
+    const old = await legacy(); expect(old.status).toBe(200);
+    expect((await old.json() as unknown[]).length).toBe(205);
+  });
+
+  it("orders by numeric time where text order differs", async () => {
+    await ingest(span("b", "10")); await ingest(span("a", "9"));
+    expect((await readAll("&limit=1")).pages).toEqual([["000000000000000a"], ["000000000000000b"]]);
+  });
+
+  it("orders and preserves full-range unsigned timestamps", async () => {
+    const times = ["1", "99", "100", "9223372036854775807", "9223372036854775808", "18446744073709551615"];
+    for (const [i, start] of times.entries()) await ingest(span(String(times.length - i), start));
+    const found: string[] = []; let cursor: string | null = null;
+    do {
+      const page = await (await get(`&limit=1${cursor ? `&cursor=${cursor}` : ""}`)).json() as Page;
+      expect(page.rows[0].effective_end_unix_nano).toBe(times.at(-1));
+      found.push(page.rows[0].start_unix_nano); cursor = page.next_cursor;
+    } while (cursor);
+    expect(found).toEqual(times);
+  });
+
+  it("returns noncanonical starts, including negative ones, without a sentinel", async () => {
+    await ingest(span("1", "-5")); await ingest(span("2", "1700000000000000000"));
+    const response = await get(); expect(response.status).toBe(200);
+    const page = await response.json() as Page;
+    expect(page.complete).toBe(true);
+    expect(page.rows.map(row => row.start_unix_nano).sort()).toEqual(["-5", "1700000000000000000"]);
+    expect((await (await legacy()).json() as unknown[]).length).toBe(2);
+  });
+
+  it("returns the largest row ingest accepts on its own page", async () => {
+    // Quotes double once on ingest and again in the response, so this ~1 MiB
+    // request is the worst case: its row alone exceeds the 2 MiB page budget.
+    const big = span("2", "2");
+    const attribute = {key: "note", value: {stringValue: ""}};
+    (big.resourceSpans[0].scopeSpans[0].spans[0] as {attributes: unknown[]}).attributes = [attribute];
+    attribute.value.stringValue = "\"".repeat((1024 * 1024 - JSON.stringify(big).length) / 2 - 1);
+    expect(new TextEncoder().encode(JSON.stringify(big)).byteLength).toBeLessThanOrEqual(1024 * 1024);
+    await ingest(span("1", "1")); await ingest(big); await ingest(span("3", "3"));
+    const {pages, bytes} = await readAll();
+    expect(pages).toEqual([["0000000000000001"], ["0000000000000002"], ["0000000000000003"]]);
+    expect(bytes[1]).toBeGreaterThan(2 * 1024 * 1024);
+    expect(bytes[1]).toBeLessThan(8 * 1024 * 1024);
+    expect((await (await legacy()).json() as unknown[]).length).toBe(3);
+  });
+
+  it("rejects a row beyond the lone-row budget without returning its payload", async () => {
+    await seed(1);
+    // Only a direct write can store this; ingest bounds requests to 1 MiB.
+    await env.DB.prepare("UPDATE spans SET attrs_json = ? WHERE tenant_id = ? AND trace_id = ?").bind("synthetic-canary" + "\u0001".repeat(1_500_000), "personal", T).run();
+    for (const response of [await get(), await legacy()]) {
+      expect(response.status).toBe(413);
+      expect(await response.text()).not.toContain("synthetic-canary");
+    }
+  });
+
+  it("keeps pages within 2 MiB when roots carry long trace-wide bounds", async () => {
+    await seed(100);
+    await env.DB.prepare("UPDATE spans SET parent_span_id = NULL WHERE tenant_id = 'personal' AND trace_id = ?").bind(T).run();
+    const longEnd = "9".repeat(400 * 1024);
+    const child = makeSingleSpanTrace(T, "ffffffffffffffff", "synthetic", "2", longEnd);
+    Object.assign(child.resourceSpans[0].scopeSpans[0].spans[0], {parentSpanId: "0000000000000000"});
+    await ingest(child);
+    const {pages, bytes} = await readAll();
+    expect(pages.flat()).toHaveLength(101);
+    expect(Math.max(...bytes)).toBeLessThanOrEqual(2 * 1024 * 1024);
+  });
+
+  it("returns 409 when a span moves before the cursor between pages", async () => {
+    // The reviewer's scenario: a@10, b@20, c@30; page 1; c re-ingested at 5.
+    for (const [id, start] of [["a", "10"], ["b", "20"], ["c", "30"]]) await ingest(span(id, start));
+    const first = await (await get("&limit=1")).json() as Page;
+    expect(first.rows.map(row => row.span_id)).toEqual(["000000000000000a"]);
+    await ingest(span("c", "5"));
+    const next = await get(`&limit=1&cursor=${first.next_cursor}`);
+    expect(next.status).toBe(409);
+    expect(await next.json()).toEqual({error: "Trace changed during pagination; repeat the query"});
+  });
+
+  it("returns 409 for a late early parent or a deletion between pages", async () => {
+    for (const [id, start] of [["a", "10"], ["b", "20"], ["c", "30"]]) await ingest(span(id, start));
+    for (const mutate of [
+      () => ingest(span("e", "5")),
+      () => env.DB.prepare("DELETE FROM spans WHERE tenant_id = 'personal' AND span_id = '000000000000000c'").run(),
+    ]) {
+      const first = await (await get("&limit=1")).json() as Page;
+      await mutate();
+      expect((await get(`&limit=1&cursor=${first.next_cursor}`)).status).toBe(409);
+    }
+  });
+
+  it("keeps reading through appends and same-position merges", async () => {
+    for (const [id, start] of [["a", "10"], ["b", "20"]]) await ingest(span(id, start));
+    const first = await (await get("&limit=1")).json() as Page;
+    await ingest(span("b", "20")); await ingest(span("a", "10")); await ingest(span("d", "40"));
+    const generation = await env.DB.prepare("SELECT generation FROM trace_generations WHERE tenant_id = 'personal' AND trace_id = ?").bind(T).first();
+    expect(generation).toBeNull();
+    let cursor = first.next_cursor; const ids = first.rows.map(row => row.span_id);
+    while (cursor) {
+      const page = await (await get(`&limit=1&cursor=${cursor}`)).json() as Page;
+      ids.push(...page.rows.map(row => row.span_id)); cursor = page.next_cursor;
+    }
+    expect(ids).toEqual(["000000000000000a", "000000000000000b", "000000000000000d"]);
+  });
+
+  it("rejects malformed, forged and cross-context cursors and invalid limits", async () => {
+    await seed(3);
+    for (const extra of ["&cursor=invalid", "&limit=0", "&limit=101", "&limit=2garbage"]) expect((await get(extra)).status).toBe(400);
+    const page = await (await get("&limit=1")).json() as {next_cursor: string};
+    const otherTrace = await SELF.fetch(`https://x/v1/query?tenant_id=personal&op=trace&trace_id=${TRACE_ID}&page=1&cursor=${page.next_cursor}`, {headers:{Authorization:BEARER}});
+    expect(otherTrace.status).toBe(400);
+    const decoded = JSON.parse(atob(page.next_cursor.replace(/-/g, "+").replace(/_/g, "/")));
+    const encode = (cursor: unknown) => btoa(JSON.stringify(cursor)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    for (const forged of [{...decoded, tenant: "other"}, {...decoded, start: "abc"}, {...decoded, generation: "x"}, {...decoded, span: "missing"}]) {
+      const response = await get(`&cursor=${encode(forged)}`);
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({error: "Invalid trace cursor"});
+    }
+    // Unknown fields are accepted but never copied into the next cursor.
+    const next = await (await get(`&limit=1&cursor=${encode({...decoded, injected: "x".repeat(64)})}`)).json() as {next_cursor: string};
+    expect(Object.keys(JSON.parse(atob(next.next_cursor.replace(/-/g, "+").replace(/_/g, "/")))).sort())
+      .toEqual(["generation", "span", "start", "tenant", "trace", "v"]);
+  });
+
+  it("returns an empty complete page for an absent trace", async () => {
+    const response = await get(); expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({rows: [], next_cursor: null, complete: true});
+  });
+});
+
+describe("trace page cost", () => {
+  // Count D1 rows_read for every statement and batch a page read issues.
+  function counted(db: D1Database) {
+    const stats = {rowsRead: 0};
+    const real = new WeakMap<object, D1PreparedStatement>();
+    const add = (result: D1Result) => { stats.rowsRead += result.meta.rows_read; };
+    const wrap = (statement: D1PreparedStatement): D1PreparedStatement => {
+      const proxy = new Proxy(statement, {get(target, prop) {
+        if (prop === "bind") return (...values: unknown[]) => wrap(target.bind(...values));
+        if (prop === "all") return async () => { const result = await target.all(); add(result); return result; };
+        const value = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      }});
+      real.set(proxy, statement);
+      return proxy;
+    };
+    const proxy = new Proxy(db, {get(target, prop) {
+      if (prop === "prepare") return (sql: string) => wrap(target.prepare(sql));
+      if (prop === "batch") return async (statements: D1PreparedStatement[]) => {
+        const results = await target.batch(statements.map(statement => real.get(statement) ?? statement));
+        results.forEach(add);
+        return results;
+      };
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    }});
+    return {db: proxy as D1Database, stats};
+  }
+  // A session root, turns under it, and tools under each turn.
+  async function seed(trace: string, count: number) {
+    const insert = env.DB.prepare(`INSERT INTO spans (tenant_id, span_id, source_device_id, trace_id, parent_span_id, name, kind,
+      start_unix_nano, end_unix_nano, status, attrs_json, resource_json, ingested_unix_nano)
+      VALUES ('personal', ?, 'mac-main', ?, ?, 'synthetic', 1, ?, ?, 0, '[]', '[]', '1')`);
+    const id = (i: number) => `${trace}-${String(i).padStart(6, "0")}`;
+    const statements = Array.from({length: count}, (_, i) => {
+      const parent = i === 0 ? null : i % 10 === 1 ? id(0) : id(i - ((i - 1) % 10));
+      const start = 1700000000000000000n + BigInt(i) * 1000n;
+      return insert.bind(id(i), trace, parent, String(start), String(start + 500n));
+    });
+    for (let offset = 0; offset < statements.length; offset += 200) await env.DB.batch(statements.slice(offset, offset + 200));
+  }
+  async function fullRead(trace: string) {
+    const {db, stats} = counted(env.DB);
+    const counting = {...(env as unknown as Env), DB: db};
+    let cursor: string | null = null; let rows = 0; const perPage: number[] = [];
+    do {
+      const before = stats.rowsRead;
+      const page = await tracePage(counting, "personal", trace, cursor, null);
+      perPage.push(stats.rowsRead - before); rows += page.rows.length; cursor = page.next_cursor;
+    } while (cursor);
+    return {rows, total: stats.rowsRead, perPage};
+  }
+
+  it("reads a whole trace in rows_read linear in its size", async () => {
+    await seed("cost-1000", 1000); await seed("cost-2000", 2000);
+    const small = await fullRead("cost-1000"); const large = await fullRead("cost-2000");
+    expect(small.rows).toBe(1000); expect(large.rows).toBe(2000);
+    // Before the position index each page re-read the whole trace: 59,150 vs
+    // 220,239 rows_read for these fixtures. Each page now costs the same.
+    expect(large.total).toBeLessThan(2.2 * small.total);
+    expect(Math.max(...large.perPage)).toBeLessThan(2000);
+    expect(large.perPage.at(-1)!).toBeLessThan(2 * small.perPage.at(-1)! + 100);
+  });
+
+  it("plans a page as an index seek with no sort of the trace", async () => {
+    for (const afterCursor of [false, true]) {
+      const plan = await env.DB.prepare(`EXPLAIN QUERY PLAN ${tracePageSql(afterCursor)}`)
+        .bind("personal", "t", "1", "s", 100, 1024).all<{id: number; parent: number; detail: string}>();
+      const details = plan.results.map(row => row.detail);
+      expect(details).toContain(`SEARCH spans USING INDEX idx_spans_trace_position (tenant_id=? AND trace_id=?${afterCursor ? " AND <expr>>?" : ""})`);
+      expect(details).toContain("SEARCH spans USING INDEX idx_spans_trace_end (tenant_id=? AND trace_id=?)");
+      expect(details).toContain("SEARCH spans USING INDEX idx_spans_trace_parent (tenant_id=? AND trace_id=? AND parent_span_id=?)");
+      // The only sort is the final ordering of the page's own (at most 100) rows.
+      expect(plan.results.filter(row => row.detail.includes("TEMP B-TREE"))).toEqual([
+        expect.objectContaining({parent: 0, detail: "USE TEMP B-TREE FOR ORDER BY"}),
+      ]);
+    }
+  });
+
+  it("applies schema.sql again without error", async () => {
+    await applySchema(env.DB);
+  });
+});
+
+
+describe("trace continuation compatibility", () => {
+  it("continues accepted uppercase IDs, unicode legacy IDs and uint64 timestamps", async () => {
+    const T = "ABCDEF0123456789ABCDEF0123456789";
+    const ids = ["ABCDEF012345678A", "ABCDEF012345678B", "legacy-µ"];
+    for (const spanId of ids) {
+      const body = makeSingleSpanTrace(T, spanId, "synthetic-uppercase", "18446744073709551615", "18446744073709551615");
+      const post = await SELF.fetch("https://x/v1/traces?tenant_id=personal",{method:"POST",headers:{Authorization:BEARER,"Content-Type":"application/json"},body:JSON.stringify(body)});
+      expect(post.status).toBe(200);
+    }
+    let cursor: string | null = null; const found: string[] = [];
+    for (let i=0; i<3; i++) {
+      const response = await SELF.fetch(`https://x/v1/query?tenant_id=personal&op=trace&trace_id=${T}&page=1&limit=1${cursor ? `&cursor=${cursor}` : ""}`,{headers:{Authorization:BEARER}});
+      expect(response.status).toBe(200);
+      const page = await response.json() as {rows:Array<{span_id:string}>;next_cursor:string|null};
+      found.push(page.rows[0].span_id); cursor=page.next_cursor;
+    }
+    expect(found).toEqual(ids); expect(cursor).toBeNull();
   });
 });

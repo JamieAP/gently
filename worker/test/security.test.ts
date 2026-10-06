@@ -65,6 +65,29 @@ describe("test database reset", () => {
     expect(tables.results.map(row => row.name)).toEqual(["raw_values", "spans"]);
     expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM spans").first("n")).toBe(0);
   });
+
+  it("recreates schema.sql's multi-statement triggers whole, and they still fire", async () => {
+    const triggers = () => env.DB.prepare(
+      "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY name",
+    ).all<{ name: string; sql: string }>();
+    const generations = () => env.DB.prepare("SELECT COUNT(*) AS n FROM trace_generations").first("n");
+    expect((await postSpans(otlp())).status).toBe(200);
+    await env.DB.prepare("DELETE FROM spans").run();
+    expect(await generations()).toBe(1);
+
+    await resetDatabase(env.DB);
+    const { results } = await triggers();
+    expect(results.map(row => row.name)).toEqual([
+      "trace_generation_on_delete",
+      "trace_generation_on_insert",
+      "trace_generation_on_start",
+    ]);
+    for (const { sql } of results) expect(sql).toMatch(/generation \+ 1;\s*END$/);
+    expect(await generations()).toBe(0);
+    expect((await postSpans(otlp())).status).toBe(200);
+    await env.DB.prepare("DELETE FROM spans").run();
+    expect(await generations()).toBe(1);
+  });
 });
 
 describe("tenant and device authorization", () => {

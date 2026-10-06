@@ -12,6 +12,17 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+/// A watcher rejected a query parameter. Watchers started before paged trace
+/// queries reject `page`, so the trace reader falls back to the legacy query.
+#[derive(Debug)]
+pub struct UnsupportedQueryParameter;
+impl std::fmt::Display for UnsupportedQueryParameter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("unsupported query parameter")
+    }
+}
+impl std::error::Error for UnsupportedQueryParameter {}
+
 const MAX_REQUEST: u64 = 64 * 1024;
 const MAX_RESPONSE: u64 = 64 * 1024 * 1024;
 
@@ -240,6 +251,8 @@ async fn forward(
                     | "until"
                     | "limit"
                     | "order"
+                    | "page"
+                    | "cursor"
             ),
             "unsupported query parameter"
         );
@@ -332,10 +345,20 @@ impl Reply {
 
 fn relayed<T: for<'de> Deserialize<'de>>(reply: Reply) -> Result<T> {
     match reply {
-        Reply::Error(error) => Err(anyhow::anyhow!(error).context(QueryFailure::WatcherRelayed)),
+        Reply::Error(error) => Err(restored(&error).context(QueryFailure::WatcherRelayed)),
         Reply::Result(result) => serde_json::from_value(result)
             .map_err(|_| anyhow::anyhow!("invalid local query response"))
             .context(QueryFailure::WatcherRelayed),
+    }
+}
+
+/// The watcher reports errors as text; restore the two that the trace reader
+/// acts on, so the relayed category wraps them without hiding their type.
+fn restored(error: &str) -> anyhow::Error {
+    match error {
+        "unsupported query parameter" => UnsupportedQueryParameter.into(),
+        crate::collector::TraceChanged::MESSAGE => crate::collector::TraceChanged.into(),
+        other => anyhow::anyhow!("{other}"),
     }
 }
 
@@ -407,6 +430,26 @@ mod relay_tests {
                 matches!(category(&error), Some(QueryFailure::WatcherUnavailable)),
                 "{reply}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn relayed_errors_the_trace_reader_acts_on_keep_their_type() {
+        for (reply, changed) in [
+            ("{\"error\":\"unsupported query parameter\"}\n", false),
+            (
+                "{\"error\":\"trace changed during pagination; repeat the query\"}\n",
+                true,
+            ),
+        ] {
+            let (_dir, path) = watcher(reply).await;
+            let error = ask(&path).await.unwrap_err();
+            assert!(
+                matches!(category(&error), Some(QueryFailure::WatcherRelayed)),
+                "{reply}"
+            );
+            assert_eq!(error.is::<crate::collector::TraceChanged>(), changed);
+            assert_eq!(error.is::<UnsupportedQueryParameter>(), !changed);
         }
     }
 

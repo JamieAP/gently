@@ -60,7 +60,7 @@ device_id = "mac-main"
 | `tenant_id` | `personal` | Namespace for capture, export and query; must match the authenticated host. |
 | `device_id` | `local` | Capture host identifier; must match the upload credential's device. |
 | `prefer_quic` | `true` | Prefer HTTP/3 export with a TCP fallback; use `false` for localhost HTTP. |
-| `outbox_cap` | `10000` | 1–1000000 envelopes applied when export drains; excess oldest envelopes are dropped. |
+| `outbox_cap` | `10000` | 1–1000000 envelopes; trimming applies only with explicit `export --discard-oldest`. |
 | `export_batch` | `512` | 1–4096 queued envelopes coalesced into one export request. |
 | `export_timeout_secs` | `15` | Per-request export timeout, 1–3600 seconds. |
 | `query_timeout_secs` | `30` | Per-request CLI/MCP query timeout, 1–3600 seconds. |
