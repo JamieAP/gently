@@ -24,7 +24,7 @@ From the repository root:
 ```sh
 cargo install --path crates/gently-cli --locked
 cd worker
-npm ci
+npm ci --ignore-scripts
 npx wrangler d1 execute gently --local --config wrangler.local.toml --file schema.sql
 cd ..
 ```

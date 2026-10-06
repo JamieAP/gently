@@ -3,7 +3,8 @@
   "private": true,
   "scripts": {
     "build": "node build.mjs",
-    "test": "node --test test_build.mjs"
+    "test": "node --test test_build.mjs",
+    "audit": "python3 ../scripts/npm-audit.py"
   },
   "devDependencies": {
     "markdown-it": "15.0.2"
