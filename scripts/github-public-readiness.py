@@ -17,6 +17,7 @@ import sys
 OWNER = "JamieAP"
 REPO = "JamieAP/gently"
 BASE = f"repos/{REPO}"
+ACTIONS_APP_ID = 15368
 CONTEXTS = ["validate (macos-latest)", "validate (ubuntu-latest)"]
 FILES = (".github/workflows/ci.yml", ".github/workflows/docs.yml", ".github/CODEOWNERS")
 ACTIONS = {"allowed_actions": "selected", "sha_pinning_required": True}
@@ -46,6 +47,22 @@ def block(text, name, indent):
             break
         values.append(line)
     return "\n".join(values)
+
+
+def plain_mapping_keys(text, indent):
+    keys = []
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if len(line) - len(line.lstrip()) != indent:
+            continue
+        match = re.fullmatch(r"[ ]{" + str(indent) + r"}([A-Za-z][A-Za-z0-9_-]*):(?:[ ].*)?", line)
+        if match is None:
+            raise GuardError("CI must fail its authorization step before checkout; unsupported mapping syntax")
+        keys.append(match.group(1))
+    if len(keys) != len(set(keys)):
+        raise GuardError("CI must fail its authorization step before checkout; duplicate mapping keys")
+    return keys
 
 
 class GuardError(Exception):
@@ -195,8 +212,17 @@ class Guard:
                                  "        if: ${{ !(" + CI_CONDITION + ") }}", "        run: exit 1"]
                     steps = block(contents, "steps", 4).splitlines()
                     boundary = next((i for i, line in enumerate(steps[1:], 1) if line.startswith("      - ")), len(steps))
-                    if conditions or steps[:boundary] != authorize or "continue-on-error" in contents:
+                    allowed = {"strategy", "runs-on", "timeout-minutes", "env", "steps"}
+                    if (set(plain_mapping_keys(contents, 4)) - allowed or conditions
+                            or steps[:boundary] != authorize or "continue-on-error" in contents):
                         raise GuardError("CI must fail an exact owner/repository/author authorization step before checkout")
+                    # Each later step must have the default success condition:
+                    # neither quoted/spaced keys nor always() may bypass failure.
+                    later = "\n".join(steps[boundary:])
+                    for step in re.split(r"(?m)(?=^      - )", later):
+                        mapping = re.sub(r"^      - ", "        ", step, count=1)
+                        if step.strip() and "if" in plain_mapping_keys(mapping, 8):
+                            raise GuardError("CI must fail its authorization step before checkout; later conditions are forbidden")
                 elif conditions != [PAGES_CONDITION]:
                     raise GuardError("Every deployment workflow job must use the exact owner/repository/branch guard")
                 if job == "deploy":
@@ -222,6 +248,8 @@ class Guard:
         security = repository.get("security_and_analysis") or {}
         if any((security.get(feature) or {}).get("status") != "enabled" for feature in SECURITY_FEATURES):
             issues.append("Secret scanning and push protection must be enabled and confirmed by readback")
+        if self.get("private-vulnerability-reporting").get("enabled") is not True:
+            issues.append("Private vulnerability reporting must be enabled and confirmed by readback")
         if check_actions:
             actions = self.get("actions/permissions")
             if actions.get("enabled") is not expect_enabled or any(actions.get(k) != v for k, v in ACTIONS.items()):
@@ -243,6 +271,10 @@ class Guard:
             protection = {}
         status = protection.get("required_status_checks") or {}
         reviews = protection.get("required_pull_request_reviews") or {}
+        bindings = [(check.get("context"), check.get("app_id")) for check in status.get("checks", [])]
+        if (len(bindings) != len(CONTEXTS) or any(type(app_id) is not int for _, app_id in bindings)
+                or any(bindings.count((context, ACTIONS_APP_ID)) != 1 for context in CONTEXTS)):
+            issues.append("Required validation checks must be bound to the GitHub Actions App")
         if status.get("strict") is not True or sorted(status.get("contexts", [])) != sorted(CONTEXTS):
             issues.append("main must require both Mac and Linux validation checks against the current base")
         if (reviews.get("require_code_owner_reviews") is not True or reviews.get("dismiss_stale_reviews") is not True
@@ -339,10 +371,10 @@ class Guard:
                 or any(current.get(key, {}).get("enabled") is True for key in stronger_flags)):
             raise GuardError("Refusing to relax existing branch protection; review its stronger or unexpected controls manually")
         bindings = {check["context"]: check["app_id"] for check in checks if check.get("app_id") is not None}
-        if any(type(app_id) is not int for app_id in bindings.values()):
-            raise GuardError("Unable to preserve existing branch status-check App bindings")
-        required_checks = [{"context": context, **({"app_id": bindings[context]} if context in bindings else {})}
-                           for context in CONTEXTS]
+        if any(type(app_id) is not int or app_id not in (-1, ACTIONS_APP_ID) for app_id in bindings.values()):
+            raise GuardError("Refusing to replace a different required-check App binding; review it manually")
+        bindings = {context: ACTIONS_APP_ID for context in CONTEXTS}
+        required_checks = [{"context": context, "app_id": ACTIONS_APP_ID} for context in CONTEXTS]
         return {
             "required_status_checks": {"strict": True, "checks": required_checks},
             "enforce_admins": False,
@@ -369,6 +401,9 @@ class Guard:
             security = (self.api.request(BASE).get("security_and_analysis") or {})
             if any((security.get(feature) or {}).get("status") != "enabled" for feature in SECURITY_FEATURES):
                 raise GuardError("GitHub did not confirm secret scanning and push protection")
+            self.get("private-vulnerability-reporting", method="PUT")
+            if self.get("private-vulnerability-reporting").get("enabled") is not True:
+                raise GuardError("GitHub did not confirm private vulnerability reporting")
             self.put("actions/permissions/workflow", WORKFLOW)
             self.put("actions/permissions/fork-pr-contributor-approval", FORK)
             if self.get("actions/permissions/fork-pr-contributor-approval").get("approval_policy") != FORK["approval_policy"]:
@@ -425,7 +460,7 @@ def main():
     args = parser.parse_args()
     if args.plan:
         print("Target: JamieAP/gently, main. No visibility or credential changes.")
-        print("Apply disables Actions first, verifies owner-only access and reviewed main workflows, sets secret scanning/push protection, read-only tokens and owner approval gates, verifies owner approval and deployment gates before enabling, then reads back Actions policies.")
+        print("Apply disables Actions first, verifies owner-only access and reviewed main workflows, sets secret scanning/push protection and private vulnerability reporting, read-only tokens and owner approval gates, verifies owner approval and deployment gates before enabling, then reads back Actions policies.")
         print("Manual prerequisites: review all installed GitHub Apps; disable github-pages administrator bypass; merge and review workflow hardening on main.")
         return 0
     root = Path(__file__).resolve().parent.parent

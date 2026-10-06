@@ -16,3 +16,7 @@ local storage, encrypted capture and same-user trust boundaries.
 Release gates require reviewed changes, Mac/Linux validation, dependency audit,
 secret scanning and push protection readback. Client-side disclosure guards
 supplement those controls and cannot classify every private value.
+
+Private vulnerability reporting must be enabled and confirmed by the repository
+readiness check before public Actions are enabled. Until that readback is recorded,
+use the private-contact fallback above; do not publish vulnerability details.

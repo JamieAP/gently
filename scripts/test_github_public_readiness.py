@@ -71,6 +71,8 @@ class FakeAPI:
                      "permissions": {"admin": True}}
         self.repo["security_and_analysis"] = {feature: {"status": "disabled"} for feature in guard_module.SECURITY_FEATURES}
         self.ignore_security_updates = False
+        self.private_reporting = False
+        self.ignore_reporting_updates = False
         self.collaborators = [{"login": OWNER}]
         self.files = copy.deepcopy(FILES)
         self.main_sha = SHA
@@ -95,6 +97,10 @@ class FakeAPI:
             if method == "PATCH" and not self.ignore_security_updates:
                 self.repo["security_and_analysis"].update(copy.deepcopy(body["security_and_analysis"]))
             return copy.deepcopy(self.repo)
+        if suffix == "private-vulnerability-reporting":
+            if method == "PUT" and not self.ignore_reporting_updates:
+                self.private_reporting = True
+            return {"enabled": self.private_reporting}
         if suffix == "collaborators":
             return copy.deepcopy(self.collaborators) if "page=1" in path else []
         if suffix == "actions/runs":
@@ -176,6 +182,43 @@ class ReadinessTests(unittest.TestCase):
 
     def apply(self):
         self.guard.apply(reviewed_main_sha=SHA, apps_reviewed=True)
+
+    def test_private_reporting_readback_precedes_actions_enable(self):
+        self.api.ignore_reporting_updates = True
+        with self.assertRaisesRegex(guard_module.GuardError, "did not confirm private vulnerability"):
+            self.apply()
+        self.assertFalse(self.api.actions["enabled"])
+        self.assertFalse(any(method == "PUT" and path.endswith("actions/permissions") and body.get("enabled") is True
+                             for method, path, body in self.api.calls))
+
+    def test_read_only_audit_detects_disabled_private_reporting(self):
+        self.apply()
+        self.api.private_reporting = False
+        self.assertTrue(any("Private vulnerability reporting" in issue for issue in self.guard.check(SHA, True)))
+
+    def test_authorization_rejects_quoted_spaced_and_later_conditions(self):
+        original = self.guard.files[".github/workflows/ci.yml"]
+        mutations = [original.replace("  validate:\n", "  validate:\n" + key + " false\n")
+                     for key in ['    "if":', "    'if':", "    if :"]]
+        mutations += [original.replace("        with:", key + " always()\n        with:")
+                      for key in ['        if:', '        "if":', "        'if':", "        if :"]]
+        mutations += [original.replace("      - uses:", key + " ${{ always() }}\n        uses:")
+                      for key in ['      - if:', '      - "if":', "      - 'if':", "      - if :"]]
+        for changed in mutations:
+            with self.subTest(workflow=changed):
+                self.guard.files[".github/workflows/ci.yml"] = changed
+                self.api.files = copy.deepcopy(self.guard.files)
+                with self.assertRaises(guard_module.GuardError):
+                    self.guard.reviewed_workflows(SHA)
+
+    def test_required_checks_are_bound_and_conflicting_bindings_refused(self):
+        self.apply()
+        self.assertEqual(self.api.protection["required_status_checks"]["checks"],
+                         [{"context": context, "app_id": guard_module.ACTIONS_APP_ID} for context in guard_module.CONTEXTS])
+        self.api.protection["required_status_checks"]["checks"][0]["app_id"] = 7
+        with self.assertRaisesRegex(guard_module.GuardError, "different required-check App binding"):
+            self.apply()
+        self.assertFalse(self.api.actions["enabled"])
 
     def test_security_readback_is_required_before_actions_enable(self):
         self.api.ignore_security_updates = True

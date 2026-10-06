@@ -9,7 +9,13 @@ not establish cloud service capacity or all-session capture completeness.
 Run the Rust, Worker, launcher, documentation and real encrypted acceptance checks
 from CONTRIBUTING on the final combined tree. Require green Mac and Linux CI on
 that same tree. Owner-created same-repository PRs into `main` may run read-only CI;
-disallowed actors/authors/forks fail the authorization step before checkout.
+the reviewed workflow rejects disallowed actors/authors/forks before checkout.
+That step is defense in depth: `pull_request` loads workflow changes from the PR
+merge ref. A fork can rewrite it, so repository approval for **all external
+contributors**, read-only tokens, no stored credentials and workflow review are
+the actual boundaries. Never approve a fork run that changes `.github` until those
+changes are reviewed as executable code. A green PR check is insufficient release
+evidence; require the final reviewed `main` push checks.
 `pull_request_target` is excluded; required validation jobs are never skipped
 as an authorization mechanism. Workflows use pinned
 GitHub-owned actions, avoid stored secrets, and never persist checkout credentials.
@@ -25,7 +31,8 @@ python3 scripts/github-public-readiness.py --check \
 After that policy is merged and explicitly approved for application, the owner
 can use `--apply` with the same reviewed full main commit. The script disables
 Actions first, checks the workflow/access inventory, enables and reads back
-secret scanning/push protection, sets required Mac/Linux checks and review gates,
+secret scanning/push protection and private vulnerability reporting, binds
+required Mac/Linux checks to GitHub Actions and sets review gates,
 and enables Actions only after policy readback. It preserves stronger existing
 branch controls or refuses to replace them. A sole-owner administrator bypass
 remains documented; an administrator can still override protection.
@@ -33,6 +40,19 @@ remains documented; an administrator can still override protection.
 Creating the policy PR does not apply settings or prove CI ran. Keep release gates
 pending until actual readback and exact-tree CI evidence exist. Review all stored
 GitHub Apps independently; OAuth cannot enumerate every installation.
+
+## Supported build tools and evidence
+
+The supported build environment is current stable Rust/Cargo with rustfmt/clippy,
+Node.js 22 at its current patch (at least 22.12), npm from that distribution, and
+Python 3.12. No lower Rust MSRV is promised. CI installs those channels and records
+exact `rustc`, `cargo`, Node, npm and Python versions in each run. Release evidence
+must retain those versions alongside its source commit; a floating channel name
+alone does not reproduce a build.
+
+Keep public-safe evidence in `docs/releases/<version>/verification.md`, linked to
+exact-commit CI runs and synthetic/native acceptance results. This guide is the
+canonical release gate list. Check a gate only when that evidence exists.
 
 ## Native coding-agent evidence
 
