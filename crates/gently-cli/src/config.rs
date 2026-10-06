@@ -112,7 +112,8 @@ pub struct Config {
     pub state_dir: PathBuf,
     /// Prefer HTTP/3 (QUIC) for export, falling back to HTTP/2.
     pub prefer_quic: bool,
-    /// Max buffered outbox rows before the oldest are dropped.
+    /// Trim threshold used only by `export --discard-oldest`; the default
+    /// export retains every queued row.
     pub outbox_cap: usize,
     /// OTLP envelope rows coalesced into one export request.
     pub export_batch: usize,
