@@ -42,6 +42,13 @@ fn rpc_failure(code: i32, message: impl Into<String>) -> RpcError {
 enum ToolFailure {
     #[error("Local jq filter failed; correct the filter syntax or operation.")]
     Filter,
+    #[error(
+        "tool result is {0} bytes, over the {limit}-byte limit; \
+         select fields with jq (for example map({{span_id, name, tool_name, status}})) \
+         or use search_spans with trace_id and limit",
+        limit = MAX_TOOL_RESULT_BYTES
+    )]
+    ResultTooLarge(usize),
 }
 const COLLECTOR_FAILURE: &str =
     "Collector query failed; check collector availability, authorization and query arguments.";
@@ -470,8 +477,21 @@ fn call_tool(params: &Value, client: &QueryClient, rt: &tokio::runtime::Runtime)
     // MCP tool results return content blocks; embed the JSON as text.
     Ok(json!({
         "isError": false,
-        "content": [{"type": "text", "text": serde_json::to_string_pretty(&payload)?}]
+        "content": [{"type": "text", "text": bounded_text(&payload)?}]
     }))
+}
+
+/// One tool result is at most this many bytes of text. `get_trace` can
+/// assemble far more (up to 32 MiB of rows) than a client can use in context.
+const MAX_TOOL_RESULT_BYTES: usize = 8 * 1024 * 1024;
+
+fn bounded_text(payload: &Value) -> Result<String> {
+    let text = serde_json::to_string_pretty(payload)?;
+    anyhow::ensure!(
+        text.len() <= MAX_TOOL_RESULT_BYTES,
+        ToolFailure::ResultTooLarge(text.len())
+    );
+    Ok(text)
 }
 
 fn str_arg(args: &Value, key: &str) -> Option<String> {
@@ -592,7 +612,7 @@ fn tool_specs() -> Value {
         },
         {
             "name": "get_trace",
-            "description": "Get all spans for a trace id (for tree reconstruction).",
+            "description": "Get all spans for a trace id (for tree reconstruction). Results over 8 MiB of text are refused; use jq to select fields.",
             "inputSchema": {"type": "object", "additionalProperties": false, "required": ["trace_id"], "properties": {
                 "trace_id": {"type": "string"},
                 "jq": {"type": "string", "description": "local jq filter applied to this tool's JSON result before returning"}
@@ -708,11 +728,15 @@ mod schema_tests {
         for error in [
             anyhow::anyhow!(private),
             anyhow::anyhow!(private).context(ToolFailure::Filter),
+            anyhow::anyhow!(private).context(ToolFailure::ResultTooLarge(1)),
             anyhow::anyhow!(private).context(QueryFailure::RawBudget),
             anyhow::anyhow!(private).context(QueryFailure::ReaderUnavailable),
             anyhow::anyhow!(private).context(QueryFailure::RawDecrypt),
             anyhow::anyhow!(private).context(QueryFailure::WatcherUnavailable),
             anyhow::anyhow!(private).context(QueryFailure::WatcherRelayed),
+            anyhow::anyhow!(private).context(QueryFailure::TraceRawBudget),
+            anyhow::anyhow!(private).context(QueryFailure::TraceTooLarge),
+            anyhow::anyhow!(private).context(QueryFailure::TraceUnstable),
         ] {
             assert!(!tool_failure(&error).contains(private));
         }
@@ -852,5 +876,36 @@ mod lifecycle_tests {
         }
         assert_eq!(decode(b""), Incoming::Unparseable);
         assert_eq!(decode(b" \r\n"), Incoming::Blank);
+    }
+}
+
+#[cfg(test)]
+mod result_tests {
+    use super::*;
+
+    #[test]
+    fn tool_results_over_the_text_limit_are_refused_with_a_way_forward() {
+        let small = json!([{"name": "synthetic"}]);
+        assert!(bounded_text(&small).is_ok());
+        let large = json!(["x".repeat(MAX_TOOL_RESULT_BYTES)]);
+        let error = bounded_text(&large).unwrap_err();
+        let text = tool_failure(&error);
+        assert_ne!(text, COLLECTOR_FAILURE);
+        assert!(text.contains("over the 8388608-byte limit"));
+        assert!(text.contains("select fields with jq"));
+    }
+
+    #[test]
+    fn trace_assembly_limits_reach_the_client_by_name() {
+        use crate::query_client::QueryFailure;
+        for failure in [
+            QueryFailure::TraceRawBudget,
+            QueryFailure::TraceTooLarge,
+            QueryFailure::TraceUnstable,
+        ] {
+            let text = tool_failure(&failure.into());
+            assert_eq!(text, failure.to_string());
+            assert_ne!(text, COLLECTOR_FAILURE);
+        }
     }
 }

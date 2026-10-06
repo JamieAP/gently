@@ -81,6 +81,36 @@ impl SpanRow {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TraceResponse {
+    Page(TracePage),
+    Legacy(Vec<SpanRow>),
+}
+fn is_trace_changed(error: &anyhow::Error) -> bool {
+    error.is::<crate::collector::TraceChanged>()
+}
+
+#[cfg(unix)]
+fn is_old_watcher(error: &anyhow::Error) -> bool {
+    error.is::<crate::query_broker::UnsupportedQueryParameter>()
+}
+#[cfg(not(unix))]
+fn is_old_watcher(_: &anyhow::Error) -> bool {
+    false
+}
+
+#[derive(Deserialize)]
+struct TracePage {
+    rows: Vec<SpanRow>,
+    next_cursor: Option<String>,
+    complete: bool,
+}
+const MAX_TRACE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_TRACE_ROWS: usize = 100_000;
+/// A paged read restarts from the first page when the trace changes under it.
+const TRACE_READ_ATTEMPTS: usize = 3;
+
 /// Per-tool rollup from `op=stats`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolStat {
@@ -117,6 +147,75 @@ pub struct TraceFilters {
     pub order: Option<String>,
 }
 
+/// What a page asks the reader to do next.
+enum TraceNext {
+    Done,
+    Continue(String),
+}
+
+/// Rows accepted so far in one paged read, with the limits that bound it.
+struct TraceAssembly<'a> {
+    trace_id: &'a str,
+    byte_limit: usize,
+    over_limit: QueryFailure,
+    rows: Vec<SpanRow>,
+    spans: std::collections::BTreeSet<String>,
+    cursors: std::collections::BTreeSet<String>,
+    bytes: usize,
+}
+impl<'a> TraceAssembly<'a> {
+    fn new(trace_id: &'a str, byte_limit: usize, over_limit: QueryFailure) -> Self {
+        Self {
+            trace_id,
+            byte_limit,
+            over_limit,
+            rows: Vec::new(),
+            spans: Default::default(),
+            cursors: Default::default(),
+            bytes: 0,
+        }
+    }
+
+    fn accept(&mut self, page: TracePage) -> Result<TraceNext> {
+        let next = match (page.complete, page.next_cursor, page.rows.is_empty()) {
+            (true, None, _) => TraceNext::Done,
+            (false, Some(_), true) => anyhow::bail!("empty unfinished trace page"),
+            (false, Some(cursor), false) => TraceNext::Continue(cursor),
+            (true, Some(_), _) | (false, None, _) => {
+                anyhow::bail!("inconsistent trace pagination response")
+            }
+        };
+        for row in page.rows {
+            self.push(row)?;
+        }
+        if let TraceNext::Continue(cursor) = &next {
+            anyhow::ensure!(
+                !cursor.is_empty() && cursor.len() <= 4096 && self.cursors.insert(cursor.clone()),
+                "invalid or repeated trace cursor"
+            );
+        }
+        Ok(next)
+    }
+
+    fn push(&mut self, row: SpanRow) -> Result<()> {
+        anyhow::ensure!(
+            row.trace_id == self.trace_id,
+            "collector returned a different trace"
+        );
+        // A repeated span means its position moved during the read.
+        if !self.spans.insert(row.span_id.clone()) {
+            return Err(crate::collector::TraceChanged.into());
+        }
+        self.bytes = self.bytes.saturating_add(serde_json::to_vec(&row)?.len());
+        anyhow::ensure!(
+            self.bytes <= self.byte_limit && self.rows.len() < MAX_TRACE_ROWS,
+            self.over_limit
+        );
+        self.rows.push(row);
+        Ok(())
+    }
+}
+
 /// HTTP client for the collector query API.
 pub struct QueryClient {
     collector: crate::collector::CollectorClient,
@@ -145,7 +244,7 @@ impl Drop for CachedRawPayload {
 
 /// Closed safe categories for callers that must not expose error chains. Each
 /// names the component that failed; an untagged error is a collector failure.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Copy, Debug, thiserror::Error)]
 pub enum QueryFailure {
     #[error("raw resolution exceeds the 8 MiB budget; narrow your query")]
     RawBudget,
@@ -163,6 +262,21 @@ pub enum QueryFailure {
         "Local query watcher relayed a collector or query error; check collector availability, authorization and query arguments."
     )]
     WatcherRelayed,
+    #[error(
+        "trace exceeds the 8 MiB raw-resolution budget; \
+         read it without raw values (GENTLY_RESOLVE_RAW_VALUES=0)"
+    )]
+    TraceRawBudget,
+    #[error(
+        "trace exceeds local assembly limits (100,000 rows or 32 MiB); \
+         use the collector cursor API for bounded pages"
+    )]
+    TraceTooLarge,
+    #[error(
+        "trace changed during pagination on {TRACE_READ_ATTEMPTS} attempts; \
+         repeat the query once capture for it is idle"
+    )]
+    TraceUnstable,
 }
 
 /// Decryption fails locally: a reader prompt not approved in time, a reader
@@ -314,10 +428,82 @@ impl QueryClient {
         self.get(&p).await
     }
 
+    /// Raw resolution charges every assembled row against its 8 MiB budget,
+    /// so with it enabled the read stops there rather than after every page.
+    fn trace_assembly<'a>(&self, trace_id: &'a str) -> TraceAssembly<'a> {
+        match self.local_raw_store {
+            Some(_) => {
+                TraceAssembly::new(trace_id, MAX_RAW_QUERY_BYTES, QueryFailure::TraceRawBudget)
+            }
+            None => TraceAssembly::new(trace_id, MAX_TRACE_BYTES, QueryFailure::TraceTooLarge),
+        }
+    }
+
+    async fn fetch_trace_page(&self, trace_id: &str, cursor: Option<&str>) -> Result<TracePage> {
+        let mut params = vec![
+            ("op", "trace".into()),
+            ("trace_id", trace_id.into()),
+            ("page", "1".into()),
+        ];
+        if let Some(cursor) = cursor {
+            params.push(("cursor", cursor.into()))
+        }
+        let response = match (self.get(&params).await, cursor) {
+            (Ok(response), _) => response,
+            (Err(error), None) if is_old_watcher(&error) => {
+                self.fetch_legacy_trace(trace_id).await?
+            }
+            (Err(error), _) => return Err(error),
+        };
+        match (response, cursor) {
+            (TraceResponse::Page(page), _) => Ok(page),
+            (TraceResponse::Legacy(rows), None) => Ok(TracePage {
+                rows,
+                next_cursor: None,
+                complete: true,
+            }),
+            (TraceResponse::Legacy(_), Some(_)) => {
+                anyhow::bail!("legacy trace response after pagination started")
+            }
+        }
+    }
+
+    /// A watcher started before paged queries rejects `page`; ask it for the
+    /// complete array instead, which it still serves within its old limits.
+    async fn fetch_legacy_trace(&self, trace_id: &str) -> Result<TraceResponse> {
+        self.get(&[("op", "trace".into()), ("trace_id", trace_id.into())])
+            .await
+            .context(
+                "the local query watcher predates paged trace queries; \
+                 restart gently export --watch --serve-queries after upgrading",
+            )
+    }
+
+    async fn read_trace(&self, trace_id: &str) -> Result<Vec<SpanRow>> {
+        let mut assembly = self.trace_assembly(trace_id);
+        let mut cursor = None;
+        loop {
+            let page = self.fetch_trace_page(trace_id, cursor.as_deref()).await?;
+            match assembly.accept(page)? {
+                TraceNext::Done => return Ok(assembly.rows),
+                TraceNext::Continue(next) => cursor = Some(next),
+            }
+        }
+    }
+
     pub async fn trace(&self, trace_id: &str) -> Result<Vec<SpanRow>> {
-        let mut rows: Vec<SpanRow> = self
-            .get(&[("op", "trace".into()), ("trace_id", trace_id.to_string())])
-            .await?;
+        let mut attempt = 1;
+        let mut rows = loop {
+            match self.read_trace(trace_id).await {
+                Err(error) if is_trace_changed(&error) && attempt < TRACE_READ_ATTEMPTS => {
+                    attempt += 1
+                }
+                Err(error) if is_trace_changed(&error) => {
+                    return Err(QueryFailure::TraceUnstable.into())
+                }
+                result => break result?,
+            }
+        };
         self.resolve_raw_values(&mut rows).await?;
         Ok(rows)
     }
@@ -556,6 +742,47 @@ mod raw_guard_tests {
         serde_json::from_value(json!({"span_id":"0123456789abcdef","trace_id":"trace","parent_span_id":null,"name":"turn","kind":1,
             "start_unix_nano":"1","end_unix_nano":"2","status":1,"session_id":"session","harness":"codex","tool_name":null,"tool_use_id":null,
             "resource_json":null,"attrs_json":null})).unwrap()
+    }
+
+    #[test]
+    fn raw_resolution_bounds_trace_assembly_at_its_own_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut raw = client();
+        raw.local_raw_store =
+            Some(gently_store::Store::open(&dir.path().join("state.db")).unwrap());
+        let wide = |id: usize| SpanRow {
+            span_id: format!("{id:016x}"),
+            attrs_json: Some("x".repeat(1024 * 1024)),
+            ..row()
+        };
+        let page = |range: std::ops::Range<usize>| TracePage {
+            rows: range.map(wide).collect(),
+            next_cursor: Some("next".into()),
+            complete: false,
+        };
+        // Nine 1 MiB rows fail on the first page with raw resolution, so no
+        // further pages are fetched; without it the same page is accepted.
+        let error = raw
+            .trace_assembly("trace")
+            .accept(page(0..9))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("8 MiB raw-resolution budget"));
+        assert!(client().trace_assembly("trace").accept(page(0..9)).is_ok());
+    }
+
+    #[test]
+    fn a_repeated_span_is_a_trace_change() {
+        let mut assembly = client().trace_assembly("trace");
+        let page = |cursor: &str| TracePage {
+            rows: vec![row()],
+            next_cursor: Some(cursor.into()),
+            complete: false,
+        };
+        assert!(assembly.accept(page("first")).is_ok());
+        assert!(is_trace_changed(
+            &assembly.accept(page("second")).err().unwrap()
+        ));
     }
 
     #[tokio::test]
