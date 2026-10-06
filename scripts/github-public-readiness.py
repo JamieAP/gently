@@ -24,7 +24,8 @@ SELECTED = {"github_owned_allowed": True, "verified_allowed": False, "patterns_a
 WORKFLOW = {"default_workflow_permissions": "read", "can_approve_pull_request_reviews": False}
 FORK = {"approval_policy": "all_external_contributors"}
 ACTIVE_STATUSES = ("in_progress", "queued", "waiting", "requested", "pending")
-CI_CONDITION = "github.repository == 'JamieAP/gently' && github.actor == 'JamieAP' && github.triggering_actor == 'JamieAP' && (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main')"
+CI_CONDITION = "github.repository == 'JamieAP/gently' && github.actor == 'JamieAP' && github.triggering_actor == 'JamieAP' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login == 'JamieAP' && github.event.pull_request.base.ref == 'main'))"
+SECURITY_FEATURES = ("secret_scanning", "secret_scanning_push_protection")
 PAGES_CONDITION = "github.repository == 'JamieAP/gently' && github.ref == 'refs/heads/main' && github.actor == 'JamieAP' && github.triggering_actor == 'JamieAP'"
 
 
@@ -172,15 +173,16 @@ class Guard:
             raise GuardError("CODEOWNERS must assign every file to JamieAP")
         for name in FILES[:2]:
             text = self.files.get(name, "")
-            if re.search(r"\b(pull_request|pull_request_target|workflow_run|issue_comment|issues|discussion_comment|repository_dispatch|self-hosted)\b", text):
+            if re.search(r"\b(pull_request_target|workflow_run|issue_comment|issues|discussion_comment|repository_dispatch|self-hosted)\b", text):
                 raise GuardError("A reviewed workflow contains a prohibited trigger or self-hosted runner")
             if "secrets." in text or re.search(r"secrets\s*\[", text):
                 raise GuardError("Public workflows must not reference stored secrets")
             if block(text, "permissions", 0).strip() != "contents: read":
                 raise GuardError("Workflow default permissions must contain only contents: read")
             triggers = re.findall(r"(?m)^  ([A-Za-z0-9_-]+):", block(text, "on", 0))
-            if sorted(triggers) != ["push", "workflow_dispatch"]:
-                raise GuardError("Only owner pushes and manual workflow dispatch are permitted")
+            expected_triggers = ["pull_request", "push", "workflow_dispatch"] if name.endswith("ci.yml") else ["push", "workflow_dispatch"]
+            if sorted(triggers) != expected_triggers:
+                raise GuardError("Only guarded owner CI pull requests, main pushes and manual dispatch are permitted")
             jobs = block(text, "jobs", 0)
             expected = ["validate"] if name.endswith("ci.yml") else ["build", "deploy"]
             if re.findall(r"(?m)^  ([A-Za-z0-9_-]+):$", jobs) != expected:
@@ -188,9 +190,15 @@ class Guard:
             for job in expected:
                 contents = block(jobs, job, 2)
                 conditions = re.findall(r"(?m)^    if: (.+)$", contents)
-                condition = CI_CONDITION if job == "validate" else PAGES_CONDITION
-                if conditions != [condition]:
-                    raise GuardError("Every public workflow job must use the exact owner/repository/branch guard")
+                if job == "validate":
+                    authorize = ["      - name: Authorize owner-operated validation",
+                                 "        if: ${{ !(" + CI_CONDITION + ") }}", "        run: exit 1"]
+                    steps = block(contents, "steps", 4).splitlines()
+                    boundary = next((i for i, line in enumerate(steps[1:], 1) if line.startswith("      - ")), len(steps))
+                    if conditions or steps[:boundary] != authorize or "continue-on-error" in contents:
+                        raise GuardError("CI must fail an exact owner/repository/author authorization step before checkout")
+                elif conditions != [PAGES_CONDITION]:
+                    raise GuardError("Every deployment workflow job must use the exact owner/repository/branch guard")
                 if job == "deploy":
                     if [line.strip() for line in block(contents, "permissions", 4).splitlines()] != ["pages: write", "id-token: write"]:
                         raise GuardError("Only Pages deployment receives exactly Pages/OIDC write permissions")
@@ -210,6 +218,10 @@ class Guard:
 
     def policy_issues(self, user, expect_enabled=True, check_actions=True):
         issues = []
+        repository = self.api.request(BASE)
+        security = repository.get("security_and_analysis") or {}
+        if any((security.get(feature) or {}).get("status") != "enabled" for feature in SECURITY_FEATURES):
+            issues.append("Secret scanning and push protection must be enabled and confirmed by readback")
         if check_actions:
             actions = self.get("actions/permissions")
             if actions.get("enabled") is not expect_enabled or any(actions.get(k) != v for k, v in ACTIONS.items()):
@@ -352,6 +364,11 @@ class Guard:
             self.inventory()
             self.reviewed_workflows(reviewed_main_sha)
             branch, bindings = self.branch_update()
+            self.api.request(BASE, method="PATCH", body={"security_and_analysis": {
+                feature: {"status": "enabled"} for feature in SECURITY_FEATURES}})
+            security = (self.api.request(BASE).get("security_and_analysis") or {})
+            if any((security.get(feature) or {}).get("status") != "enabled" for feature in SECURITY_FEATURES):
+                raise GuardError("GitHub did not confirm secret scanning and push protection")
             self.put("actions/permissions/workflow", WORKFLOW)
             self.put("actions/permissions/fork-pr-contributor-approval", FORK)
             if self.get("actions/permissions/fork-pr-contributor-approval").get("approval_policy") != FORK["approval_policy"]:
@@ -408,7 +425,7 @@ def main():
     args = parser.parse_args()
     if args.plan:
         print("Target: JamieAP/gently, main. No visibility or credential changes.")
-        print("Apply disables Actions first, verifies owner-only access and reviewed main workflows, sets read-only tokens and owner approval gates, verifies owner approval and deployment gates before enabling, then reads back Actions policies.")
+        print("Apply disables Actions first, verifies owner-only access and reviewed main workflows, sets secret scanning/push protection, read-only tokens and owner approval gates, verifies owner approval and deployment gates before enabling, then reads back Actions policies.")
         print("Manual prerequisites: review all installed GitHub Apps; disable github-pages administrator bypass; merge and review workflow hardening on main.")
         return 0
     root = Path(__file__).resolve().parent.parent
