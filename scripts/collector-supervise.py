@@ -85,7 +85,7 @@ def main():
     if sys.argv[1] == "--export-only":
         gently = sys.argv[2]
         environment = local_environment(public_setup(gently))
-        os.execvpe(gently, [gently, "export", "--watch"], environment)
+        os.execvpe(gently, [gently, "export", "--watch", "--serve-queries", "--preserve-backlog"], environment)
     node, gently, repo = sys.argv[1:]
     repo = Path(repo)
     environment = local_environment(public_setup(gently))
@@ -110,7 +110,7 @@ def main():
         "capabilities": ["ingest", "read"],
     }])
     try:
-        children.append(subprocess.Popen([gently, "export", "--watch"], cwd=repo,
+        children.append(subprocess.Popen([gently, "export", "--watch", "--serve-queries", "--preserve-backlog"], cwd=repo,
             env=environment, start_new_session=True))
         children.append(subprocess.Popen([
             node, str(repo / "worker/node_modules/wrangler/bin/wrangler.js"), "dev",
@@ -119,11 +119,23 @@ def main():
         ], cwd=repo / "worker", env=worker_env, start_new_session=True))
         print("Gently collector and persistent exporter started.", flush=True)
         while not stopping:
-            for child in children:
+            for name, child in zip(("exporter", "collector"), children):
                 code = child.poll()
                 if code is not None:
-                    print("A Gently service exited; stopping its companion.", file=sys.stderr)
-                    return code
+                    if code < 0:
+                        number = -code
+                        try:
+                            label = signal.Signals(number).name
+                        except ValueError:
+                            label = "unknown"
+                        reason = f"after signal {label} ({number})"
+                        exit_code = 128 + number
+                    else:
+                        reason = f"with status {code}"
+                        exit_code = code
+                    print(f"Gently {name} exited {reason}; stopping its companion.",
+                          file=sys.stderr, flush=True)
+                    return exit_code
             time.sleep(0.25)
         return 0
     finally:

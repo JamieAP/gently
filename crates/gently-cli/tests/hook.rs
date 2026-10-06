@@ -77,7 +77,7 @@ fn hook_is_silent_exits_zero_and_buffers_length_only_spans() {
         run_hook(dir.path(), payload);
     }
     let store = Store::open(&runtime(dir.path()).join("state.db")).unwrap();
-    assert_eq!(store.outbox_len().unwrap(), 2);
+    assert_eq!(store.outbox_len().unwrap(), 3);
     assert_eq!(store.raw_objects_len().unwrap(), 0);
     let queued = store.outbox_take_batch(10).unwrap();
     for (_, json) in queued {
@@ -123,7 +123,7 @@ fn raw_capture_encrypts_public_only_and_binds_open_tool_input_to_completed_span(
     let queued = store.outbox_take_batch(10).unwrap();
     let completed = queued
         .iter()
-        .find(|(_, json)| json.contains("\"name\":\"Bash\""))
+        .find(|(_, json)| json.contains("\"name\":\"Bash\"") && json.contains("PostToolUse"))
         .unwrap();
     assert!(completed.1.contains("gently.tool_input.raw_ref"));
     assert!(completed.1.contains("gently.tool_response.raw_ref"));
@@ -274,7 +274,7 @@ fn capture_failure_preserves_authenticated_refs_inherited_from_open_tool() {
     let queued = store.outbox_take_batch(10).unwrap();
     let completed = queued
         .iter()
-        .find(|(_, json)| json.contains("\"name\":\"Bash\""))
+        .find(|(_, json)| json.contains("\"name\":\"Bash\"") && json.contains("PostToolUse"))
         .unwrap();
     assert!(completed.1.contains(&input.context.raw_ref));
     assert!(completed.1.contains("gently.tool_input.raw_ref"));
@@ -345,7 +345,275 @@ fn multi_span_event_uses_one_envelope() {
             .as_array()
             .unwrap()
             .len(),
-        2
+        3
     );
     assert!(!runtime(dir.path()).join("export.log").exists());
+}
+
+#[test]
+fn immutable_receipts_retain_resume_estimates_after_later_session_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    for payload in [
+        r#"{"hook_event_name":"SessionStart","session_id":"resume-metadata","source":"resume","context_tokens":10,"estimated_cache_write_usd":0.123456789012345678901}"#,
+        r#"{"hook_event_name":"SessionStart","session_id":"resume-metadata","source":"resume","context_tokens":20,"estimated_cache_write_usd":0.234567890123456789012}"#,
+        r#"{"hook_event_name":"SessionEnd","session_id":"resume-metadata","reason":"other"}"#,
+    ] {
+        run_hook(dir.path(), payload);
+    }
+    let store = Store::open(&runtime(dir.path()).join("state.db")).unwrap();
+    let spans: Vec<serde_json::Value> = store
+        .outbox_take_batch(10)
+        .unwrap()
+        .iter()
+        .flat_map(|(_, body)| {
+            let req: serde_json::Value = serde_json::from_str(body).unwrap();
+            req["resourceSpans"][0]["scopeSpans"][0]["spans"]
+                .as_array()
+                .unwrap()
+                .clone()
+        })
+        .collect();
+    let receipts: Vec<_> = spans
+        .iter()
+        .filter(|s| s["name"] == "hook:SessionStart")
+        .collect();
+    assert_eq!(receipts.len(), 2);
+    assert_ne!(receipts[0]["spanId"], receipts[1]["spanId"]);
+    for (receipt, tokens, cost) in [
+        (receipts[0], "10", "0.123456789012345678901"),
+        (receipts[1], "20", "0.234567890123456789012"),
+    ] {
+        let attrs: std::collections::HashMap<_, _> = receipt["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| {
+                (
+                    a["key"].as_str().unwrap(),
+                    a["value"]["stringValue"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(attrs.get("gently.context_tokens"), Some(&tokens));
+        assert_eq!(attrs.get("gently.estimated_cache_write_usd"), Some(&cost));
+        assert_eq!(attrs.get("gently.source"), Some(&"resume"));
+        assert!(!attrs.contains_key("gently.tool_name"));
+    }
+    assert_eq!(store.raw_objects_len().unwrap(), 0);
+}
+
+#[test]
+fn tool_invocation_ids_survive_aggregation_without_counting_permission_markers_as_tools() {
+    for harness in ["claude", "codex"] {
+        let dir = tempfile::tempdir().unwrap();
+        for event in [
+            "UserPromptSubmit",
+            "PermissionRequest",
+            "PreToolUse",
+            "PostToolUse",
+        ] {
+            let payload = serde_json::json!({"hook_event_name":event,"session_id":"tool-correlation",
+                "prompt_id":"p","turn_id":"p","tool_name":"Bash","tool_use_id":"invocation-1",
+                "tool_input":{"command":"private command"}});
+            Command::cargo_bin("gently")
+                .unwrap()
+                .args(["hook", "--harness", harness])
+                .env("GENTLY_STATE_DIR", dir.path())
+                .env("GENTLY_TENANT_ID", "personal")
+                .env("GENTLY_DEVICE_ID", "capture-host")
+                .env_remove("GENTLY_TOKEN")
+                .env("GENTLY_CAPTURE_RAW_VALUES", "0")
+                .write_stdin(payload.to_string())
+                .assert()
+                .success()
+                .stdout(predicates::str::is_empty());
+        }
+        let store = Store::open(&runtime(dir.path()).join("state.db")).unwrap();
+        let envelopes = store.outbox_take_batch(10).unwrap();
+        let spans: Vec<serde_json::Value> = envelopes
+            .iter()
+            .flat_map(|(_, body)| {
+                let req: serde_json::Value = serde_json::from_str(body).unwrap();
+                req["resourceSpans"][0]["scopeSpans"][0]["spans"]
+                    .as_array()
+                    .unwrap()
+                    .clone()
+            })
+            .collect();
+        let attrs = |span: &serde_json::Value| -> std::collections::HashMap<String, String> {
+            span["attributes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| {
+                    (
+                        a["key"].as_str().unwrap().to_string(),
+                        a["value"]["stringValue"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect()
+        };
+        let tools: Vec<_> = spans.iter().filter(|s| s["name"] == "Bash").collect();
+        assert_eq!(tools.len(), 2);
+        for tool in &tools {
+            assert_eq!(
+                attrs(tool).get("gently.tool_use_id").map(String::as_str),
+                Some("invocation-1"),
+                "{harness}: aggregate must expose its invocation ID"
+            );
+        }
+        assert_eq!(tools[0]["spanId"], tools[1]["spanId"]);
+        let permission = spans
+            .iter()
+            .find(|s| s["name"] == "PermissionRequest")
+            .unwrap();
+        let metadata = attrs(permission);
+        assert!(
+            !metadata.contains_key("gently.tool_name"),
+            "observers must not become tool rows in collector rollups"
+        );
+        assert_eq!(
+            metadata.get("gently.hook.tool_name").map(String::as_str),
+            Some("Bash")
+        );
+        assert_eq!(
+            metadata.get("gently.hook.tool_use_id").map(String::as_str),
+            Some("invocation-1")
+        );
+        assert!(metadata.contains_key("gently.tool_input.bytes"));
+        assert!(!envelopes
+            .iter()
+            .any(|(_, body)| body.contains("private command")));
+    }
+}
+
+#[test]
+fn failed_queue_write_does_not_consume_first_sight_of_an_inferred_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(runtime(dir.path())).unwrap();
+    let store = Store::open(&runtime(dir.path()).join("state.db")).unwrap();
+    let fault = rusqlite::Connection::open(runtime(dir.path()).join("state.db")).unwrap();
+    fault.execute_batch("CREATE TRIGGER fail_queue BEFORE INSERT ON outbox BEGIN SELECT RAISE(FAIL, 'fixture queue failure'); END;").unwrap();
+    let payload = r#"{"hook_event_name":"PostToolUse","session_id":"atomic-inferred","turn_id":"continuation","tool_name":"shell_command","tool_use_id":"u","tool_response":"opaque"}"#;
+    let invoke = || {
+        Command::cargo_bin("gently")
+            .unwrap()
+            .args(["hook", "--harness", "codex"])
+            .env("GENTLY_STATE_DIR", dir.path())
+            .env("GENTLY_TENANT_ID", "personal")
+            .env("GENTLY_DEVICE_ID", "capture-host")
+            .env_remove("GENTLY_TOKEN")
+            .env("GENTLY_CAPTURE_RAW_VALUES", "0")
+            .write_stdin(payload)
+            .assert()
+            .success()
+            .stdout(predicates::str::is_empty());
+    };
+    invoke();
+    assert_eq!(store.outbox_len().unwrap(), 0);
+    assert!(store
+        .peek_open("atomic-inferred", "turn:continuation")
+        .unwrap()
+        .is_none());
+    fault.execute_batch("DROP TRIGGER fail_queue;").unwrap();
+    invoke();
+    let rows = store.outbox_take_batch(10).unwrap();
+    assert_eq!(rows.len(), 1);
+    let envelope: serde_json::Value = serde_json::from_str(&rows[0].1).unwrap();
+    let spans = envelope["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .unwrap();
+    let turn = spans
+        .iter()
+        .find(|s| s["name"] == "turn:1")
+        .expect("retry must still emit the inferred parent");
+    let tool = spans.iter().find(|s| s["name"] == "shell_command").unwrap();
+    assert_eq!(tool["parentSpanId"], turn["spanId"]);
+}
+
+#[test]
+fn tool_open_is_visible_without_a_close_and_finalizes_with_the_same_identity() {
+    for harness in ["claude", "codex"] {
+        let dir = tempfile::tempdir().unwrap();
+        let invoke = |event: &str, input: serde_json::Value| {
+            let payload = serde_json::json!({"hook_event_name":event,"session_id":"unfinished","turn_id":"t","prompt_id":"t","tool_name":"Bash","tool_use_id":"u","tool_input":input});
+            Command::cargo_bin("gently")
+                .unwrap()
+                .args(["hook", "--harness", harness])
+                .env("GENTLY_STATE_DIR", dir.path())
+                .env("GENTLY_TENANT_ID", "personal")
+                .env("GENTLY_DEVICE_ID", "capture-host")
+                .env_remove("GENTLY_TOKEN")
+                .env("GENTLY_CAPTURE_RAW_VALUES", "0")
+                .write_stdin(payload.to_string())
+                .assert()
+                .success()
+                .stdout(predicates::str::is_empty());
+        };
+        invoke("UserPromptSubmit", serde_json::Value::Null);
+        invoke(
+            "PreToolUse",
+            serde_json::json!({"command":"private command"}),
+        );
+        let store = Store::open(&runtime(dir.path()).join("state.db")).unwrap();
+        let rows = store.outbox_take_batch(10).unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(&rows[1].1).unwrap();
+        let open = envelope["resourceSpans"][0]["scopeSpans"][0]["spans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "Bash")
+            .expect("an interrupted tool still needs its own provisional aggregate");
+        assert_eq!(open["kind"], 3);
+        assert_eq!(open["status"]["code"], 0);
+        assert_eq!(open["startTimeUnixNano"], open["endTimeUnixNano"]);
+        assert!(!rows[1].1.contains("private command"));
+        invoke("PostToolUse", serde_json::Value::Null);
+        let rows = store.outbox_take_batch(10).unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(&rows[2].1).unwrap();
+        let closed = envelope["resourceSpans"][0]["scopeSpans"][0]["spans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "Bash")
+            .unwrap();
+        assert_eq!(closed["spanId"], open["spanId"]);
+        assert_eq!(closed["parentSpanId"], open["parentSpanId"]);
+        assert_eq!(closed["startTimeUnixNano"], open["startTimeUnixNano"]);
+    }
+}
+
+#[test]
+fn encrypted_receipt_retains_precise_nested_and_future_payload_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let identity = enrollment(dir.path());
+    let raw = r#"{"hook_event_name":"PostCompact","session_id":"future","compact_summary":"private summary","future":{"number":0.123456789012345678901,"huge":1e400,"$serde_json::private::Number":"literal"}}"#;
+    run_hook_capture(dir.path(), raw, true);
+    let store = Store::open(&runtime(dir.path()).join("state.db")).unwrap();
+    let objects = store.raw_objects_pending("personal", 10).unwrap();
+    assert_eq!(objects.len(), 1);
+    let object = &objects[0];
+    let payload = gently_raw::open(
+        object,
+        &object.context,
+        &ReaderIdentities::from_native(vec![identity]),
+    )
+    .unwrap();
+    let captured = &payload.fields["gently.hook_payload"];
+    assert!(captured.contains("0.123456789012345678901"));
+    assert!(captured.contains("1e+400") || captured.contains("1e400"));
+    assert!(captured.contains("$serde_json::private::Number"));
+    let queued = store.outbox_take_batch(10).unwrap();
+    let req: serde_json::Value = serde_json::from_str(&queued[0].1).unwrap();
+    let spans = req["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .unwrap();
+    let receipt = spans
+        .iter()
+        .find(|span| span["name"] == "hook:PostCompact")
+        .unwrap();
+    assert!(payload.bindings["gently.hook_payload"]
+        .contains(&receipt["spanId"].as_str().unwrap().to_string()));
+    assert!(!queued[0].1.contains("private summary"));
+    assert!(!queued[0].1.contains(".sha256"));
 }

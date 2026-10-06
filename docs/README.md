@@ -26,11 +26,11 @@ from credential storage.
 
 ## What is supported
 
-CLI hooks and token-configured queries are included for Claude Code and Codex.
-Codex hook registration also requires trusting the installed entries in Codex.
-Desktop hooks can queue without a token and use a separate export watcher.
-That watcher does not authenticate CLI or MCP queries. Authenticated desktop
-MCP access and Claude Chat/Cowork integration remain incomplete.
+Claude Code and Codex coding agents are supported in the terminal and desktop.
+Codex hooks require trusting the installed entries in Codex. Tokenless desktop
+hooks queue for an export watcher; on Unix, `--serve-queries` also lets tokenless
+CLI/MCP clients query through that watcher. See [compatibility](reference/compatibility.md)
+for checked versions and the limits of hook fidelity.
 
 Raw content capture is off by default. Ordinary exports still contain identifying
 metadata such as paths, host information and session IDs. The collector's

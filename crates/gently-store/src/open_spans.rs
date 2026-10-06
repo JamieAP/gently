@@ -183,9 +183,20 @@ impl Store {
         Ok((n as u64, inserted > 0))
     }
 
-    /// The current turn index for a session (0 if no turn has started - tool
-    /// calls before the first prompt parent to `turn:0`, a degraded but valid
-    /// state).
+    /// Observe the current counter turn, plus whether this is the session's
+    /// first counter reference. Turn zero groups activity before an observed
+    /// prompt without inventing a prompt boundary. The retained counter row
+    /// prevents later references from reopening an already closed turn.
+    pub fn observe_current_turn(&self, session_id: &str) -> Result<(u64, bool)> {
+        let inserted = self.conn.execute(
+            "INSERT INTO counters (session_id, turn_index, current_turn) VALUES (?1, 0, 0)
+             ON CONFLICT(session_id) DO NOTHING",
+            rusqlite::params![session_id],
+        )?;
+        Ok((self.current_turn(session_id)?, inserted > 0))
+    }
+
+    /// The current turn index for a session (0 if no turn has started).
     pub fn current_turn(&self, session_id: &str) -> Result<u64> {
         let n: i64 = self
             .conn
@@ -194,6 +205,7 @@ impl Store {
                 rusqlite::params![session_id],
                 |r| r.get(0),
             )
+            .optional()?
             .unwrap_or(0);
         Ok(n as u64)
     }
@@ -266,6 +278,27 @@ mod tests {
     fn current_turn_defaults_to_zero() {
         let (_d, s) = store();
         assert_eq!(s.current_turn("nope").unwrap(), 0);
+    }
+
+    #[test]
+    fn observing_current_turn_infers_only_the_initial_unprompted_reference() {
+        let (_d, s) = store();
+        assert_eq!(s.observe_current_turn("sess").unwrap(), (0, true));
+        assert_eq!(s.observe_current_turn("sess").unwrap(), (0, false));
+        assert_eq!(s.next_turn_index("sess").unwrap(), 1);
+        assert_eq!(s.observe_current_turn("sess").unwrap(), (1, false));
+        assert_eq!(s.next_turn_index("other").unwrap(), 1);
+        assert_eq!(s.observe_current_turn("other").unwrap(), (1, false));
+    }
+
+    #[test]
+    fn current_turn_propagates_database_errors() {
+        let (_d, s) = store();
+        s.conn.execute("DROP TABLE counters", []).unwrap();
+        assert!(
+            s.current_turn("sess").is_err(),
+            "a broken counter must not silently become turn zero"
+        );
     }
 
     #[test]

@@ -86,30 +86,59 @@ export async function insertSpans(env: Env, tenantId: string, deviceId: string, 
   // multi-process emitter with no delivery-order guarantee: the same span_id is
   // reported provisionally on open, again on close, and (for the session root)
   // again on every resume. `INSERT OR REPLACE` let the last-delivered report win
-  // - so a retried provisional could revert a finalized span, and a resume could
-  // shove the session root's start forward past its own history. Instead a
-  // span's stored extent is the ENVELOPE of all its reports (earliest start,
-  // latest end), and its content comes from the most-finalized report (the one
-  // that ends latest; ties favour the newcomer). Bounds converge across replays,
-  // but conflicting metadata at equal end times depends on arrival order. Nanos
-  // are CAST to INTEGER (< 2^63) for comparison; stored values stay as received TEXT.
-  const newer =
-    "CAST(COALESCE(excluded.end_unix_nano, excluded.start_unix_nano) AS INTEGER) >= " +
-    "CAST(COALESCE(end_unix_nano, start_unix_nano) AS INTEGER)";
+  // — so a retried provisional could revert a finalized span, and a resume could
+  // shove the session root's start forward past its own history.
+  // Lifecycle extents keep earliest start/latest end. Tool completion outranks
+  // a provisional open, and a runtime-reported duration outranks inferred
+  // hook-pair timing: keep that report's start AND end together. This prevents
+  // pre-hook overhead from expanding a precise tool duration on merge.
+  // Equal-quality reports pick content by latest end; ties favour the newcomer.
+  // Replays and out-of-order delivery otherwise converge. nanos are CAST to
+  // INTEGER (< 2^63) only for comparison; the stored value stays the TEXT we got.
+  const hasAttr = (prefix: string, key: string, value?: string) =>
+    `EXISTS (SELECT 1 FROM json_each(${prefix}attrs_json) a WHERE
+      json_extract(a.value, '$.key') = '${key}'${value === undefined ? "" :
+      ` AND json_extract(a.value, '$.value.stringValue') = '${value}'`})`;
+  const quality = (prefix: string) => `(CASE
+    WHEN ${prefix}tool_name IS NULL THEN 0
+    WHEN ${hasAttr(prefix, "gently.tool_state", "closed")}
+      OR ${hasAttr(prefix, "gently.event", "PostToolUse")}
+      OR ${hasAttr(prefix, "gently.event", "PostToolUseFailure")}
+    THEN CASE WHEN ${hasAttr(prefix, "gently.tool_duration_ms")} THEN 2 ELSE 1 END
+    ELSE 0 END)`;
+  const incomingQuality = "(SELECT incoming_quality FROM decision)";
+  const storedQuality = "(SELECT stored_quality FROM decision)";
+  const newer = "(SELECT prefer_incoming FROM decision)";
   const pick = (col: string) => `${col} = CASE WHEN ${newer} THEN excluded.${col} ELSE ${col} END`;
-  const stmts = rows.map((r) =>
-    env.DB.prepare(
-      `INSERT INTO spans
+  // Materialize the previous report and merge decision once, before mutation.
+  // Re-expanding JSON predicates for every column makes batch SQL unnecessarily
+  // large and repeatedly scans the same attribute array.
+  const sql = `WITH previous AS MATERIALIZED (
+         SELECT ${quality("spans.")} AS quality,
+           COALESCE(end_unix_nano, start_unix_nano) AS endpoint
+         FROM spans WHERE tenant_id = ?1 AND span_id = ?2
+       ), decision AS MATERIALIZED (
+         SELECT ?18 AS incoming_quality, COALESCE(MAX(quality), 0) AS stored_quality,
+           (?18 > COALESCE(MAX(quality), 0) OR
+             (?18 = COALESCE(MAX(quality), 0) AND
+               CAST(COALESCE(?9, ?8) AS INTEGER) >= CAST(MAX(endpoint) AS INTEGER))) AS prefer_incoming
+         FROM previous
+       )
+       INSERT INTO spans
         (tenant_id, span_id, source_device_id, trace_id, parent_span_id, name, kind,
          start_unix_nano, end_unix_nano, status,
          session_id, harness, tool_name, tool_use_id,
          attrs_json, resource_json, ingested_unix_nano)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
        ON CONFLICT(tenant_id, span_id) DO UPDATE SET
          start_unix_nano = CASE
+           WHEN ${incomingQuality} = 2 OR ${storedQuality} = 2
+           THEN CASE WHEN ${newer} THEN excluded.start_unix_nano ELSE spans.start_unix_nano END
            WHEN CAST(excluded.start_unix_nano AS INTEGER) < CAST(start_unix_nano AS INTEGER)
            THEN excluded.start_unix_nano ELSE start_unix_nano END,
          end_unix_nano = CASE
+           WHEN ${incomingQuality} != ${storedQuality} OR ${incomingQuality} = 2
+           THEN CASE WHEN ${newer} THEN excluded.end_unix_nano ELSE spans.end_unix_nano END
            WHEN CAST(COALESCE(excluded.end_unix_nano, excluded.start_unix_nano) AS INTEGER)
               > CAST(COALESCE(end_unix_nano, start_unix_nano) AS INTEGER)
            THEN excluded.end_unix_nano ELSE end_unix_nano END,
@@ -124,8 +153,9 @@ export async function insertSpans(env: Env, tenantId: string, deviceId: string, 
          ${pick("attrs_json")},
          ${pick("resource_json")},
          ${pick("ingested_unix_nano")}
-         WHERE source_device_id = excluded.source_device_id AND trace_id = excluded.trace_id`,
-    ).bind(
+         WHERE source_device_id = excluded.source_device_id AND trace_id = excluded.trace_id`;
+  const stmts = rows.map((r) =>
+    env.DB.prepare(sql).bind(
       tenantId,
       r.span_id,
       deviceId,
@@ -143,6 +173,7 @@ export async function insertSpans(env: Env, tenantId: string, deviceId: string, 
       r.attrs_json,
       r.resource_json,
       r.ingested_unix_nano,
+      toolReportQuality(r),
     ),
   );
 
@@ -156,6 +187,16 @@ export async function insertSpans(env: Env, tenantId: string, deviceId: string, 
   }
 }
 
+function toolReportQuality(row: Row): number {
+  if (row.tool_name === null) return 0;
+  const attrs = JSON.parse(row.attrs_json) as Array<{key: string; value?: {stringValue?: string}}>;
+  const has = (key: string, value: string) => attrs.some(a => a.key === key && a.value?.stringValue === value);
+  const closed = has("gently.tool_state", "closed") ||
+    has("gently.event", "PostToolUse") || has("gently.event", "PostToolUseFailure");
+  if (!closed) return 0;
+  return attrs.some(a => a.key === "gently.tool_duration_ms") ? 2 : 1;
+}
+
 export interface TraceSummary {
   trace_id: string;
   session_id: string | null;
@@ -165,6 +206,14 @@ export interface TraceSummary {
   span_count: number;
   error_count: number;
 }
+
+// Older producers lifted tool_name onto permission markers. Keep those rows
+// visible in traces/searches, but do not treat observations as tool executions.
+const TOOL_EXECUTION = `tool_name IS NOT NULL AND NOT EXISTS (
+  SELECT 1 FROM json_each(attrs_json) a
+  WHERE json_extract(a.value, '$.key') = 'gently.event'
+    AND json_extract(a.value, '$.value.stringValue') IN ('PermissionRequest', 'PermissionDenied')
+)`;
 
 export async function traces(
   env: Env,
@@ -212,7 +261,7 @@ export async function traces(
             -- loops) and the session root can too; counting those would drown the
             -- tool-failure signal. The status stays on those spans for rendering;
             -- it just doesn't count here. tool_name IS NOT NULL ⇒ it's a tool span.
-            SUM(status = 2 AND tool_name IS NOT NULL) AS error_count
+            SUM(status = 2 AND (${TOOL_EXECUTION})) AS error_count
      FROM spans
      ${where}
      GROUP BY trace_id
@@ -380,13 +429,23 @@ export async function stats(env: Env, tenantId: string): Promise<ToolStat[]> {
        SUM(status = 2) AS error_count,
        AVG(
          CASE
-           WHEN end_unix_nano IS NOT NULL
+           WHEN end_unix_nano IS NOT NULL AND NOT (EXISTS (
+             SELECT 1 FROM json_each(attrs_json) a
+             WHERE json_extract(a.value, '$.key') = 'gently.tool_state'
+               AND json_extract(a.value, '$.value.stringValue') = 'open'
+           ) AND NOT EXISTS (
+             SELECT 1 FROM json_each(attrs_json) a
+             WHERE (json_extract(a.value, '$.key') = 'gently.tool_state'
+               AND json_extract(a.value, '$.value.stringValue') = 'closed')
+               OR (json_extract(a.value, '$.key') = 'gently.event'
+                 AND json_extract(a.value, '$.value.stringValue') IN ('PostToolUse', 'PostToolUseFailure'))
+           ))
            THEN (CAST(end_unix_nano AS REAL) - CAST(start_unix_nano AS REAL)) / 1e6
            ELSE NULL
          END
        ) AS avg_duration_ms
      FROM spans
-     WHERE tenant_id = ? AND tool_name IS NOT NULL
+     WHERE tenant_id = ? AND (${TOOL_EXECUTION})
      GROUP BY tool_name
      ORDER BY span_count DESC`,
   ).bind(tenantId).all<ToolStat>();

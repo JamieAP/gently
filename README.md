@@ -50,9 +50,10 @@ Status: ✓ ok · unset ✗ error ? unknown
 
 ## Current support
 
-CLI capture and token-configured queries are available for Claude Code and
-Codex. Desktop parity is partial: authenticated desktop MCP access and
-Claude Chat/Cowork integration remain open work.
+Capture and queries cover Claude Code and Codex coding agents in the terminal
+and desktop. On Unix, desktop MCP can delegate queries to an unlocked export
+watcher through a private socket. See [compatibility](docs/reference/compatibility.md)
+for checked versions, hook coverage and fidelity limits.
 
 Read [data and privacy](#data-and-privacy) before enabling capture.
 
@@ -118,7 +119,8 @@ Restart your agent session after configuring it. Codex hooks must also be
 trusted inside Codex. `GENTLY_COLLECTOR_URL`, `GENTLY_TENANT_ID` and `GENTLY_DEVICE_ID` override
 public config values; `GENTLY_TOKEN` has no persisted-token fallback. See [configuration](docs/getting-started/configuration.md) for queue,
 transport, timeout, and state-directory options. A watcher can export tokenless
-desktop hooks; CLI and MCP query processes still need the token. Background
+desktop hooks. With `--serve-queries`, it also handles tokenless CLI/MCP queries
+over an owner-only Unix socket. Background
 hooks never attempt hardware unlock.
 
 ### 3. Query a session
@@ -198,8 +200,9 @@ drains the queue continuously and reuses connections. Remote export can use
 HTTP/3, with a TCP fallback.
 
 The exporter drains the outbox with retry and backoff.
-The default queue cap is 10,000 envelopes, applied when export drains the
-outbox; excess oldest envelopes are dropped before sending. The queue can grow
+Explicit exports default to a 10,000-envelope cap; excess oldest envelopes
+are dropped before sending. Hook-spawned exporters and the local launchers use
+`--preserve-backlog`, overriding that cap to avoid discarding queued history. The queue can grow
 beyond that cap while no exporter drains it. Authentication failures stop export
 immediately; transient failures use backoff, and unprocessable envelopes can be
 quarantined.

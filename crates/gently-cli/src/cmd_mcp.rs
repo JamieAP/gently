@@ -30,7 +30,7 @@ pub fn run() -> Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        let req: Value = match serde_json::from_str(&line) {
+        let req: Value = match crate::json_fidelity::parse(&line) {
             Ok(v) => v,
             Err(_) => continue,
         };

@@ -122,6 +122,12 @@ pub struct QueryClient {
     collector: crate::collector::CollectorClient,
     tenant_id: String,
     local_raw_store: Option<gently_store::Store>,
+    #[cfg(unix)]
+    query_socket: Option<PathBuf>,
+    #[cfg(unix)]
+    broker_base: String,
+    #[cfg(unix)]
+    timeout: std::time::Duration,
     raw_identity_path: Option<PathBuf>,
     raw_identities: OnceCell<gently_raw::ReaderIdentities>,
 }
@@ -165,7 +171,21 @@ fn hydrate_cached_payload(
 
 impl QueryClient {
     pub fn new(cfg: &Config) -> Result<Self> {
+        #[cfg(unix)]
+        let query_socket = if cfg.token.is_empty() {
+            let path = cfg.runtime_dir().join("query.sock");
+            crate::query_broker::validate_socket(&path).context(
+                "token is not configured; start an unlocked gently export --watch --serve-queries or inherit GENTLY_TOKEN"
+            )?;
+            Some(path)
+        } else {
+            None
+        };
+        #[cfg(not(unix))]
         cfg.require_collector()?;
+        if !cfg.token.is_empty() {
+            cfg.require_collector()?;
+        }
         let local_raw_store = if cfg.resolve_raw_values {
             cfg.ensure_state_dir()?;
             Some(gently_store::Store::open(&cfg.state_db())?)
@@ -183,11 +203,43 @@ impl QueryClient {
             raw_identity_path: cfg.raw_identity.clone(),
             raw_identities: OnceCell::new(),
             local_raw_store,
+            #[cfg(unix)]
+            query_socket,
+            #[cfg(unix)]
+            broker_base: cfg.collector_url.clone(),
+            #[cfg(unix)]
+            timeout: std::time::Duration::from_secs(cfg.query_timeout_secs.max(1)),
         })
     }
 
     async fn get<T: for<'de> Deserialize<'de>>(&self, params: &[(&str, String)]) -> Result<T> {
+        #[cfg(unix)]
+        if let Some(path) = &self.query_socket {
+            return crate::query_broker::query(
+                path,
+                &self.broker_base,
+                &self.tenant_id,
+                params,
+                self.timeout,
+            )
+            .await;
+        }
         self.collector.query(params).await
+    }
+
+    async fn fetch_raw(&self, reference: &str) -> Result<Option<gently_raw::RawObject>> {
+        #[cfg(unix)]
+        if let Some(path) = &self.query_socket {
+            return crate::query_broker::query(
+                path,
+                &self.broker_base,
+                &self.tenant_id,
+                &[("op", "raw".into()), ("raw_ref", reference.into())],
+                self.timeout,
+            )
+            .await;
+        }
+        self.collector.fetch_raw(reference).await
     }
 
     fn reader_identities(&self) -> Result<&gently_raw::ReaderIdentities> {
@@ -327,7 +379,7 @@ impl QueryClient {
                     }
                     let object = match store.raw_object_get(&self.tenant_id, &reference)? {
                         Some(object) => Some(object),
-                        None => self.collector.fetch_raw(&reference).await?,
+                        None => self.fetch_raw(&reference).await?,
                     };
                     if let Some(object) = object {
                         local_raw::validate_row_context(&self.tenant_id, row, &object.context)?;
@@ -371,6 +423,9 @@ const RAW_ALIASES: &[&str] = &[
     "tool_calls",
     "error",
     "error_details",
+    "hook_payload",
+    "message.delta",
+    "instruction_file",
 ];
 const SAFE_REASONS: &[&str] = &[
     "clear",
@@ -447,6 +502,12 @@ mod raw_guard_tests {
             )
             .unwrap(),
             tenant_id: "personal".into(),
+            #[cfg(unix)]
+            query_socket: None,
+            #[cfg(unix)]
+            broker_base: "https://synthetic.invalid".into(),
+            #[cfg(unix)]
+            timeout: std::time::Duration::from_secs(1),
             local_raw_store: None,
             raw_identity_path: None,
             raw_identities: OnceCell::new(),

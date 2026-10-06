@@ -27,6 +27,9 @@ const RAW_FIELDS: &[&str] = &[
     "gently.tool_calls",
     "gently.error",
     "gently.error_details",
+    "gently.hook_payload",
+    "gently.message.delta",
+    "gently.instruction_file",
 ];
 
 /// In-memory raw material plus authenticated public recipient policy. Capture
@@ -58,7 +61,7 @@ pub fn prepare(
     if !cfg.capture_raw_values {
         return Ok(None);
     }
-    let mut fields = BTreeMap::new();
+    let mut fields = BTreeMap::from([("gently.hook_payload".into(), serde_json::to_string(raw)?)]);
     for op in &parsed.ops {
         for (key, _) in op_attrs(op) {
             if let Some(base) = key.strip_suffix(".bytes") {
@@ -115,6 +118,9 @@ pub fn prepare(
 }
 
 impl PreparedRaw {
+    pub fn reference(&self) -> &str {
+        &self.context.raw_ref
+    }
     /// Run inside the event transaction, after apply, so field bindings cover
     /// both emitted spans and pending tools whose close arrives in a later hook.
     pub fn seal_for_spans(self, store: &Store, spans: &[Span]) -> Result<RawObject> {
@@ -189,6 +195,8 @@ fn extract_field(raw: &Value, base: &str) -> Result<Option<String>> {
         "gently.prompt" => &["prompt", "user_prompt", "user"],
         "gently.assistant" => &["last_assistant_message", "assistant", "assistant_message"],
         "gently.reason" => &["reason"],
+        "gently.message.delta" => &["delta"],
+        "gently.instruction_file" => &["file_path"],
         "gently.compact_instructions" => &["custom_instructions"],
         "gently.compact_summary" => &["compact_summary"],
         "gently.error" => &["error"],
@@ -222,7 +230,8 @@ fn op_attrs(op: &SpanOp) -> &Attrs {
         | SpanOp::CloseTool { attrs, .. }
         | SpanOp::OpenAgent { attrs, .. }
         | SpanOp::CloseAgent { attrs, .. }
-        | SpanOp::Mark { attrs, .. } => attrs,
+        | SpanOp::Mark { attrs, .. }
+        | SpanOp::MarkContext { attrs, .. } => attrs,
     }
 }
 fn op_attrs_mut(op: &mut SpanOp) -> &mut Attrs {
@@ -235,7 +244,8 @@ fn op_attrs_mut(op: &mut SpanOp) -> &mut Attrs {
         | SpanOp::CloseTool { attrs, .. }
         | SpanOp::OpenAgent { attrs, .. }
         | SpanOp::CloseAgent { attrs, .. }
-        | SpanOp::Mark { attrs, .. } => attrs,
+        | SpanOp::Mark { attrs, .. }
+        | SpanOp::MarkContext { attrs, .. } => attrs,
     }
 }
 

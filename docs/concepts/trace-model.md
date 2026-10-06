@@ -24,14 +24,24 @@ to its execution scope, so both main and subagent work can have a `turn:1`.
 | --- | --- | --- | --- |
 | Session | `SessionStart` | `SessionEnd` | A provisional report on open and a report with closing status on close. |
 | Turn | `UserPromptSubmit`, or first reference to an unseen prompt/turn ID | `Stop`, Claude `StopFailure`, or Codex `Interrupt` | A provisional report, then a closing report when observed. |
-| Tool | `PreToolUse` | `PostToolUse`, or Claude `PostToolUseFailure` | Local open bookkeeping; a span is exported on close. |
+| Tool | `PreToolUse` | `PostToolUse`, or Claude `PostToolUseFailure` | A provisional report, then a closing report when observed. |
 | Subagent | `SubagentStart` | `SubagentStop` | A provisional report, then a closing report when observed. |
-| Marker | Compaction, permission and other marker events | Same event | An instant span attached to a turn. |
+| Turn marker | Compaction, permission and other turn events | Same event | An instant span attached to a turn. |
+| Context marker | Setup, configuration, notifications and other context events | Same event | An instant span attached to the session or execution agent. |
+| Hook receipt | Every received event | Same event | An immutable `hook:<Event>` span with complete payload byte length. |
 
 Provisional reports have equal start and end timestamps and unset status. The
 closing report uses the same span ID. If a close is missing, an already emitted
 provisional span may remain visible, but it does not establish a completion
-time. A tool whose close never arrives is not exported as a tool span.
+time. A tool whose close never arrives remains visible with unset status and
+zero reported duration. Its `hook:PreToolUse` receipt also records the observed
+invocation.
+
+Tools carry `gently.tool_state = "open"` or `"closed"`, independently of success
+status. A closed opaque Codex result can still have unset status. Tool counts
+include observed unfinished invocations; duration averages exclude open tools.
+When the runtime supplies `duration_ms`, the closing report carries
+`gently.tool_duration_ms` and retains its more accurate time bounds during merge.
 
 When a close arrives without local open bookkeeping, Gently still emits a span.
 Its duration is zero unless the hook provides `duration_ms`. This fallback
@@ -47,7 +57,7 @@ Main and subagent execution scopes distinguish their turns and tools.
 Claude `prompt_id` and Codex `turn_id`, when present, identify turns across
 separate hook invocations. A local first-seen ordinal supplies the display name
 `turn:N`. Without a prompt/turn ID, Gently uses the local turn counter. A missing
-`tool_use_id` falls back to the tool name, which can collide for concurrent
+or empty `tool_use_id` falls back to the tool name, which can collide for concurrent
 anonymous tools with the same name.
 
 Deterministic IDs let reports for the same logical span merge and let a child
@@ -63,7 +73,9 @@ When a tool, agent or marker first refers to an unseen prompt/turn ID, Gently
 emits a provisional turn with `gently.event = "TurnInferred"`. This covers
 continuation work that has no observed `UserPromptSubmit`. The inferred start
 is the time Gently first observed that reference, not a recovered prompt time.
-The counter fallback without a prompt/turn ID does not infer the same parent.
+Without a prompt/turn ID, activity before the first observed prompt gets one
+inferred `turn:0` parent. The first observed prompt opens `turn:1`. This keeps
+the tree connected without claiming to reconstruct unseen prompt boundaries.
 
 A resume reuses the session's deterministic ID. Existing local open bookkeeping
 preserves its earliest start; the collector also keeps the earliest reported

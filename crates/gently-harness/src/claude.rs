@@ -6,7 +6,10 @@
 //! adapter is forward-compatible by construction. No raw prompt or tool content
 //! is ever placed in a span - only its byte length.
 
-use crate::hooks::{common_attrs, push_first_str_length, push_value_length, str_field, u64_field};
+use crate::hooks::{
+    common_attrs, push_first_str_length, push_observed_tool_attrs, push_value_length, str_field,
+    u64_field,
+};
 use crate::{Attrs, Harness, HarnessError, Parsed, SpanOp};
 use gently_core::Status;
 
@@ -73,7 +76,7 @@ impl Harness for ClaudeCode {
                     push_value_length(&mut attrs, "gently.tool_input", input);
                 }
                 vec![SpanOp::OpenTool {
-                    tool_use_id: str_field(raw, "tool_use_id"),
+                    tool_use_id: str_field(raw, "tool_use_id").filter(|id| !id.is_empty()),
                     tool_name,
                     attrs,
                 }]
@@ -91,7 +94,7 @@ impl Harness for ClaudeCode {
                     Status::Ok
                 };
                 vec![SpanOp::CloseTool {
-                    tool_use_id: str_field(raw, "tool_use_id"),
+                    tool_use_id: str_field(raw, "tool_use_id").filter(|id| !id.is_empty()),
                     tool_name,
                     status,
                     duration_ms: u64_field(raw, "duration_ms"),
@@ -111,7 +114,7 @@ impl Harness for ClaudeCode {
                 };
                 vec![SpanOp::OpenAgent {
                     agent_id,
-                    parent_tool_use_id: str_field(raw, "tool_use_id"),
+                    parent_tool_use_id: str_field(raw, "tool_use_id").filter(|id| !id.is_empty()),
                     attrs: claude_attrs(raw, event),
                 }]
             }
@@ -155,6 +158,48 @@ fn claude_attrs(raw: &serde_json::Value, event: &str) -> Attrs {
         }
     }
     match event {
+        "SessionStart" => {
+            push_cache_estimates(&mut attrs, raw);
+            push_u64_attr(&mut attrs, raw, "seconds_since_last_response");
+            push_bool_attr(&mut attrs, raw, "prompt_cache_likely_expired");
+        }
+        "MessageDisplay" => {
+            for (field, key) in [("message_id", "id"), ("turn_id", "turn_id")] {
+                if let Some(value) = str_field(raw, field).filter(|value| !value.is_empty()) {
+                    attrs.push((format!("gently.message.{key}"), value));
+                }
+            }
+            if let Some(index) = u64_field(raw, "index") {
+                attrs.push(("gently.message.index".into(), index.to_string()));
+            }
+            if let Some(final_batch) = raw.get("final").and_then(serde_json::Value::as_bool) {
+                attrs.push(("gently.message.final".into(), final_batch.to_string()));
+            }
+            // An empty final delta is still a completion signal. Measure text length only;
+            // full content remains available through opt-in payload resolution.
+            push_first_str_length(&mut attrs, "gently.message.delta", raw, &["delta"]);
+        }
+        "InstructionsLoaded" => {
+            push_enum_attr(
+                &mut attrs,
+                raw,
+                "memory_type",
+                &["User", "Project", "Local", "Managed"],
+            );
+            push_enum_attr(
+                &mut attrs,
+                raw,
+                "load_reason",
+                &[
+                    "session_start",
+                    "nested_traversal",
+                    "path_glob_match",
+                    "include",
+                    "compact",
+                ],
+            );
+            push_first_str_length(&mut attrs, "gently.instruction_file", raw, &["file_path"]);
+        }
         "PreCompact" | "PostCompact" => {
             if let Some(trigger) = str_field(raw, "trigger")
                 .filter(|trigger| matches!(trigger.as_str(), "manual" | "auto"))
@@ -215,6 +260,15 @@ fn claude_attrs(raw: &serde_json::Value, event: &str) -> Attrs {
             }
         }
         "PreModelSwitch" | "PostModelSwitch" => {
+            push_cache_estimates(&mut attrs, raw);
+            push_bool_attr(&mut attrs, raw, "prompt_cache_warm");
+            push_enum_attr(&mut attrs, raw, "cache_ttl", &["5m", "1h"]);
+            push_enum_attr(
+                &mut attrs,
+                raw,
+                "pricing",
+                &["configured", "catalog", "default"],
+            );
             for field in ["from_model", "to_model"] {
                 if let Some(model) = str_field(raw, field) {
                     attrs.push((format!("gently.{field}"), model.clone()));
@@ -230,10 +284,63 @@ fn claude_attrs(raw: &serde_json::Value, event: &str) -> Attrs {
     attrs
 }
 
+fn push_u64_attr(attrs: &mut Attrs, raw: &serde_json::Value, field: &str) {
+    if let Some(value) = u64_field(raw, field) {
+        attrs.push((format!("gently.{field}"), value.to_string()));
+    }
+}
+
+fn push_bool_attr(attrs: &mut Attrs, raw: &serde_json::Value, field: &str) {
+    if let Some(value) = raw.get(field).and_then(serde_json::Value::as_bool) {
+        attrs.push((format!("gently.{field}"), value.to_string()));
+    }
+}
+
+fn push_enum_attr(attrs: &mut Attrs, raw: &serde_json::Value, field: &str, values: &[&str]) {
+    if let Some(value) = str_field(raw, field).filter(|value| values.contains(&value.as_str())) {
+        attrs.push((format!("gently.{field}"), value));
+    }
+}
+
+fn push_cache_estimates(attrs: &mut Attrs, raw: &serde_json::Value) {
+    push_u64_attr(attrs, raw, "context_tokens");
+    if let Some(value) = raw.get("estimated_cache_write_usd").filter(|value| {
+        value.is_number()
+            && !value.to_string().starts_with('-')
+            && value.as_f64().is_some_and(|number| number.is_finite())
+    }) {
+        // Validate the numeric type without rounding the supplied decimal.
+        attrs.push(("gently.estimated_cache_write_usd".into(), value.to_string()));
+    }
+}
+
 fn claude_mark(raw: &serde_json::Value, event: &str) -> SpanOp {
+    let mut attrs = claude_attrs(raw, event);
+    if matches!(event, "PermissionRequest" | "PermissionDenied") {
+        push_observed_tool_attrs(&mut attrs, raw);
+    }
+    if matches!(
+        event,
+        "Setup"
+            | "Notification"
+            | "InstructionsLoaded"
+            | "ConfigChange"
+            | "CwdChanged"
+            | "DirectoryAdded"
+            | "FileChanged"
+            | "MessageDisplay"
+            | "PreModelSwitch"
+            | "PostModelSwitch"
+            | "TeammateIdle"
+    ) {
+        return SpanOp::MarkContext {
+            name: event.into(),
+            attrs,
+        };
+    }
     SpanOp::Mark {
         name: event.to_string(),
-        attrs: claude_attrs(raw, event),
+        attrs,
     }
 }
 
@@ -306,7 +413,9 @@ mod tests {
         let parsed = ClaudeCode
             .parse(&json!({"hook_event_name":"TeammateIdle","session_id":"s"}))
             .unwrap();
-        assert!(matches!(&parsed.ops[..], [SpanOp::Mark { name, .. }] if name == "TeammateIdle"));
+        assert!(
+            matches!(&parsed.ops[..], [SpanOp::MarkContext { name, .. }] if name == "TeammateIdle")
+        );
     }
 
     #[test]
@@ -341,6 +450,143 @@ mod tests {
         assert!(attrs.contains("gently.source"));
         assert!(attrs.contains("startup"));
         assert!(!attrs.contains("gently.model"));
+    }
+
+    #[test]
+    fn resume_and_model_switch_keep_typed_cache_estimates() {
+        for event in ["SessionStart", "PreModelSwitch", "PostModelSwitch"] {
+            let raw = json!({"hook_event_name":event,"session_id":"s",
+                "context_tokens":182340,"seconds_since_last_response":5400,
+                "prompt_cache_likely_expired":true,"prompt_cache_warm":false,
+                "estimated_cache_write_usd":1.1396,"cache_ttl":"5m","pricing":"catalog"});
+            let attrs = claude_attrs(&raw, event);
+            for pair in [
+                ("gently.context_tokens", "182340"),
+                ("gently.estimated_cache_write_usd", "1.1396"),
+            ] {
+                assert!(
+                    attrs.contains(&(pair.0.into(), pair.1.into())),
+                    "{event}: {pair:?}"
+                );
+            }
+            if event == "SessionStart" {
+                assert!(
+                    attrs.contains(&("gently.seconds_since_last_response".into(), "5400".into()))
+                );
+                assert!(
+                    attrs.contains(&("gently.prompt_cache_likely_expired".into(), "true".into()))
+                );
+                assert!(!attrs.iter().any(|(k, _)| k == "gently.prompt_cache_warm"));
+            } else {
+                assert!(attrs.contains(&("gently.prompt_cache_warm".into(), "false".into())));
+                assert!(attrs.contains(&("gently.cache_ttl".into(), "5m".into())));
+                assert!(attrs.contains(&("gently.pricing".into(), "catalog".into())));
+                assert!(!attrs
+                    .iter()
+                    .any(|(k, _)| k == "gently.seconds_since_last_response"));
+            }
+        }
+        let attrs = claude_attrs(
+            &json!({"context_tokens":"private tokens",
+            "seconds_since_last_response":-1,"prompt_cache_likely_expired":"private flag",
+            "estimated_cache_write_usd":-1}),
+            "SessionStart",
+        );
+        assert_eq!(attrs, vec![("gently.event".into(), "SessionStart".into())]);
+        let attrs = claude_attrs(
+            &json!({"context_tokens":1.5,
+            "prompt_cache_warm":1,"cache_ttl":"private ttl","pricing":"private pricing"}),
+            "PreModelSwitch",
+        );
+        assert_eq!(
+            attrs,
+            vec![("gently.event".into(), "PreModelSwitch".into())]
+        );
+    }
+
+    #[test]
+    fn cache_estimates_keep_exact_decimals_and_reject_negative_underflow() {
+        let raw: serde_json::Value = serde_json::from_str(
+            r#"{"estimated_cache_write_usd":1.139612345678901234567890123456789}"#,
+        )
+        .unwrap();
+        assert!(claude_attrs(&raw, "SessionStart").contains(&(
+            "gently.estimated_cache_write_usd".into(),
+            "1.139612345678901234567890123456789".into(),
+        )));
+        for literal in ["-1e-9999", "-0.0", "1e9999"] {
+            let raw: serde_json::Value =
+                serde_json::from_str(&format!("{{\"estimated_cache_write_usd\":{literal}}}"))
+                    .unwrap();
+            assert!(
+                !claude_attrs(&raw, "SessionStart")
+                    .iter()
+                    .any(|(k, _)| k == "gently.estimated_cache_write_usd"),
+                "{literal}"
+            );
+        }
+        // serde_json normalizes integer -0 to 0 before the adapter sees it.
+        let raw: serde_json::Value =
+            serde_json::from_str(r#"{"estimated_cache_write_usd":-0}"#).unwrap();
+        assert!(claude_attrs(&raw, "SessionStart")
+            .contains(&("gently.estimated_cache_write_usd".into(), "0".into(),)));
+    }
+
+    #[test]
+    fn message_batches_keep_identity_order_and_empty_final_signal_without_text() {
+        for (index, final_batch, delta) in [(0, false, "private reply\n"), (1, true, "")] {
+            let parsed = ClaudeCode
+                .parse(&json!({"hook_event_name":"MessageDisplay",
+                "session_id":"s","turn_id":"display-turn","message_id":"message-1",
+                "index":index,"final":final_batch,"delta":delta}))
+                .unwrap();
+            let [SpanOp::MarkContext { attrs, .. }] = &parsed.ops[..] else {
+                panic!("display batches must not invent turns")
+            };
+            for (k, v) in [
+                ("gently.message.id", "message-1".into()),
+                ("gently.message.turn_id", "display-turn".into()),
+                ("gently.message.index", index.to_string()),
+                ("gently.message.final", final_batch.to_string()),
+                ("gently.message.delta.bytes", delta.len().to_string()),
+            ] {
+                assert!(attrs.contains(&(k.into(), v)), "missing {k}");
+            }
+            assert!(!format!("{attrs:?}").contains("private reply"));
+        }
+        let attrs = claude_attrs(
+            &json!({"index":-1,"final":"private flag",
+            "message_id":null,"delta":{"text":"private reply"}}),
+            "MessageDisplay",
+        );
+        assert_eq!(
+            attrs,
+            vec![("gently.event".into(), "MessageDisplay".into())]
+        );
+    }
+
+    #[test]
+    fn instruction_loads_keep_scope_and_reason_with_private_path_length() {
+        let attrs = claude_attrs(
+            &json!({"memory_type":"Project","load_reason":"compact",
+            "file_path":"/private/project/CLAUDE.md"}),
+            "InstructionsLoaded",
+        );
+        assert!(attrs.contains(&("gently.memory_type".into(), "Project".into())));
+        assert!(attrs.contains(&("gently.load_reason".into(), "compact".into())));
+        assert!(attrs
+            .iter()
+            .any(|(k, _)| k == "gently.instruction_file.bytes"));
+        assert!(!format!("{attrs:?}").contains("/private/project"));
+        let attrs = claude_attrs(
+            &json!({"memory_type":"private scope",
+            "load_reason":"private reason"}),
+            "InstructionsLoaded",
+        );
+        assert_eq!(
+            attrs,
+            vec![("gently.event".into(), "InstructionsLoaded".into())]
+        );
     }
 
     #[test]
@@ -493,7 +739,7 @@ mod tests {
             "from_model": "claude-sonnet-4-6", "to_model": "claude-opus-4-6", "requested_model": null
         })).unwrap();
         match &parsed.ops[..] {
-            [SpanOp::Mark { name, attrs }] => {
+            [SpanOp::MarkContext { name, attrs }] => {
                 assert_eq!(name, "PostModelSwitch");
                 assert!(attrs.contains(&("gently.from_model".into(), "claude-sonnet-4-6".into())));
                 assert!(attrs.contains(&("gently.to_model".into(), "claude-opus-4-6".into())));

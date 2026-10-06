@@ -3,7 +3,7 @@
 This table describes the adapters and default registrations shipped in this
 checkout. Synthetic fixtures exercise selected payloads and lifecycle cases;
 they do not establish compatibility with every release or desktop integration.
-Check your installed harness's hook schema when upgrading.
+See the [checked compatibility baseline](compatibility.md) when upgrading.
 
 The [Claude hook reference](https://code.claude.com/docs/en/hooks) and
 [Codex hook documentation](https://learn.chatgpt.com/docs/hooks) describe their
@@ -21,12 +21,17 @@ Codex registrations also require the agent's hook trust step.
 | Tool open/close | `PreToolUse` / `PostToolUse`; `PostToolUseFailure` closes with error status. | `PreToolUse` / `PostToolUse` |
 | Subagent open/close | `SubagentStart` / `SubagentStop` | `SubagentStart` / `SubagentStop` |
 | Compaction markers | `PreCompact`, `PostCompact` | `PreCompact`, `PostCompact` |
-| Other markers | `PermissionRequest`, `PostToolBatch`, `PostModelSwitch` | `PermissionRequest` |
+| Turn markers | `PermissionRequest`, `PermissionDenied`, `PostToolBatch`, `UserPromptExpansion`, `TaskCreated`, `TaskCompleted`, `Elicitation`, `ElicitationResult` | `PermissionRequest` |
+| Context markers | `Setup`, `Notification`, `InstructionsLoaded`, `ConfigChange`, `CwdChanged`, `DirectoryAdded`, `FileChanged`, `MessageDisplay`, `TeammateIdle`, `PreModelSwitch`, `PostModelSwitch` | — |
 
-A marker is an instant span attached to the current or inferred turn. Unknown
-events become markers only if they are explicitly wired to Gently; init does
-not register every possible harness event. Claude `PreModelSwitch`, for example,
-is parsed as a marker when wired, but is not installed by default.
+A turn marker attaches to the current or inferred turn. Context markers attach
+to the session or executing subagent without inventing a turn. Unknown events
+become turn markers if explicitly wired. Every successfully processed event
+also emits an immutable `hook:<Event>` receipt with a complete payload byte length.
+Opt-in encrypted capture and explicit reader resolution can retain and return
+that normalized JSON.
+Init registers 31 Claude and 12 Codex events. Claude worktree create/remove
+handlers are intentionally excluded because they replace Git operations.
 
 Both adapters require string `session_id` and `hook_event_name` fields. Other
 missing fields may degrade correlation rather than reject the event. Malformed
@@ -63,6 +68,15 @@ missing, the close falls back to turn parentage. These fallbacks preserve a
 record but cannot always recover nested caller context from incomplete payloads.
 
 ## Status and content handling
+
+Tool aggregates retain the supplied invocation ID in `gently.tool_use_id`, so
+the collector's `tool_use_id` query column can correlate opens and closes.
+Missing or empty IDs use the documented tool-name fallback; an empty subagent
+caller ID uses turn parentage instead of inventing a tool reference.
+Permission markers retain namespaced `gently.hook.tool_name` and
+`gently.hook.tool_use_id` metadata plus an input byte length. They are observations,
+so they do not add tool executions to usage or duration rollups. Historical
+permission markers remain queryable and are also excluded from those rollups.
 
 Claude `PostToolUse` maps to success; `PostToolUseFailure` maps to error. Codex
 opaque tool results remain unset. A Codex tool named with the `mcp__` prefix and

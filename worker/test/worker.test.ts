@@ -2,6 +2,8 @@ import { env, SELF } from "cloudflare:test";
 import { describe, it, expect, beforeAll } from "vitest";
 import worker from "../src/index";
 import type { Env } from "../src/d1";
+import { insertSpans } from "../src/d1";
+import { flatten } from "../src/otlp";
 import schemaSql from "../schema.sql?raw";
 
 const BEARER = "Bearer test-token-secret";
@@ -198,6 +200,20 @@ describe("POST /v1/traces?tenant_id=personal", () => {
 });
 
 describe("idempotent-monotonic ingest", () => {
+  it("keeps merge statements compact for batched backlog drains", async () => {
+    const queries: string[] = [];
+    const db = {
+      prepare(query: string) { queries.push(query); return env.DB.prepare(query); },
+      batch: env.DB.batch.bind(env.DB),
+    } as D1Database;
+    await insertSpans({...env, DB: db}, "personal", "mac-main", flatten(makeOtlpFixture(), {tenant_id:"personal", device_id:"mac-main", capabilities:["ingest", "read"]}));
+    const upserts = queries.filter(query => query.includes("INSERT INTO spans"));
+    expect(upserts).toHaveLength(2);
+    for (const query of upserts) {
+      expect(new TextEncoder().encode(query).length).toBeLessThan(10_000);
+      expect(query.match(/json_each/g)?.length ?? 0).toBeLessThanOrEqual(12);
+    }
+  });
   function spanPayload(
     spanId: string,
     traceId: string,
@@ -266,9 +282,142 @@ describe("idempotent-monotonic ingest", () => {
     expect(row?.start_unix_nano).toBe("1700000100000000000"); // earliest origin preserved
     expect(row?.end_unix_nano).toBe("1700009999000000000"); // latest activity
   });
+
+  it("runtime tool duration survives provisional delivery and replay in either order", async () => {
+    const T = "33333333333333333333333333333333";
+    const toolPayload = (id: string, closed: boolean) => {
+      const body = spanPayload(id, T, closed ? "1700000000200000000" : "1700000000000000000",
+        closed ? "1700000000300000000" : "1700000000000000000", closed ? 2 : 0,
+        closed ? "PostToolUseFailure" : "PreToolUse");
+      const span = body.resourceSpans[0].scopeSpans[0].spans[0];
+      span.name = "TimedTool";
+      span.kind = 3;
+      span.attributes.push({key: "gently.tool_name", value: {stringValue: "TimedTool"}},
+        {key: "gently.tool_state", value: {stringValue: closed ? "closed" : "open"}});
+      if (closed) span.attributes.push({key: "gently.tool_duration_ms", value: {stringValue: "100"}});
+      return body;
+    };
+    for (const [id, order] of [["3333333333333301", [false, true, false]], ["3333333333333302", [true, false, true]]] as const) {
+      for (const closed of order) expect((await post(toolPayload(id, closed))).status).toBe(200);
+      const row = await readSpan(id);
+      expect(row?.start_unix_nano).toBe("1700000000200000000");
+      expect(row?.end_unix_nano).toBe("1700000000300000000");
+      expect(row?.status).toBe(2);
+      expect(row?.attrs_json).toContain("closed");
+    }
+    const res = await SELF.fetch("https://x/v1/query?tenant_id=personal&op=stats", {headers: {Authorization: BEARER}});
+    const rows = await res.json<Array<{tool_name: string; span_count: number; avg_duration_ms: number}>>();
+    expect(rows.find(r => r.tool_name === "TimedTool")).toMatchObject({span_count: 2, avg_duration_ms: 100});
+  });
+
+  it("unfinished tool invocations count once but do not dilute completed duration averages", async () => {
+    const T = "44444444444444444444444444444444";
+    const toolPayload = (id: string, closed: boolean) => {
+      const body = spanPayload(id, T, "1700000000000000000",
+        closed ? "1700000000100000000" : "1700000000000000000", 0,
+        closed ? "PostToolUse" : "PreToolUse");
+      const span = body.resourceSpans[0].scopeSpans[0].spans[0];
+      span.name = "OpaqueTool";
+      span.kind = 3;
+      span.attributes.push({key: "gently.tool_name", value: {stringValue: "OpaqueTool"}},
+        {key: "gently.tool_state", value: {stringValue: closed ? "closed" : "open"}});
+      return body;
+    };
+    await post(toolPayload("4444444444444401", false));
+    await post(toolPayload("4444444444444401", false));
+    let res = await SELF.fetch("https://x/v1/query?tenant_id=personal&op=stats", {headers: {Authorization: BEARER}});
+    let rows = await res.json<Array<{tool_name: string; span_count: number; avg_duration_ms: number | null}>>();
+    expect(rows.find(r => r.tool_name === "OpaqueTool")).toMatchObject({span_count: 1, avg_duration_ms: null});
+    await post(toolPayload("4444444444444402", true));
+    res = await SELF.fetch("https://x/v1/query?tenant_id=personal&op=stats", {headers: {Authorization: BEARER}});
+    rows = await res.json();
+    expect(rows.find(r => r.tool_name === "OpaqueTool")).toMatchObject({span_count: 2, avg_duration_ms: 100});
+  });
+
+  it("a delayed open can recover a missing tool start without reverting completion", async () => {
+    const id = "5555555555555501";
+    const T = "55555555555555555555555555555555";
+    const body = (closed: boolean) => {
+      const payload = spanPayload(id, T, closed ? "1700000000200000000" : "1700000000000000000",
+        closed ? "1700000000200000000" : "1700000000000000000", 0,
+        closed ? "PostToolUse" : "PreToolUse");
+      const span = payload.resourceSpans[0].scopeSpans[0].spans[0];
+      span.name = "DelayedTool";
+      span.kind = 3;
+      span.attributes.push({key: "gently.tool_name", value: {stringValue: "DelayedTool"}},
+        {key: "gently.tool_state", value: {stringValue: closed ? "closed" : "open"}});
+      return payload;
+    };
+    await post(body(true));
+    await post(body(false));
+    const row = await readSpan(id);
+    expect(row?.start_unix_nano).toBe("1700000000000000000");
+    expect(row?.end_unix_nano).toBe("1700000000200000000");
+    expect(row?.attrs_json).toContain("closed");
+  });
+
+  it("classifies duplicated imported tool attributes consistently on insert and replay", async () => {
+    const id = "6666666666666601";
+    const T = "66666666666666666666666666666666";
+    const open = spanPayload(id, T, "1700000000000000000", "1700000000000000000", 0, "PreToolUse");
+    const closed = spanPayload(id, T, "1700000000200000000", "1700000000300000000", 2, "PostToolUseFailure");
+    for (const payload of [open, closed]) {
+      const span = payload.resourceSpans[0].scopeSpans[0].spans[0];
+      span.name = "ImportedTool";
+      span.kind = 3;
+      span.attributes.push({key: "gently.tool_name", value: {stringValue: "ImportedTool"}},
+        {key: "gently.tool_state", value: {stringValue: payload === open ? "open" : "closed"}});
+    }
+    const attrs = closed.resourceSpans[0].scopeSpans[0].spans[0].attributes;
+    attrs.unshift({key: "gently.event", value: {stringValue: "PreToolUse"}},
+      {key: "gently.tool_state", value: {stringValue: "open"}});
+    attrs.push({key: "gently.tool_duration_ms", value: {stringValue: "100"}});
+    await post(open);
+    await post(closed);
+    await post(open);
+    const row = await readSpan(id);
+    expect(row?.start_unix_nano).toBe("1700000000200000000");
+    expect(row?.end_unix_nano).toBe("1700000000300000000");
+    expect(row?.status).toBe(2);
+    const res = await SELF.fetch("https://x/v1/query?tenant_id=personal&op=stats", {headers: {Authorization: BEARER}});
+    const rows = await res.json<Array<{tool_name: string; avg_duration_ms: number | null}>>();
+    expect(rows.find(r => r.tool_name === "ImportedTool")?.avg_duration_ms).toBe(100);
+  });
 });
 
 describe("GET /v1/query", () => {
+  it("legacy permission markers remain queryable without inflating tool counts or failures", async () => {
+    const T = "77777777777777777777777777777777";
+    const common = {traceId:T, name:"LegacyRollupTool", kind:3,
+      startTimeUnixNano:"1700000000000000000", endTimeUnixNano:"1700000000100000000"};
+    const toolAttrs = [{key:"gently.tool_name",value:{stringValue:"LegacyRollupTool"}},
+      {key:"gently.tool_use_id",value:{stringValue:"legacy-call"}}];
+    const report = (id: string, event: string, status: number, marker: boolean) => ({
+      ...common, spanId:id, name:marker ? event : common.name, kind:marker ? 1 : 3,
+      endTimeUnixNano:marker ? common.startTimeUnixNano : common.endTimeUnixNano,
+      status:{code:status}, attributes:[...toolAttrs,{key:"gently.event",value:{stringValue:event}}],
+    });
+    const ingest = await SELF.fetch("https://x/v1/traces?tenant_id=personal", {method:"POST",
+      headers:{Authorization:BEARER,"Content-Type":"application/json"},
+      body:JSON.stringify({resourceSpans:[{resource:{attributes:[{key:"gently.session_id",value:{stringValue:"legacy-permissions"}}]},scopeSpans:[{spans:[
+        report("7777777777777701","PostToolUseFailure",2,false),
+        report("7777777777777702","PermissionRequest",0,true),
+        report("7777777777777703","PermissionDenied",2,true),
+      ]}]}]}),
+    });
+    expect(ingest.status).toBe(200);
+    const statsRes = await SELF.fetch("https://x/v1/query?tenant_id=personal&op=stats",{headers:{Authorization:BEARER}});
+    const groups = await statsRes.json<Array<{tool_name:string;span_count:number;error_count:number;avg_duration_ms:number}>>();
+    expect(groups.find(r => r.tool_name === "LegacyRollupTool")).toMatchObject({span_count:1,error_count:1,avg_duration_ms:100});
+    const tracesRes = await SELF.fetch("https://x/v1/query?tenant_id=personal&op=traces&session_id=legacy-permissions",{headers:{Authorization:BEARER}});
+    const traces = await tracesRes.json<Array<{span_count:number;error_count:number}>>();
+    expect(traces).toHaveLength(1);
+    expect(traces[0]).toMatchObject({span_count:3,error_count:1});
+    const traceRes = await SELF.fetch(`https://x/v1/query?tenant_id=personal&op=trace&trace_id=${T}`,{headers:{Authorization:BEARER}});
+    const rows = await traceRes.json<Array<{name:string}>>();
+    expect(rows.map(r => r.name)).toEqual(expect.arrayContaining(["PermissionRequest","PermissionDenied","LegacyRollupTool"]));
+  });
+
   it("op=trace returns spans for a trace ordered by start", async () => {
     const res = await SELF.fetch(
       `https://x/v1/query?tenant_id=personal&op=trace&trace_id=${TRACE_ID}`,

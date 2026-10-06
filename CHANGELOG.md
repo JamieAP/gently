@@ -5,6 +5,17 @@ The project is pre-1.0; pending changes appear under Unreleased.
 
 ## [Unreleased]
 
+- Refresh all 31 observational Claude Code and 12 Codex command-hook registrations,
+  including desktop coding runtimes; safely migrate covered legacy Codex JSON handlers.
+- Retain immutable event receipts and useful display, instruction, model/cache metadata;
+  encrypt complete hook payloads under the existing recipient policy when capture is enabled.
+- Preserve provisional tool visibility, invocation IDs and runtime durations; keep tool
+  rollups accurate across replay, unfinished invocations and permission observations.
+- Add tenant-bound tokenless local query delegation and backlog-preserving launchers.
+- Preserve SQLite locks during permission hardening and exact JSON numbers on hook input.
+- Require explicit public-repository review through commit/push hooks and inspect stored
+  Git objects even when replacement refs are installed.
+
 ### Added
 
 - Encrypt raw event fields before local persistence with age and random opaque
@@ -54,10 +65,23 @@ The project is pre-1.0; pending changes appear under Unreleased.
 
 ### Fixed
 
+- Preserve large integers and precise decimal JSON values in hook payloads;
+  valid extreme exponents no longer cause the entire hook to be discarded.
+  Keep user object keys literal in hooks, configuration rewrites and local queries.
+- Preserve SQLite's POSIX locks during private database and sidecar permission
+  checks, preventing concurrent writers from losing WAL shared-memory locks.
+- Migrate covered legacy Codex JSON registrations to the canonical inline hooks,
+  avoiding duplicate capture through the default Claude adapter while preserving
+  user handlers and matcher coverage.
+- Identify the exited local service and signal/status in launcher diagnostics,
+  with conventional exit codes for signal termination.
 - Align the waterfall separator with the header and span timeline borders.
 - Keep valid spans eligible for retry after authentication rejection.
 - Calculate trace bounds without recursive subtree queries.
 - Link tool spans to inferred turns during Codex continuation.
+- Emit one inferred parent for activity before the first observed prompt when
+  turn IDs are absent, and propagate counter database errors instead of silently
+  attaching activity to turn zero.
 - Preserve a resumed session's original start and derive its full trace window.
 - Scope turn and tool tracking to execution agents while retaining the root
   session trace and nesting lifecycle spans under their parent tools.

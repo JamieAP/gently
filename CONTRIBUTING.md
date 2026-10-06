@@ -21,6 +21,33 @@ See [Architecture](docs/concepts/architecture.md) for how these parts fit togeth
 
 ## Check a change
 
+Install this checkout's public-repository guards before committing or pushing:
+
+```sh
+git config --local core.hooksPath .githooks
+chmod +x .githooks/pre-commit .githooks/pre-push
+```
+
+Review the staged diff and outgoing commits for public disclosure, including
+private customer data, session content and credentials. Then acknowledge that
+review on each Git command:
+
+```sh
+GENTLY_PUBLIC_REPO_SANITY=1 git commit
+GENTLY_PUBLIC_REPO_SANITY=1 git push
+```
+
+Both hooks reject an absent acknowledgement, private artifact paths and common
+credential patterns. Pre-commit scans the Git index; pre-push scans outgoing
+commit snapshots and complete commit/tag objects, including author headers
+and data deleted by a later commit. Shallow history and local grafts are refused
+because they prevent verification of the original parent graph.
+Diagnostics identify the path/rule without printing matched values. The flag
+does not bypass the scan. Do not export it in your shell profile or store it in
+Git configuration: it acknowledges the review for that command. These local
+guards supplement human review; they do not recognize every sensitive value
+and Git's client-side hooks are not server-enforced.
+
 From the repository root, run the Rust checks:
 
 ```sh

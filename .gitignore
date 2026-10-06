@@ -4,6 +4,8 @@ node_modules
 .dev.vars
 .wrangler
 *.log
+__pycache__/
+*.py[cod]
 
 # Generated documentation
 docs/_book/

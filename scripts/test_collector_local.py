@@ -39,7 +39,7 @@ class LauncherTests(unittest.TestCase):
         })
         self.env["GENTLY_STATE_DIR"] = str(self.home / ".gently")
         self.executable("gently", 'import os, sys, time\nfrom pathlib import Path\n'
-            'assert sys.argv[1:] == ["export", "--watch"]\n'
+            'assert sys.argv[1:] == ["export", "--watch", "--serve-queries", "--preserve-backlog"]\n'
             'assert os.environ.get("GENTLY_TOKEN") == "synthetic-fixture-only"\n'
             'assert os.environ["GENTLY_COLLECTOR_URL"] == "http://127.0.0.1:8787"\n'
             'setup = __import__("json").loads(os.environ["FIXTURE_PUBLIC_SETUP"])\n'
@@ -105,7 +105,8 @@ class LauncherTests(unittest.TestCase):
                 pass
 
     def test_direct_launch_supervises_both_children(self):
-        self.launch(self.repo / "scripts/collector-local")
+        result = self.launch(self.repo / "scripts/collector-local")
+        self.assertIn("collector exited with status 0", result.stderr)
         self.assert_stopped("watch.pid")
         self.assert_stopped("collector.pid")
 
@@ -124,8 +125,16 @@ class LauncherTests(unittest.TestCase):
         self.executable("node", 'import os, time\nfrom pathlib import Path\n'
             'Path(os.environ["FIXTURE_DIR"], "collector.pid").write_text(str(os.getpid()))\n'
             'time.sleep(60)\n')
-        self.launch(self.repo / "scripts/collector-local", 7)
+        result = self.launch(self.repo / "scripts/collector-local", 7)
+        self.assertIn("exporter exited with status 7", result.stderr)
         self.assert_stopped("collector.pid")
+
+    def test_collector_signal_reports_service_and_conventional_exit_code(self):
+        self.executable("node", 'import os, signal, time\n'
+            'time.sleep(0.3)\nos.kill(os.getpid(), signal.SIGTERM)\n')
+        result = self.launch(self.repo / "scripts/collector-local", 143)
+        self.assertIn("collector exited after signal SIGTERM (15)", result.stderr)
+        self.assert_stopped("watch.pid")
 
     def test_missing_dependency_never_unlocks(self):
         self.wrangler.unlink()
@@ -151,7 +160,7 @@ class LauncherTests(unittest.TestCase):
 
     def test_attach_launcher_runs_only_exporter(self):
         self.executable("gently", 'import os, sys\n'
-            'assert sys.argv[1:] == ["export", "--watch"]\n'
+            'assert sys.argv[1:] == ["export", "--watch", "--serve-queries", "--preserve-backlog"]\n'
             'assert os.environ.get("GENTLY_TOKEN") == "synthetic-fixture-only"\n')
         self.launch(self.repo / "scripts/export-local")
         self.assertFalse((self.root / "collector.pid").exists())
