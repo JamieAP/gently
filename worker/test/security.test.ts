@@ -1,8 +1,8 @@
 import { env, SELF } from "cloudflare:test";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index";
 import type { Env } from "../src/d1";
-import schemaSql from "../schema.sql?raw";
+import { resetDatabase } from "./reset";
 
 const TOKEN = "test-token-secret";
 const OTHER = "other-tenant-token";
@@ -47,10 +47,24 @@ function postSpans(body: unknown, token = TOKEN, tenant = "personal") {
   });
 }
 
-beforeAll(async () => {
-  for (const statement of schemaSql.split(";").map(s => s.trim()).filter(Boolean)) {
-    await env.DB.prepare(statement).run();
-  }
+beforeEach(async () => {
+  // Vitest 4 isolates storage per file. Reset every test explicitly so data and
+  // authorization assertions do not depend on execution order.
+  await resetDatabase(env.DB);
+});
+
+describe("test database reset", () => {
+  it("drops rows and tables it was not told about, then reapplies the schema", async () => {
+    expect((await postSpans(otlp())).status).toBe(200);
+    await env.DB.prepare("CREATE TABLE stray_probe (value TEXT)").run();
+    await env.DB.prepare("INSERT INTO stray_probe (value) VALUES ('synthetic')").run();
+    await resetDatabase(env.DB);
+    const tables = await env.DB.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('spans', 'raw_values', 'stray_probe') ORDER BY name",
+    ).all<{ name: string }>();
+    expect(tables.results.map(row => row.name)).toEqual(["raw_values", "spans"]);
+    expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM spans").first("n")).toBe(0);
+  });
 });
 
 describe("tenant and device authorization", () => {

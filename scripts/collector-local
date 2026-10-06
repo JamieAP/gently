@@ -39,7 +39,7 @@ if [ ! -x "$gently_bin" ]; then
   exit 1
 fi
 if [ ! -f "$repo_dir/worker/node_modules/wrangler/bin/wrangler.js" ]; then
-  printf '%s\n' 'Install collector dependencies with npm ci in the worker directory.' >&2
+  printf '%s\n' 'Install collector dependencies with npm ci --ignore-scripts in the worker directory.' >&2
   exit 1
 fi
 if [ "$check_only" = true ]; then

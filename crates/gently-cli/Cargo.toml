@@ -30,6 +30,7 @@ fs4.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 dirs = "5"
 toml = "0.8"
 toml_edit = "0.22"

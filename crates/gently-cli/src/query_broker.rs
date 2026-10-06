@@ -2,6 +2,7 @@
 //! its memory; no TCP listener, secret handoff, vault calls or native auth reads.
 
 use crate::config::Config;
+use crate::query_client::QueryFailure;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -251,6 +252,9 @@ async fn forward(
     client.query(&params).await
 }
 
+/// Ask the watcher, then blame the right component: a failed exchange is the
+/// watcher's, while an error or result it relays came from the collector or
+/// the query itself.
 pub async fn query<T: for<'de> Deserialize<'de>>(
     path: &Path,
     base: &str,
@@ -258,6 +262,19 @@ pub async fn query<T: for<'de> Deserialize<'de>>(
     params: &[(&str, String)],
     timeout: Duration,
 ) -> Result<T> {
+    let response = exchange(path, base, tenant, params, timeout)
+        .await
+        .context(QueryFailure::WatcherUnavailable)?;
+    relayed(response)
+}
+
+async fn exchange(
+    path: &Path,
+    base: &str,
+    tenant: &str,
+    params: &[(&str, String)],
+    timeout: Duration,
+) -> Result<Reply> {
     validate_socket(path)?;
     tokio::time::timeout(timeout, async {
         let mut stream = UnixStream::connect(path)
@@ -288,19 +305,116 @@ pub async fn query<T: for<'de> Deserialize<'de>>(
         stream.write_all(&bytes).await?;
         let response =
             crate::json_fidelity::parse_bytes(&read_line(&mut stream, MAX_RESPONSE).await?)?;
-        if let Some(error) = response.get("error").and_then(Value::as_str) {
-            anyhow::bail!("{error}");
-        }
-        serde_json::from_value(
-            response
-                .get("result")
-                .context("query response missing result")?
-                .clone(),
-        )
-        .map_err(|_| anyhow::anyhow!("invalid local query response"))
+        Reply::decode(response)
     })
     .await
     .context("local query watcher timed out")?
+}
+
+/// A well-formed watcher reply: the collector's result, or a relayed error.
+#[derive(Debug)]
+enum Reply {
+    Result(Value),
+    Error(String),
+}
+
+impl Reply {
+    fn decode(mut response: Value) -> Result<Self> {
+        if let Some(error) = response.get("error").and_then(Value::as_str) {
+            return Ok(Self::Error(error.into()));
+        }
+        response
+            .get_mut("result")
+            .map(|result| Self::Result(result.take()))
+            .context("query response missing result")
+    }
+}
+
+fn relayed<T: for<'de> Deserialize<'de>>(reply: Reply) -> Result<T> {
+    match reply {
+        Reply::Error(error) => Err(anyhow::anyhow!(error).context(QueryFailure::WatcherRelayed)),
+        Reply::Result(result) => serde_json::from_value(result)
+            .map_err(|_| anyhow::anyhow!("invalid local query response"))
+            .context(QueryFailure::WatcherRelayed),
+    }
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+
+    fn category(error: &anyhow::Error) -> Option<&QueryFailure> {
+        error.downcast_ref::<QueryFailure>()
+    }
+
+    /// A healthy watcher that answers one request with a fixed reply line.
+    async fn watcher(reply: &'static str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("query.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_line(&mut stream, MAX_REQUEST).await;
+            stream.write_all(reply.as_bytes()).await.unwrap();
+        });
+        (dir, path)
+    }
+
+    async fn ask(path: &Path) -> Result<Vec<Value>> {
+        query(
+            path,
+            "https://synthetic.invalid",
+            "personal",
+            &[("op", "traces".into())],
+            Duration::from_secs(5),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_missing_watcher_is_the_watchers_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = ask(&dir.path().join("query.sock")).await.unwrap_err();
+        assert!(matches!(
+            category(&error),
+            Some(QueryFailure::WatcherUnavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn errors_relayed_by_a_healthy_watcher_are_not_blamed_on_it() {
+        for reply in [
+            "{\"error\":\"collector query transport failed\"}\n",
+            "{\"result\":\"not a row list\"}\n",
+        ] {
+            let (_dir, path) = watcher(reply).await;
+            let error = ask(&path).await.unwrap_err();
+            assert!(
+                matches!(category(&error), Some(QueryFailure::WatcherRelayed)),
+                "{reply}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_malformed_watcher_reply_is_the_watchers_failure() {
+        for reply in ["{\"neither\":true}\n", "not json\n", "{\"result\":[]}"] {
+            let (_dir, path) = watcher(reply).await;
+            let error = ask(&path).await.unwrap_err();
+            assert!(
+                matches!(category(&error), Some(QueryFailure::WatcherUnavailable)),
+                "{reply}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_healthy_watcher_returns_the_collector_result() {
+        let (_dir, path) = watcher("{\"result\":[]}\n").await;
+        assert!(ask(&path).await.unwrap().is_empty());
+    }
 }
 
 #[cfg(test)]
