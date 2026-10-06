@@ -71,7 +71,7 @@ cd gently
 
 ```sh
 cd worker
-npm ci
+npm ci --ignore-scripts
 npx wrangler d1 create gently
 ```
 
@@ -252,7 +252,7 @@ state outside tracked files and review other confidential prose or code manually
 cargo test
 cargo clippy --all-targets -- -D warnings
 cd worker
-npm ci
+npm ci --ignore-scripts
 npm test
 npm run typecheck
 ```

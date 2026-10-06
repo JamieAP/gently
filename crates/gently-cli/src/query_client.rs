@@ -143,12 +143,43 @@ impl Drop for CachedRawPayload {
     }
 }
 
+/// Closed safe categories for callers that must not expose error chains. Each
+/// names the component that failed; an untagged error is a collector failure.
+#[derive(Debug, thiserror::Error)]
+pub enum QueryFailure {
+    #[error("raw resolution exceeds the 8 MiB budget; narrow your query")]
+    RawBudget,
+    #[error("Reader identity is unavailable; configure or unlock an enrolled reader.")]
+    ReaderUnavailable,
+    #[error(
+        "Reader could not decrypt raw values; approve the reader prompt within 60 seconds, or use a reader enrolled for these objects."
+    )]
+    RawDecrypt,
+    #[error(
+        "Local query watcher failed; restart the unlocked watcher and check collector health."
+    )]
+    WatcherUnavailable,
+    #[error(
+        "Local query watcher relayed a collector or query error; check collector availability, authorization and query arguments."
+    )]
+    WatcherRelayed,
+}
+
+/// Decryption fails locally: a reader prompt not approved in time, a reader
+/// that failed, or an identity that is not a recipient of an older object.
+fn open_raw(
+    object: &gently_raw::RawObject,
+    identities: &gently_raw::ReaderIdentities,
+) -> Result<gently_raw::RawPayload> {
+    gently_raw::open(object, &object.context, identities).context(QueryFailure::RawDecrypt)
+}
+
 const MAX_RAW_QUERY_BYTES: usize = 8 * 1024 * 1024;
 fn account_raw_query_bytes(bytes: &mut usize, added: usize) -> Result<()> {
     *bytes = bytes
         .checked_add(added)
         .filter(|total| *total <= MAX_RAW_QUERY_BYTES)
-        .context("raw resolution exceeds the 8 MiB budget; narrow your query")?;
+        .context(QueryFailure::RawBudget)?;
     Ok(())
 }
 
@@ -248,14 +279,16 @@ impl QueryClient {
             let path = self
                 .raw_identity_path
                 .as_deref()
-                .context("raw resolution requires an explicit reader identity")?;
-            gently_store::private_fs::harden_existing_file(path)?;
-            let identities = gently_raw::load_identities(path)?;
+                .context(QueryFailure::ReaderUnavailable)?;
+            gently_store::private_fs::harden_existing_file(path)
+                .context(QueryFailure::ReaderUnavailable)?;
+            let identities =
+                gently_raw::load_identities(path).context(QueryFailure::ReaderUnavailable)?;
             let _ = self.raw_identities.set(identities);
         }
         self.raw_identities
             .get()
-            .context("reader identity unavailable")
+            .context(QueryFailure::ReaderUnavailable)
     }
 
     pub async fn traces(&self, f: &TraceFilters) -> Result<Vec<TraceSummary>> {
@@ -335,11 +368,7 @@ impl QueryClient {
 
     async fn resolve_raw_values(&self, rows: &mut [SpanRow]) -> Result<()> {
         self.resolve_raw_values_with_reader(rows, |object| {
-            Ok(gently_raw::open(
-                object,
-                &object.context,
-                self.reader_identities()?,
-            )?)
+            open_raw(object, self.reader_identities()?)
         })
         .await
     }
@@ -812,6 +841,81 @@ mod raw_guard_tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn reader_that_cannot_decrypt_is_reported_as_a_reader_failure() {
+        use gently_raw::{
+            DeviceIdentity, Manifest, OwnerKey, RawContext, ReaderIdentities, Recipient, TrustPin,
+            VerifiedManifest,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = gently_store::Store::open(&dir.path().join("state.db")).unwrap();
+        let enrolled = DeviceIdentity::generate();
+        let owner = OwnerKey::generate();
+        let manifest = Manifest {
+            version: 1,
+            tenant_id: "personal".into(),
+            key_epoch: 1,
+            expires_unix_secs: 4_102_444_800,
+            readers: vec![Recipient {
+                device_id: "reader".into(),
+                key_id: "key".into(),
+                recipient: enrolled.to_public().to_string(),
+            }],
+        };
+        let pin = TrustPin {
+            tenant_id: "personal".into(),
+            owner_verify_key_b64: owner.verification_key_b64(),
+            min_epoch: 1,
+            manifest_digest: gently_raw::manifest_digest(&manifest).unwrap(),
+        };
+        let verified =
+            VerifiedManifest::verify(&gently_raw::sign_manifest(manifest, &owner).unwrap(), &pin)
+                .unwrap();
+        let context = RawContext {
+            tenant_id: "personal".into(),
+            device_id: "writer".into(),
+            key_epoch: 1,
+            raw_ref: gently_raw::new_raw_ref(),
+            session_id: "session".into(),
+            harness: "codex".into(),
+            event: "UserPromptSubmit".into(),
+        };
+        let mut row = row();
+        let object = gently_raw::seal(
+            &verified,
+            context.clone(),
+            BTreeMap::from([("gently.prompt".into(), "private older fixture".into())]),
+            BTreeMap::from([("gently.prompt".into(), vec![row.span_id.clone()])]),
+        )
+        .unwrap();
+        store.raw_object_cache(&object).unwrap();
+        row.resource_json = Some(
+            json!([
+                {"key":"gently.tenant_id","value":{"stringValue":"personal"}},
+                {"key":"gently.device_id","value":{"stringValue":"writer"}}
+            ])
+            .to_string(),
+        );
+        row.attrs_json = Some(
+            json!([{"key":"gently.prompt.raw_ref","value":{"stringValue":context.raw_ref}}])
+                .to_string(),
+        );
+        let mut client = client();
+        client.local_raw_store = Some(store);
+        // A newer reader is not a recipient of objects sealed before it enrolled.
+        let newer = ReaderIdentities::from_native(vec![DeviceIdentity::generate()]);
+        assert!(client.raw_identities.set(newer).is_ok());
+        let error = client
+            .resolve_raw_values(std::slice::from_mut(&mut row))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<QueryFailure>(),
+            Some(QueryFailure::RawDecrypt)
+        ));
+        assert!(!error.to_string().contains("private older fixture"));
     }
 
     #[tokio::test]

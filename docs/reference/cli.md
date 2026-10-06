@@ -9,7 +9,7 @@ Use `gently --help` or `gently <command> --help` for command syntax;
 | Command | Collector URL and token required? |
 | --- | --- |
 | `hook` | No. Events queue locally without credentials. |
-| `init`, `status`, `raw`, `quarantine` | No. These use local configuration and files. |
+| `init`, `uninstall`, `status`, `state`, `raw`, `quarantine` | No. These use local configuration and files. |
 | `waterfall` | No. Reads stdin without loading configuration or local state. |
 | `export` | Yes. |
 | `traces`, `trace`, `spans`, `stats`, `whoami`, `mcp` | URL plus token, or a local query watcher on Unix. |
@@ -269,3 +269,18 @@ Tools, examples, local `jq` behavior, and raw-value resolution are documented in
 
 [Command parsing](https://github.com/JamieAP/gently/blob/main/crates/gently-cli/src/main.rs) and
 [query rendering](https://github.com/JamieAP/gently/blob/main/crates/gently-cli/src/cmd_query.rs) define this interface.
+
+## `gently state` and `gently uninstall`
+
+`state backup PATH` creates a consistent owner-only namespace-pinned backup,
+including live WAL state; `state restore PATH` accepts supported encrypted backups
+into a missing database in the same tenant/device namespace. Both operate without
+unlocking a reader. Backups contain private metadata and require private storage.
+Backup reports private temporaries left by an interrupted backup in the
+destination directory; `state backup --remove-stale PATH` deletes only exact
+owner-only Gently temporaries and leaves lookalikes for review.
+
+`uninstall --codex` and `uninstall --claude` remove only the current executable's
+exact managed registrations, preserving custom hooks, state and keys. Use the
+installed executable before removing its binary. See
+[installation and recovery](../guides/installation-and-recovery.md).

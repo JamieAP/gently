@@ -17,6 +17,7 @@ import sys
 OWNER = "JamieAP"
 REPO = "JamieAP/gently"
 BASE = f"repos/{REPO}"
+ACTIONS_APP_ID = 15368
 CONTEXTS = ["validate (macos-latest)", "validate (ubuntu-latest)"]
 FILES = (".github/workflows/ci.yml", ".github/workflows/docs.yml", ".github/CODEOWNERS")
 ACTIONS = {"allowed_actions": "selected", "sha_pinning_required": True}
@@ -24,8 +25,19 @@ SELECTED = {"github_owned_allowed": True, "verified_allowed": False, "patterns_a
 WORKFLOW = {"default_workflow_permissions": "read", "can_approve_pull_request_reviews": False}
 FORK = {"approval_policy": "all_external_contributors"}
 ACTIVE_STATUSES = ("in_progress", "queued", "waiting", "requested", "pending")
-CI_CONDITION = "github.repository == 'JamieAP/gently' && github.actor == 'JamieAP' && github.triggering_actor == 'JamieAP' && (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main')"
+CI_CONDITION = "github.repository == 'JamieAP/gently' && github.actor == 'JamieAP' && github.triggering_actor == 'JamieAP' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login == 'JamieAP' && github.event.pull_request.base.ref == 'main'))"
+SECURITY_FEATURES = ("secret_scanning", "secret_scanning_push_protection")
 PAGES_CONDITION = "github.repository == 'JamieAP/gently' && github.ref == 'refs/heads/main' && github.actor == 'JamieAP' && github.triggering_actor == 'JamieAP'"
+# Reviewed workflow shapes are allowlists: any other key, quoted key or
+# indentation fails closed rather than being interpreted.
+WORKFLOW_KEYS = {"name", "on", "permissions", "concurrency", "jobs"}
+JOB_KEYS = {
+    "validate": {"strategy", "runs-on", "timeout-minutes", "env", "steps"},
+    "build": {"if", "runs-on", "timeout-minutes", "steps"},
+    "deploy": {"if", "needs", "runs-on", "timeout-minutes", "permissions", "environment", "steps"},
+}
+# Later CI steps keep the default success() condition: no if/continue-on-error.
+STEP_KEYS = {"name", "id", "uses", "with", "run", "shell", "working-directory", "env", "timeout-minutes"}
 
 
 def block(text, name, indent):
@@ -45,6 +57,42 @@ def block(text, name, indent):
             break
         values.append(line)
     return "\n".join(values)
+
+
+def plain_mapping_keys(text, indent):
+    """Return the plain keys of one block mapping whose keys sit at `indent`.
+
+    Deeper lines are values. Shallower lines, quoted/spaced/merge keys, flow
+    syntax and duplicates are not interpreted: they fail closed.
+    """
+    keys = []
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        depth = len(line) - len(line.lstrip(" "))
+        if depth > indent:
+            continue
+        match = re.fullmatch(r"[ ]{" + str(indent) + r"}([A-Za-z][A-Za-z0-9_-]*):(?:[ ].*)?", line)
+        if depth < indent or match is None:
+            raise GuardError("Reviewed workflow uses unsupported mapping syntax")
+        keys.append(match.group(1))
+    if len(keys) != len(set(keys)):
+        raise GuardError("Reviewed workflow uses duplicate mapping keys")
+    return keys
+
+
+def step_blocks(steps):
+    """Split a steps sequence (items at indent 6) into per-step key mappings.
+
+    Every item must start `      - key:` with exactly one space after the
+    dash, so its mapping sits at indent 8 and no key can hide at another one.
+    """
+    for step in re.split(r"(?m)(?=^      -)", steps):
+        if not step.strip():
+            continue
+        if not re.match(r"      - [A-Za-z]", step):
+            raise GuardError("CI must fail its authorization step before checkout; unsupported step syntax")
+        yield plain_mapping_keys("        " + step[len("      - "):], 8)
 
 
 class GuardError(Exception):
@@ -172,25 +220,40 @@ class Guard:
             raise GuardError("CODEOWNERS must assign every file to JamieAP")
         for name in FILES[:2]:
             text = self.files.get(name, "")
-            if re.search(r"\b(pull_request|pull_request_target|workflow_run|issue_comment|issues|discussion_comment|repository_dispatch|self-hosted)\b", text):
+            if not set(plain_mapping_keys(text, 0)) <= WORKFLOW_KEYS:
+                raise GuardError("Reviewed workflow has unexpected top-level keys")
+            if re.search(r"\b(pull_request_target|workflow_run|issue_comment|issues|discussion_comment|repository_dispatch|self-hosted)\b", text):
                 raise GuardError("A reviewed workflow contains a prohibited trigger or self-hosted runner")
             if "secrets." in text or re.search(r"secrets\s*\[", text):
                 raise GuardError("Public workflows must not reference stored secrets")
             if block(text, "permissions", 0).strip() != "contents: read":
                 raise GuardError("Workflow default permissions must contain only contents: read")
-            triggers = re.findall(r"(?m)^  ([A-Za-z0-9_-]+):", block(text, "on", 0))
-            if sorted(triggers) != ["push", "workflow_dispatch"]:
-                raise GuardError("Only owner pushes and manual workflow dispatch are permitted")
+            triggers = plain_mapping_keys(block(text, "on", 0), 2)
+            expected_triggers = ["pull_request", "push", "workflow_dispatch"] if name.endswith("ci.yml") else ["push", "workflow_dispatch"]
+            if sorted(triggers) != expected_triggers:
+                raise GuardError("Only guarded owner CI pull requests, main pushes and manual dispatch are permitted")
             jobs = block(text, "jobs", 0)
             expected = ["validate"] if name.endswith("ci.yml") else ["build", "deploy"]
-            if re.findall(r"(?m)^  ([A-Za-z0-9_-]+):$", jobs) != expected:
+            if plain_mapping_keys(jobs, 2) != expected:
                 raise GuardError("Reviewed workflow has an unexpected job inventory")
             for job in expected:
                 contents = block(jobs, job, 2)
                 conditions = re.findall(r"(?m)^    if: (.+)$", contents)
-                condition = CI_CONDITION if job == "validate" else PAGES_CONDITION
-                if conditions != [condition]:
-                    raise GuardError("Every public workflow job must use the exact owner/repository/branch guard")
+                unexpected = set(plain_mapping_keys(contents, 4)) - JOB_KEYS[job]
+                if job == "validate":
+                    authorize = ["      - name: Authorize owner-operated validation",
+                                 "        if: ${{ !(" + CI_CONDITION + ") }}", "        run: exit 1"]
+                    steps = block(contents, "steps", 4).splitlines()
+                    boundary = next((i for i, line in enumerate(steps[1:], 1) if line.startswith("      -")), len(steps))
+                    if (unexpected or conditions or steps[:boundary] != authorize
+                            or "continue-on-error" in contents):
+                        raise GuardError("CI must fail an exact owner/repository/author authorization step before checkout")
+                    # Each later step keeps the default success() condition.
+                    for keys in step_blocks("\n".join(steps[boundary:])):
+                        if not set(keys) <= STEP_KEYS:
+                            raise GuardError("CI must fail its authorization step before checkout; later steps use only reviewed keys and no conditions")
+                elif unexpected or conditions != [PAGES_CONDITION]:
+                    raise GuardError("Every deployment workflow job must use the exact owner/repository/branch guard and reviewed keys")
                 if job == "deploy":
                     if [line.strip() for line in block(contents, "permissions", 4).splitlines()] != ["pages: write", "id-token: write"]:
                         raise GuardError("Only Pages deployment receives exactly Pages/OIDC write permissions")
@@ -209,7 +272,8 @@ class Guard:
                 raise GuardError("CI must have no write permissions")
 
     def policy_issues(self, user, expect_enabled=True, check_actions=True):
-        issues = []
+        issues = [f"{control[0].upper()}{control[1:]} must be enabled and confirmed by readback"
+                  for control in self.unconfirmed_security()]
         if check_actions:
             actions = self.get("actions/permissions")
             if actions.get("enabled") is not expect_enabled or any(actions.get(k) != v for k, v in ACTIONS.items()):
@@ -231,6 +295,10 @@ class Guard:
             protection = {}
         status = protection.get("required_status_checks") or {}
         reviews = protection.get("required_pull_request_reviews") or {}
+        bindings = [(check.get("context"), check.get("app_id")) for check in status.get("checks", [])]
+        if (len(bindings) != len(CONTEXTS) or any(type(app_id) is not int for _, app_id in bindings)
+                or any(bindings.count((context, ACTIONS_APP_ID)) != 1 for context in CONTEXTS)):
+            issues.append("Required validation checks must be bound to the GitHub Actions App")
         if status.get("strict") is not True or sorted(status.get("contexts", [])) != sorted(CONTEXTS):
             issues.append("main must require both Mac and Linux validation checks against the current base")
         if (reviews.get("require_code_owner_reviews") is not True or reviews.get("dismiss_stale_reviews") is not True
@@ -264,6 +332,16 @@ class Guard:
         if policies.get("total_count") != 1 or [(p.get("name"), p.get("type")) for p in values] != [("main", "branch")]:
             issues.append("github-pages must permit exactly the main branch and no tags")
         return issues
+
+    def unconfirmed_security(self):
+        """Read back the repository security controls; name each one not enabled."""
+        unconfirmed = []
+        security = self.api.request(BASE).get("security_and_analysis") or {}
+        if any((security.get(feature) or {}).get("status") != "enabled" for feature in SECURITY_FEATURES):
+            unconfirmed.append("secret scanning and push protection")
+        if self.get("private-vulnerability-reporting").get("enabled") is not True:
+            unconfirmed.append("private vulnerability reporting")
+        return unconfirmed
 
     def pages_policies(self):
         try:
@@ -327,10 +405,10 @@ class Guard:
                 or any(current.get(key, {}).get("enabled") is True for key in stronger_flags)):
             raise GuardError("Refusing to relax existing branch protection; review its stronger or unexpected controls manually")
         bindings = {check["context"]: check["app_id"] for check in checks if check.get("app_id") is not None}
-        if any(type(app_id) is not int for app_id in bindings.values()):
-            raise GuardError("Unable to preserve existing branch status-check App bindings")
-        required_checks = [{"context": context, **({"app_id": bindings[context]} if context in bindings else {})}
-                           for context in CONTEXTS]
+        if any(type(app_id) is not int or app_id not in (-1, ACTIONS_APP_ID) for app_id in bindings.values()):
+            raise GuardError("Refusing to replace a different required-check App binding; review it manually")
+        bindings = {context: ACTIONS_APP_ID for context in CONTEXTS}
+        required_checks = [{"context": context, "app_id": ACTIONS_APP_ID} for context in CONTEXTS]
         return {
             "required_status_checks": {"strict": True, "checks": required_checks},
             "enforce_admins": False,
@@ -352,6 +430,12 @@ class Guard:
             self.inventory()
             self.reviewed_workflows(reviewed_main_sha)
             branch, bindings = self.branch_update()
+            self.api.request(BASE, method="PATCH", body={"security_and_analysis": {
+                feature: {"status": "enabled"} for feature in SECURITY_FEATURES}})
+            self.get("private-vulnerability-reporting", method="PUT")
+            unconfirmed = self.unconfirmed_security()
+            if unconfirmed:
+                raise GuardError("GitHub did not confirm " + "; ".join(unconfirmed))
             self.put("actions/permissions/workflow", WORKFLOW)
             self.put("actions/permissions/fork-pr-contributor-approval", FORK)
             if self.get("actions/permissions/fork-pr-contributor-approval").get("approval_policy") != FORK["approval_policy"]:
@@ -408,7 +492,7 @@ def main():
     args = parser.parse_args()
     if args.plan:
         print("Target: JamieAP/gently, main. No visibility or credential changes.")
-        print("Apply disables Actions first, verifies owner-only access and reviewed main workflows, sets read-only tokens and owner approval gates, verifies owner approval and deployment gates before enabling, then reads back Actions policies.")
+        print("Apply disables Actions first, verifies owner-only access and reviewed main workflows, sets secret scanning/push protection and private vulnerability reporting, read-only tokens and owner approval gates, verifies owner approval and deployment gates before enabling, then reads back Actions policies.")
         print("Manual prerequisites: review all installed GitHub Apps; disable github-pages administrator bypass; merge and review workflow hardening on main.")
         return 0
     root = Path(__file__).resolve().parent.parent
