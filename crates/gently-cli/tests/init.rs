@@ -488,9 +488,7 @@ fn codex_skips_symlinked_legacy_json_and_finishes_inline_setup() {
         .env("GENTLY_STATE_DIR", dir.path().join(".gently"))
         .assert()
         .success()
-        .stderr(predicates::str::contains(
-            "skipped legacy Codex hooks.json migration",
-        ));
+        .stderr(predicates::str::contains("skipped legacy Codex hooks.json"));
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"user\":true}");
     assert_eq!(
         std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,

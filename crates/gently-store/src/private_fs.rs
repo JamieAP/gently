@@ -211,6 +211,16 @@ pub fn prepare_sqlite_file(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Create a new owner-only file, refusing every existing path or alias.
+pub fn create_private_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    protect_options(&mut options);
+    let file = options.open(path)?;
+    protect_handle(&file)?;
+    Ok(file)
+}
+
 /// Open or create a private file without truncating existing data.
 pub fn open_private_file(path: &Path, append: bool) -> io::Result<File> {
     reject_symlink(path)?;

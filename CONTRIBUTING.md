@@ -132,8 +132,10 @@ mapping changes, update its fixture and [reference](docs/reference/hooks.md).
 If a CLI or query interface changes, update help, examples and the relevant
 reference. Preserve metadata-only defaults, separate encrypted capture/sync/
 resolution opt-ins, tenant/device boundaries and keyless capture/export. Never
-use real private keys or credentials in tests. Pre-public schema changes require
-explicit reset of disposable state; do not add plaintext migration paths.
+use real private keys or credentials in tests. Encrypted schema changes require
+reviewed migrations or explicit version refusal
+and backup/restore coverage. Preserve supported encrypted state; do not add
+plaintext migration paths.
 
 ## License
 
