@@ -4,7 +4,7 @@ import worker from "../src/index";
 import type { Env } from "../src/d1";
 import { insertSpans } from "../src/d1";
 import { flatten } from "../src/otlp";
-import schemaSql from "../schema.sql?raw";
+import { resetDatabase } from "./reset";
 
 const BEARER = "Bearer test-token-secret";
 
@@ -106,17 +106,7 @@ function makeSingleSpanTrace(
 beforeEach(async () => {
   // Vitest 4 isolates storage per file. Reset every test explicitly so data and
   // authorization assertions do not depend on execution order.
-  await env.DB.prepare("DROP TABLE IF EXISTS spans").run();
-  await env.DB.prepare("DROP TABLE IF EXISTS raw_values").run();
-  // Apply schema: split on semicolons, trim, skip blanks
-  const statements = schemaSql
-    .split(";")
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-
-  for (const stmt of statements) {
-    await env.DB.prepare(stmt).run();
-  }
+  await resetDatabase(env.DB);
 
   // Seed a fresh baseline for every test; POST fixtures use these same IDs.
   await SELF.fetch("https://x/v1/traces?tenant_id=personal", {

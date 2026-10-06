@@ -48,8 +48,7 @@ jobs:
       - name: Worker dependencies, tests and type checking
         working-directory: worker
         run: |
-          npm ci
-          npm run audit
+          npm ci --ignore-scripts
           npm test
           npm run typecheck
       - name: Launcher regression tests
@@ -61,3 +60,8 @@ jobs:
           npm run --prefix docs build
       - name: Real CLI, encrypted readers, Wrangler and D1 acceptance
         run: python3 scripts/acceptance-local.py --binary "$RUNNER_TEMP/gently-install/bin/gently"
+      # Last, so a newly published advisory or an audit endpoint outage fails the
+      # run without hiding functional results. Reviewed exceptions expire; see
+      # CONTRIBUTING.md.
+      - name: Locked Node dependency advisory audit
+        run: python3 scripts/npm-audit.py worker docs

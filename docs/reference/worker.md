@@ -244,7 +244,7 @@ For development from the checkout:
 
 ```sh
 cd worker
-npm ci
+npm ci --ignore-scripts
 npm test
 npm run typecheck
 ```

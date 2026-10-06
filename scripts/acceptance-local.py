@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Real CLI -> age -> Wrangler/workerd/D1 -> CLI/MCP acceptance, synthetic only.
 
-Requires a built gently binary, Node, and `npm ci` in worker/. No real HOME,
+Requires a built gently binary, Node, and `npm ci --ignore-scripts` in worker/. No real HOME,
 credential provider, hardware key, cloud account or remote resource is used.
 Output deliberately contains phase names only, never child output or fixtures.
 """

@@ -60,17 +60,43 @@ For Worker changes (Node.js 22.12 or later):
 
 ```sh
 cd worker
-npm ci
-npm run audit
+npm ci --ignore-scripts
 npm test
 npm run typecheck
+npm run audit
 cd ..
 ```
 
-The Worker test suite uses the Cloudflare Vitest plugin and Vitest 4. Each test
-resets its synthetic D1 tables because storage isolation now applies per file.
-Use `npm ci` to reproduce the lockfile and resolve advisories before publishing;
-CI runs the dependency audit as a release guard. For migration details see the
+The Worker test suite uses the Cloudflare Vitest plugin and Vitest 4. Storage
+is isolated per test file, not per test, so each test calls
+`worker/test/reset.ts` to drop every table and reapply `schema.sql`.
+`npm ci --ignore-scripts` installs exactly what the lockfile records without
+running dependency install scripts; the Worker, tests and local collector do
+not need them.
+
+`npm run audit` (and `npm run audit` in `docs/`) runs `scripts/npm-audit.py`,
+which audits the committed lockfile and fails on any advisory of low severity
+or above. CI runs it for `worker/` and `docs/` on every push to `main`, as its
+last step so a newly published advisory cannot hide functional results. Fix an
+advisory by upgrading when a patched release exists. Otherwise, record a
+reviewed exception in that project's `audit-allowlist.json`:
+
+```json
+{
+  "advisories": [
+    {
+      "id": "GHSA-xxxx-xxxx-xxxx",
+      "package": "affected-package",
+      "justification": "Why the vulnerable code is unreachable here, and what removes the entry.",
+      "expires": "YYYY-MM-DD"
+    }
+  ]
+}
+```
+
+An entry matches one GitHub advisory ID in one package, must expire within 90
+days and fails the audit once expired. Remove entries that no longer match.
+Rust dependencies are not audited by this check. For migration details see the
 [Cloudflare test-plugin guide](https://developers.cloudflare.com/workers/testing/vitest-integration/migration-guides/migrate-to-vitest-plugin/).
 
 For local launcher changes:
