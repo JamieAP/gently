@@ -844,3 +844,70 @@ describe("GET /v1/query", () => {
     expect(res.status).toBe(404);
   });
 });
+
+
+describe("bounded trace pages", () => {
+  const T = "9876543210abcdef9876543210abcdef";
+  async function seed(count: number) {
+    const rows = Array.from({length: count}, (_, i) => ({
+      tenant_id: "personal", device_id: "mac-main", trace_id: T,
+      span_id: i.toString(16).padStart(16, "0"), parent_span_id: i ? "0000000000000000" : null,
+      name: "synthetic", kind: 1, start_unix_nano: "1700000000000000000",
+      end_unix_nano: String(1700000000000000000n + BigInt(i)), status: 0,
+      session_id: "synthetic", harness: "codex", tool_name: null, tool_use_id: null,
+      attrs_json: "[]", resource_json: "[]", ingested_unix_nano: "1700000000000000000"
+    }));
+    for (let i = 0; i < count; i += 32) await insertSpans(env, "personal", "mac-main", rows.slice(i, i + 32));
+  }
+  const get = (extra = "") => SELF.fetch(`https://x/v1/query?tenant_id=personal&op=trace&trace_id=${T}&page=1${extra}`, {headers: {Authorization: BEARER}});
+  it("reconstructs a long trace with timestamp ties and trace-wide root bounds", async () => {
+    await seed(205);
+    let cursor: string | null = null; const ids: string[] = [];
+    for (let page = 0; page < 3; page++) {
+      const res = await get(cursor ? `&cursor=${cursor}` : ""); expect(res.status).toBe(200);
+      const body = await res.json() as {rows: Array<{span_id: string; effective_end_unix_nano: string}>; next_cursor: string | null; complete: boolean};
+      if (page === 0) expect(body.rows[0].effective_end_unix_nano).toBe("1700000000000000204");
+      ids.push(...body.rows.map(row => row.span_id)); cursor = body.next_cursor;
+      expect(body.complete).toBe(page === 2);
+    }
+    expect(ids).toHaveLength(205); expect(new Set(ids).size).toBe(205); expect(ids).toEqual([...ids].sort());
+    const legacy = await SELF.fetch(`https://x/v1/query?tenant_id=personal&op=trace&trace_id=${T}`, {headers:{Authorization:BEARER}});
+    expect(legacy.status).toBe(413);
+  });
+  it("rejects malformed and cross-context cursors and invalid limits", async () => {
+    await seed(2);
+    for (const extra of ["&cursor=invalid", "&limit=0", "&limit=101", "&limit=2garbage"]) expect((await get(extra)).status).toBe(400);
+    const page = await (await get("&limit=1")).json() as {next_cursor: string};
+    const otherTrace = await SELF.fetch(`https://x/v1/query?tenant_id=personal&op=trace&trace_id=${TRACE_ID}&page=1&cursor=${page.next_cursor}`, {headers:{Authorization:BEARER}});
+    expect(otherTrace.status).toBe(400);
+    const foreign = btoa(JSON.stringify({v:1,tenant:"other",trace:T,start:"1700000000000000000",span:"0000000000000000"})).replace(/=+$/, "");
+    expect((await get(`&cursor=${foreign}`)).status).toBe(400);
+  });
+  it("rejects a single row beyond the byte budget without returning its payload", async () => {
+    await seed(1);
+    await env.DB.prepare("UPDATE spans SET attrs_json = ? WHERE tenant_id = ? AND trace_id = ?").bind("synthetic-canary".repeat(100_000), "personal", T).run();
+    const response = await get(); expect(response.status).toBe(413);
+    expect(await response.text()).not.toContain("synthetic-canary");
+  });
+});
+
+
+describe("trace continuation compatibility", () => {
+  it("continues accepted uppercase IDs, unicode legacy IDs and uint64 timestamps", async () => {
+    const T = "ABCDEF0123456789ABCDEF0123456789";
+    const ids = ["ABCDEF012345678A", "ABCDEF012345678B", "legacy-µ"];
+    for (const spanId of ids) {
+      const body = makeSingleSpanTrace(T, spanId, "synthetic-uppercase", "18446744073709551615", "18446744073709551615");
+      const post = await SELF.fetch("https://x/v1/traces?tenant_id=personal",{method:"POST",headers:{Authorization:BEARER,"Content-Type":"application/json"},body:JSON.stringify(body)});
+      expect(post.status).toBe(200);
+    }
+    let cursor: string | null = null; const found: string[] = [];
+    for (let i=0; i<3; i++) {
+      const response = await SELF.fetch(`https://x/v1/query?tenant_id=personal&op=trace&trace_id=${T}&page=1&limit=1${cursor ? `&cursor=${cursor}` : ""}`,{headers:{Authorization:BEARER}});
+      expect(response.status).toBe(200);
+      const page = await response.json() as {rows:Array<{span_id:string}>;next_cursor:string|null};
+      found.push(page.rows[0].span_id); cursor=page.next_cursor;
+    }
+    expect(found).toEqual(ids); expect(cursor).toBeNull();
+  });
+});

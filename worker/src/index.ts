@@ -1,5 +1,5 @@
 import { flatten } from "./otlp.js";
-import { insertSpans, traces, trace, spans, stats } from "./d1.js";
+import { insertSpans, traces, trace, tracePage, spans, stats } from "./d1.js";
 import type { Env } from "./d1.js";
 import { authenticate, ID_PATTERN } from "./auth.js";
 import { ClientError, jsonResponse, readJson } from "./http.js";
@@ -73,7 +73,11 @@ export default {
 
         if (op === "trace") {
           const trace_id = url.searchParams.get("trace_id") ?? "";
-          const result = await trace(env, tenantId, trace_id);
+          const page = url.searchParams.get("page");
+          if (page !== null && page !== "1") throw new ClientError(400, "Invalid page mode");
+          const result = page === "1"
+            ? await tracePage(env, tenantId, trace_id, url.searchParams.get("cursor"), url.searchParams.get("limit"))
+            : await trace(env, tenantId, trace_id);
           return jsonResponse(result);
         }
 

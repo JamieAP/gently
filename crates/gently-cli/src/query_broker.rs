@@ -239,6 +239,8 @@ async fn forward(
                     | "until"
                     | "limit"
                     | "order"
+                    | "page"
+                    | "cursor"
             ),
             "unsupported query parameter"
         );

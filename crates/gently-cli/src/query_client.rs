@@ -81,6 +81,21 @@ impl SpanRow {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TraceResponse {
+    Page(TracePage),
+    Legacy(Vec<SpanRow>),
+}
+#[derive(Deserialize)]
+struct TracePage {
+    rows: Vec<SpanRow>,
+    next_cursor: Option<String>,
+    complete: bool,
+}
+const MAX_TRACE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_TRACE_ROWS: usize = 100_000;
+
 /// Per-tool rollup from `op=stats`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolStat {
@@ -282,9 +297,61 @@ impl QueryClient {
     }
 
     pub async fn trace(&self, trace_id: &str) -> Result<Vec<SpanRow>> {
-        let mut rows: Vec<SpanRow> = self
-            .get(&[("op", "trace".into()), ("trace_id", trace_id.to_string())])
-            .await?;
+        let mut rows = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut cursors = std::collections::BTreeSet::new();
+        let mut spans = std::collections::BTreeSet::new();
+        let mut bytes = 0usize;
+        loop {
+            let mut params = vec![
+                ("op", "trace".into()),
+                ("trace_id", trace_id.into()),
+                ("page", "1".into()),
+            ];
+            if let Some(cursor) = &cursor {
+                params.push(("cursor", cursor.clone()));
+            }
+            let response: TraceResponse = self.get(&params).await?;
+            let page = match response {
+                TraceResponse::Page(page) => page,
+                TraceResponse::Legacy(rows) => TracePage {
+                    rows,
+                    next_cursor: None,
+                    complete: true,
+                },
+            };
+            anyhow::ensure!(
+                page.complete == page.next_cursor.is_none(),
+                "inconsistent trace pagination response"
+            );
+            anyhow::ensure!(
+                page.complete || !page.rows.is_empty(),
+                "empty unfinished trace page"
+            );
+            for row in page.rows {
+                anyhow::ensure!(
+                    row.trace_id == trace_id,
+                    "collector returned a different trace"
+                );
+                anyhow::ensure!(
+                    spans.insert(row.span_id.clone()),
+                    "trace changed during pagination; repeat the query"
+                );
+                bytes = bytes.saturating_add(serde_json::to_vec(&row)?.len());
+                anyhow::ensure!(bytes <= MAX_TRACE_BYTES && rows.len() < MAX_TRACE_ROWS,
+                    "trace exceeds local assembly limits; use the collector cursor API for bounded pages");
+                rows.push(row);
+            }
+            if page.complete {
+                break;
+            }
+            let next = page.next_cursor.unwrap();
+            anyhow::ensure!(
+                next.len() <= 4096 && cursors.insert(next.clone()),
+                "invalid or repeated trace cursor"
+            );
+            cursor = Some(next);
+        }
         self.resolve_raw_values(&mut rows).await?;
         Ok(rows)
     }

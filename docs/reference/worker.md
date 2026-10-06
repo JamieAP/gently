@@ -259,3 +259,21 @@ describes exporter limits independently of database retention.
 [Routing and auth](https://github.com/JamieAP/gently/blob/main/worker/src/index.ts),
 [OTLP flattening](https://github.com/JamieAP/gently/blob/main/worker/src/otlp.ts), and
 [database operations](https://github.com/JamieAP/gently/blob/main/worker/src/d1.ts) define this API.
+
+## Bounded full-trace queries
+
+Use `op=trace&trace_id=TRACE_ID&page=1` for a page with `rows`, `next_cursor`
+and `complete`. `limit` accepts 1–100 (default 100). Follow `cursor=NEXT_CURSOR`
+until `complete` is true. Pages use numeric start time then span ID, so equal
+timestamps have stable ordering. Public cursor fields are validated against the
+requested tenant and trace; cursors are continuation positions, not credentials.
+All SQL queries retain authenticated tenant scope and global display bounds.
+
+D1 selects a conservative byte-bounded prefix before returning metadata rows;
+responses are capped at 2 MiB. A single oversized row receives HTTP 413. Legacy
+array queries return a complete bounded trace or HTTP 413 directing the caller
+to pagination. The CLI, waterfall and MCP reconstruct pages up to 100,000 rows
+or 32 MiB of encoded metadata, failing explicitly beyond those limits. An older
+collector's complete array response remains supported under HTTP response caps.
+Paging is a live view, not a snapshot: ingests or monotonic merges between pages
+can change results; query a settled trace again when completeness matters.
