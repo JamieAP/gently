@@ -170,7 +170,8 @@ fn tokenless_cli_and_mcp_query_through_unlocked_watcher() {
         .assert().success().get_output().stdout.clone();
     let response: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&output).lines().last().unwrap()).unwrap();
-    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    assert_eq!(response["result"]["content"][0]["text"], "[]");
     assert!(!String::from_utf8(output)
         .unwrap()
         .contains("synthetic-broker-token"));

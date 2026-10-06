@@ -124,6 +124,7 @@ fn mcp_metadata_handshake_does_not_unlock_or_require_an_opted_in_reader() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(messages.len(), 3);
+    assert_eq!(messages[2]["result"]["isError"], false);
     assert!(messages
         .iter()
         .all(|message| message.get("error").is_none()));
@@ -200,6 +201,10 @@ fn negotiation_ping_protocol_errors_and_tool_execution_errors() {
     for row in &rows[3..8] {
         assert_eq!(row["error"]["code"], -32602);
     }
+    assert!(rows[9]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("jq filter"));
     for row in &rows[8..] {
         assert_eq!(row["result"]["isError"], true);
         assert!(row.get("error").is_none());
@@ -243,4 +248,16 @@ fn invalid_envelopes_preserve_detected_integer_or_string_ids() {
     assert_eq!(rows[1]["id"], "correlate");
     assert!(rows[2]["id"].is_null());
     assert!(rows.iter().all(|row| row["error"]["code"] == -32600));
+}
+
+#[test]
+fn lifecycle_gates_tools_until_initialized_and_allows_early_ping() {
+    let init = handshake().lines().next().unwrap().to_owned();
+    let input = format!("{{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"ping\"}}\n{{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/list\"}}\n{init}\n{{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/list\"}}\n{init}\n{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}}\n{{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/list\"}}\n");
+    let rows = run_messages(input);
+    assert_eq!(rows[0]["result"], serde_json::json!({}));
+    assert_eq!(rows[1]["error"]["code"], -32600);
+    assert_eq!(rows[3]["error"]["code"], -32600);
+    assert_eq!(rows[4]["error"]["message"], "Already initialized");
+    assert!(rows[5]["result"]["tools"].is_array());
 }

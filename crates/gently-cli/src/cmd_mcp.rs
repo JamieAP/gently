@@ -9,7 +9,7 @@
 use crate::config::Config;
 use crate::mcp_jq;
 use crate::query_client::{QueryClient, SpanFilters, TraceFilters};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::io::{BufRead, Write};
@@ -33,7 +33,26 @@ fn stdin_lock() -> std::io::StdinLock<'static> {
 }
 
 #[derive(Debug)]
-struct RpcError(i32, &'static str);
+struct RpcError(i32, String);
+fn rpc_failure(code: i32, message: impl Into<String>) -> RpcError {
+    RpcError(code, message.into())
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ToolFailure {
+    #[error("Local jq filter failed; correct the filter syntax or operation.")]
+    Filter,
+}
+fn tool_failure(error: &anyhow::Error) -> String {
+    if let Some(error) = error.downcast_ref::<ToolFailure>() {
+        return error.to_string();
+    }
+    if let Some(error) = error.downcast_ref::<crate::query_client::QueryFailure>() {
+        return error.to_string();
+    }
+    "Collector query failed; check collector availability, authorization and query arguments."
+        .into()
+}
 
 fn valid_id(id: &Value) -> bool {
     id.is_string() || id.as_i64().is_some() || id.as_u64().is_some()
@@ -86,7 +105,7 @@ fn serve(
         let response = match crate::json_fidelity::parse_bytes(&bytes) {
             Err(_) => Some(rpc_error(
                 Value::Null,
-                RpcError(-32700, "Invalid or oversized JSON frame"),
+                rpc_failure(-32700, "Invalid or oversized JSON frame"),
             )),
             Ok(req) => {
                 let id = req.get("id").cloned().unwrap_or(Value::Null);
@@ -97,7 +116,7 @@ fn serve(
                 {
                     Some(rpc_error(
                         if valid_id(&id) { id } else { Value::Null },
-                        RpcError(-32600, "Invalid JSON-RPC request"),
+                        rpc_failure(-32600, "Invalid JSON-RPC request"),
                     ))
                 } else {
                     let method = req["method"].as_str().unwrap();
@@ -109,9 +128,9 @@ fn serve(
                         None
                     } else {
                         let result = if method == "initialize" && negotiated {
-                            Err(RpcError(-32600, "Already initialized"))
+                            Err(rpc_failure(-32600, "Already initialized"))
                         } else if !initialized && !matches!(method, "initialize" | "ping") {
-                            Err(RpcError(-32600, "Initialize the MCP session first"))
+                            Err(rpc_failure(-32600, "Initialize the MCP session first"))
                         } else {
                             handle(method, &params, client, runtime)
                         };
@@ -143,7 +162,7 @@ fn handle(
     rt: &tokio::runtime::Runtime,
 ) -> std::result::Result<Value, RpcError> {
     if !params.is_object() {
-        return Err(RpcError(-32602, "Expected object parameters"));
+        return Err(rpc_failure(-32602, "Expected object parameters"));
     }
     match method {
         "initialize" => {
@@ -163,7 +182,7 @@ fn handle(
                     .and_then(Value::as_str)
                     .is_none()
             {
-                return Err(RpcError(-32602, "Missing initialization fields"));
+                return Err(rpc_failure(-32602, "Missing initialization fields"));
             }
             Ok(json!({
                 "protocolVersion": PROTOCOL_VERSION,
@@ -173,56 +192,100 @@ fn handle(
         }
         "ping" => Ok(json!({})),
         "tools/list" if params.get("cursor").is_some() => {
-            Err(RpcError(-32602, "No tool-list cursor is available"))
+            Err(rpc_failure(-32602, "No tool-list cursor is available"))
         }
         "tools/list" => Ok(json!({"tools": tool_specs()})),
         "tools/call" => {
             validate_tool(params)?;
             // Execution errors belong in CallToolResult, not JSON-RPC errors. Do
             // not expose collector URLs, credentials, payloads or filter source.
-            Ok(call_tool(params, client, rt).unwrap_or_else(|_| json!({
-                "isError": true,
-                "content": [{"type": "text", "text": "Tool query or local filter failed; check local collector health and arguments."}]
-            })))
+            Ok(call_tool(params, client, rt).unwrap_or_else(|error| {
+                json!({
+                    "isError": true,
+                    "content": [{"type": "text", "text": tool_failure(&error)}]
+                })
+            }))
         }
-        _ => Err(RpcError(-32601, "Method not found")),
+        _ => Err(rpc_failure(-32601, "Method not found")),
     }
+}
+
+// JSON Schema accepts decimal/exponent spellings of integers. Inspect the
+// preserved number before converting bounded limits; f64 can round a fraction.
+fn exact_integer(value: &Value) -> bool {
+    let Some(number) = value.as_number() else {
+        return false;
+    };
+    let text = number.to_string();
+    let (mantissa, exponent) = match text.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => {
+            let Ok(exponent) = exponent.parse::<i64>() else {
+                return false;
+            };
+            (mantissa, exponent)
+        }
+        None => (text.as_str(), 0),
+    };
+    let fraction = mantissa
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.len());
+    let Some(scale) = exponent.checked_sub(fraction as i64) else {
+        return false;
+    };
+    if scale >= 0 {
+        return true;
+    }
+    let digits = mantissa.bytes().filter(u8::is_ascii_digit).rev();
+    digits
+        .take(scale.unsigned_abs().min(usize::MAX as u64) as usize)
+        .all(|digit| digit == b'0')
 }
 
 fn validate_tool(params: &Value) -> std::result::Result<(), RpcError> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
-        .ok_or(RpcError(-32602, "Missing tool name"))?;
+        .ok_or(rpc_failure(-32602, "Missing tool name"))?;
     let specs = tool_specs();
     let spec = specs
         .as_array()
         .unwrap()
         .iter()
         .find(|v| v["name"] == name)
-        .ok_or(RpcError(-32602, "Unknown tool"))?;
+        .ok_or(rpc_failure(-32602, "Unknown tool"))?;
     let empty = json!({});
     let args = params
         .get("arguments")
         .unwrap_or(&empty)
         .as_object()
-        .ok_or(RpcError(-32602, "Expected object arguments"))?;
+        .ok_or(rpc_failure(-32602, "Expected object arguments"))?;
     let schema = &spec["inputSchema"];
     if let Some(required) = schema.get("required").and_then(Value::as_array) {
         for key in required {
             if !args.contains_key(key.as_str().unwrap()) {
-                return Err(RpcError(-32602, "Missing required tool argument"));
+                return Err(rpc_failure(-32602, "Missing required tool argument"));
             }
         }
     }
     for (key, value) in args {
         let property = schema["properties"]
             .get(key)
-            .ok_or(RpcError(-32602, "Unknown tool argument"))?;
+            .ok_or(rpc_failure(-32602, "Unknown tool argument"))?;
         let valid = match property["type"].as_str() {
             Some("string") => value.as_str().is_some(),
-            Some("integer") => value.as_u64().is_some_and(|v| (1..=1000).contains(&v)),
-            _ => false,
+            Some("integer") => value.as_f64().is_some_and(|v| {
+                v.is_finite()
+                    && exact_integer(value)
+                    && property
+                        .get("minimum")
+                        .and_then(Value::as_f64)
+                        .is_none_or(|min| v >= min)
+                    && property
+                        .get("maximum")
+                        .and_then(Value::as_f64)
+                        .is_none_or(|max| v <= max)
+            }),
+            _ => return Err(rpc_failure(-32603, "Unsupported tool schema")),
         };
         if !valid
             || property
@@ -230,7 +293,18 @@ fn validate_tool(params: &Value) -> std::result::Result<(), RpcError> {
                 .and_then(Value::as_array)
                 .is_some_and(|v| !v.contains(value))
         {
-            return Err(RpcError(-32602, "Invalid tool argument"));
+            let expected = match property["type"].as_str() {
+                Some("integer") => format!(
+                    "integer from {} to {}",
+                    property["minimum"], property["maximum"]
+                ),
+                _ if property.get("enum").is_some() => format!("one of {}", property["enum"]),
+                _ => "string".into(),
+            };
+            return Err(rpc_failure(
+                -32602,
+                format!("Invalid {key}: expected {expected}"),
+            ));
         }
     }
     Ok(())
@@ -247,7 +321,7 @@ fn call_tool(params: &Value, client: &QueryClient, rt: &tokio::runtime::Runtime)
     let payload: Value = match name {
         "list_traces" | "sessions" => {
             let f = TraceFilters {
-                limit: args.get("limit").and_then(Value::as_u64).map(|v| v as u32),
+                limit: args.get("limit").and_then(Value::as_f64).map(|v| v as u32),
                 harness: str_arg(&args, "harness"),
                 session_id: str_arg(&args, "session_id"),
                 since: str_arg(&args, "since"),
@@ -274,7 +348,7 @@ fn call_tool(params: &Value, client: &QueryClient, rt: &tokio::runtime::Runtime)
                 kind: str_arg(&args, "kind"),
                 since: str_arg(&args, "since"),
                 until: str_arg(&args, "until"),
-                limit: args.get("limit").and_then(Value::as_u64).map(|v| v as u32),
+                limit: args.get("limit").and_then(Value::as_f64).map(|v| v as u32),
                 order: str_arg(&args, "order"),
             };
             serde_json::to_value(rt.block_on(client.spans(&f))?)?
@@ -292,7 +366,7 @@ fn call_tool(params: &Value, client: &QueryClient, rt: &tokio::runtime::Runtime)
                 kind: str_arg(&args, "kind"),
                 since: str_arg(&args, "since"),
                 until: str_arg(&args, "until"),
-                limit: args.get("limit").and_then(Value::as_u64).map(|v| v as u32),
+                limit: args.get("limit").and_then(Value::as_f64).map(|v| v as u32),
                 order: str_arg(&args, "order"),
             };
             let rows = rt.block_on(client.spans(&f))?;
@@ -300,7 +374,7 @@ fn call_tool(params: &Value, client: &QueryClient, rt: &tokio::runtime::Runtime)
         }
         other => anyhow::bail!("unknown tool: {other}"),
     };
-    let payload = mcp_jq::apply(payload, jq.as_deref())?;
+    let payload = mcp_jq::apply(payload, jq.as_deref()).context(ToolFailure::Filter)?;
 
     // MCP tool results return content blocks; embed the JSON as text.
     Ok(json!({
@@ -485,4 +559,68 @@ fn tool_specs() -> Value {
             }}
         }
     ])
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    #[test]
+    fn shipped_schemas_use_supported_types_and_enforce_their_own_bounds() {
+        for spec in tool_specs().as_array().unwrap() {
+            for property in spec["inputSchema"]["properties"]
+                .as_object()
+                .unwrap()
+                .values()
+            {
+                assert!(
+                    matches!(property["type"].as_str(), Some("string" | "integer")),
+                    "add explicit validation for new schema types"
+                );
+            }
+        }
+        for (value, valid) in [
+            (json!(1), true),
+            (json!(5.0), true),
+            (json!(1000), true),
+            (json!(0), false),
+            (json!(1001), false),
+            (json!(1.5), false),
+        ] {
+            assert_eq!(
+                validate_tool(&json!({"name":"search_spans","arguments":{"limit":value}})).is_ok(),
+                valid
+            );
+        }
+    }
+    #[test]
+    fn integer_schema_uses_preserved_decimal_not_rounded_f64() {
+        for (number, valid) in [
+            ("1.00000000000000001", false),
+            ("1000.00000000000000001", false),
+            ("5.0", true),
+            ("5e0", true),
+            ("0.5e1", true),
+            ("1e-100", false),
+            ("0e-100", false),
+        ] {
+            let params = crate::json_fidelity::parse(&format!(
+                r#"{{"name":"search_spans","arguments":{{"limit":{number}}}}}"#
+            ))
+            .unwrap();
+            assert_eq!(validate_tool(&params).is_ok(), valid, "{number}");
+        }
+    }
+    #[test]
+    fn fixed_tool_failures_do_not_echo_error_chains() {
+        let private = "synthetic-private-error-canary";
+        for error in [
+            anyhow::anyhow!(private),
+            anyhow::anyhow!(private).context(ToolFailure::Filter),
+            anyhow::anyhow!(private).context(crate::query_client::QueryFailure::RawBudget),
+            anyhow::anyhow!(private).context(crate::query_client::QueryFailure::ReaderUnavailable),
+            anyhow::anyhow!(private).context(crate::query_client::QueryFailure::WatcherUnavailable),
+        ] {
+            assert!(!tool_failure(&error).contains(private));
+        }
+    }
 }

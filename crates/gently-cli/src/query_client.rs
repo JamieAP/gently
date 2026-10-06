@@ -143,12 +143,25 @@ impl Drop for CachedRawPayload {
     }
 }
 
+/// Closed safe categories for callers that must not expose error chains.
+#[derive(Debug, thiserror::Error)]
+pub enum QueryFailure {
+    #[error("raw resolution exceeds the 8 MiB budget; narrow your query")]
+    RawBudget,
+    #[error("Reader identity is unavailable; configure or unlock an enrolled reader.")]
+    ReaderUnavailable,
+    #[error(
+        "Local query watcher failed; restart the unlocked watcher and check collector health."
+    )]
+    WatcherUnavailable,
+}
+
 const MAX_RAW_QUERY_BYTES: usize = 8 * 1024 * 1024;
 fn account_raw_query_bytes(bytes: &mut usize, added: usize) -> Result<()> {
     *bytes = bytes
         .checked_add(added)
         .filter(|total| *total <= MAX_RAW_QUERY_BYTES)
-        .context("raw resolution exceeds the 8 MiB budget; narrow your query")?;
+        .context(QueryFailure::RawBudget)?;
     Ok(())
 }
 
@@ -223,7 +236,8 @@ impl QueryClient {
                 params,
                 self.timeout,
             )
-            .await;
+            .await
+            .context(QueryFailure::WatcherUnavailable);
         }
         self.collector.query(params).await
     }
@@ -238,7 +252,8 @@ impl QueryClient {
                 &[("op", "raw".into()), ("raw_ref", reference.into())],
                 self.timeout,
             )
-            .await;
+            .await
+            .context(QueryFailure::WatcherUnavailable);
         }
         self.collector.fetch_raw(reference).await
     }
@@ -248,14 +263,16 @@ impl QueryClient {
             let path = self
                 .raw_identity_path
                 .as_deref()
-                .context("raw resolution requires an explicit reader identity")?;
-            gently_store::private_fs::harden_existing_file(path)?;
-            let identities = gently_raw::load_identities(path)?;
+                .context(QueryFailure::ReaderUnavailable)?;
+            gently_store::private_fs::harden_existing_file(path)
+                .context(QueryFailure::ReaderUnavailable)?;
+            let identities =
+                gently_raw::load_identities(path).context(QueryFailure::ReaderUnavailable)?;
             let _ = self.raw_identities.set(identities);
         }
         self.raw_identities
             .get()
-            .context("reader identity unavailable")
+            .context(QueryFailure::ReaderUnavailable)
     }
 
     pub async fn traces(&self, f: &TraceFilters) -> Result<Vec<TraceSummary>> {
