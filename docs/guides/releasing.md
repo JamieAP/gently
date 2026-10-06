@@ -77,8 +77,11 @@ against a different tree does not close the release-candidate gate.
 
 Audit locked Rust and Node dependencies, including development/test tooling.
 Document advisory reachability and fix or explicitly review every unresolved
-finding before a v1 tag. Do not run blanket force upgrades. The Worker tooling
-audit is an open release task until patched versions and acceptance pass.
+finding before a v1 tag. Do not run blanket force upgrades. CI audits the locked
+Worker and docs npm dependencies and fails on any advisory without a reviewed
+exception in that project's `audit-allowlist.json`; each exception records its
+reachability and expires within 90 days (see CONTRIBUTING). The locked Rust audit
+(`cargo audit` or `cargo deny`) is still an open release task.
 
 Release artifacts need a version matching the tag, an exact reviewed source
 commit, supported OS/architecture labels, checksums, build provenance, recovery
