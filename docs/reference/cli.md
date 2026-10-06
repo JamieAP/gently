@@ -252,3 +252,15 @@ Tools, examples, local `jq` behavior, and raw-value resolution are documented in
 
 [Command parsing](https://github.com/JamieAP/gently/blob/main/crates/gently-cli/src/main.rs) and
 [query rendering](https://github.com/JamieAP/gently/blob/main/crates/gently-cli/src/cmd_query.rs) define this interface.
+
+## `gently state` and `gently uninstall`
+
+`state backup PATH` creates a consistent owner-only namespace-pinned backup,
+including live WAL state; `state restore PATH` accepts supported encrypted backups
+into a missing database in the same tenant/device namespace. Both operate without
+unlocking a reader. Backups contain private metadata and require private storage.
+
+`uninstall --codex` and `uninstall --claude` remove only the current executable's
+exact managed registrations, preserving custom hooks, state and keys. Use the
+installed executable before removing its binary. See
+[installation and recovery](../guides/installation-and-recovery.md).

@@ -68,6 +68,215 @@ pub fn run_claude(resolve_raw_values: bool) -> Result<()> {
     Ok(())
 }
 
+/// Remove exact registrations for this executable; preserve state, policy,
+/// identities, user wrappers, preferences and unknown harness configuration.
+pub fn run_uninstall(codex: bool) -> Result<()> {
+    let home = dirs::home_dir().context("cannot determine home directory")?;
+    let exe = std::env::current_exe().context("cannot resolve executable")?;
+    let commands: Vec<_> = [shell_quote(&exe), legacy_shell_quote(&exe)]
+        .into_iter()
+        .flat_map(|quoted| {
+            [
+                format!("{quoted} hook"),
+                format!("{quoted} hook --harness codex"),
+            ]
+        })
+        .collect();
+    match codex {
+        true => uninstall_codex(&home, &exe, &commands)?,
+        false => uninstall_claude(&home, &exe, &commands)?,
+    }
+    eprintln!("gently: removed exact managed registrations; retained local state, policy, keys and user configuration. Restart the coding agent.");
+    Ok(())
+}
+
+fn uninstall_codex(home: &Path, exe: &Path, commands: &[String]) -> Result<()> {
+    let path = home.join(".codex/config.toml");
+    let legacy_path = home.join(".codex/hooks.json");
+    // Stage and validate all selected files before publishing any edit.
+    let mut doc = path.exists().then(|| read_toml_doc(&path)).transpose()?;
+    let mut legacy = legacy_path
+        .exists()
+        .then(|| read_json(&legacy_path))
+        .transpose()?;
+    let changed = doc
+        .as_mut()
+        .map(|doc| remove_codex_registrations(doc, exe, commands))
+        .transpose()?
+        .unwrap_or(false);
+    let legacy_changed = legacy
+        .as_mut()
+        .map(|config| remove_json_hooks(config, commands))
+        .transpose()?
+        .unwrap_or(false);
+    if changed {
+        write_toml_doc(&path, doc.as_ref().unwrap())?;
+    }
+    if legacy_changed {
+        write_json(&legacy_path, legacy.as_ref().unwrap())?;
+    }
+    Ok(())
+}
+
+fn uninstall_claude(home: &Path, exe: &Path, commands: &[String]) -> Result<()> {
+    let settings = home.join(".claude/settings.json");
+    let mcp = home.join(".claude.json");
+    let mut config = mcp.exists().then(|| read_json(&mcp)).transpose()?;
+    let mut hooks = settings
+        .exists()
+        .then(|| read_json(&settings))
+        .transpose()?;
+    if let Some(config) = config.as_mut() {
+        config
+            .as_object_mut()
+            .context("MCP configuration must be an object")?;
+    }
+    let mcp_changed = match config
+        .as_mut()
+        .and_then(|config| config.get_mut("mcpServers"))
+    {
+        None => false,
+        Some(servers) => {
+            let servers = servers
+                .as_object_mut()
+                .context("MCP servers must be an object")?;
+            match servers.get("gently") {
+                Some(server)
+                    if server["command"] == exe.to_string_lossy().as_ref()
+                        && server["args"] == json!(["mcp"]) =>
+                {
+                    servers.remove("gently");
+                    true
+                }
+                _ => false,
+            }
+        }
+    };
+    let hooks_changed = hooks
+        .as_mut()
+        .map(|config| remove_json_hooks(config, commands))
+        .transpose()?
+        .unwrap_or(false);
+    if hooks_changed {
+        write_json(&settings, hooks.as_ref().unwrap())?;
+    }
+    if mcp_changed {
+        write_json(&mcp, config.as_ref().unwrap())?;
+    }
+    Ok(())
+}
+
+fn remove_codex_registrations(
+    doc: &mut DocumentMut,
+    exe: &Path,
+    commands: &[String],
+) -> Result<bool> {
+    let mut changed = false;
+    if let Some(hooks) = doc.get_mut("hooks") {
+        for (_, groups) in require_table(hooks, "hooks")?.iter_mut() {
+            let groups = require_groups(groups, "hook groups")?;
+            // Retain empty user groups; remove only groups emptied by us.
+            let mut emptied = Vec::new();
+            for (index, group) in groups.iter_mut().enumerate() {
+                if let Some(handlers) = group.get_mut("hooks") {
+                    let handlers = require_groups(handlers, "hook handlers")?;
+                    let before = handlers.len();
+                    handlers.retain(|handler| !managed_toml_handler(handler, commands));
+                    if handlers.len() != before {
+                        changed = true;
+                        if handlers.is_empty() && group.len() == 1 {
+                            emptied.push(index);
+                        }
+                    }
+                }
+            }
+            for index in emptied.into_iter().rev() {
+                groups.remove(index);
+            }
+        }
+    }
+    if let Some(servers) = doc.get_mut("mcp_servers") {
+        let servers = require_table(servers, "mcp_servers")?;
+        if servers.get("gently").is_some_and(|server| {
+            server.get("command").and_then(Item::as_str) == Some(exe.to_string_lossy().as_ref())
+                && server
+                    .get("args")
+                    .and_then(Item::as_array)
+                    .is_some_and(|args| {
+                        args.len() == 1
+                            && args.get(0).and_then(toml_edit::Value::as_str) == Some("mcp")
+                    })
+        }) {
+            servers.remove("gently");
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+fn managed_toml_handler(handler: &Table, commands: &[String]) -> bool {
+    handler.get("commandWindows").is_none()
+        && handler.get("command_windows").is_none()
+        && handler.get("type").and_then(Item::as_str) == Some("command")
+        && handler
+            .get("command")
+            .and_then(Item::as_str)
+            .is_some_and(|command| commands.iter().any(|owned| owned == command))
+}
+fn remove_json_hooks(config: &mut Value, commands: &[String]) -> Result<bool> {
+    config
+        .as_object_mut()
+        .context("hook configuration must be an object")?;
+    let mut changed = false;
+    if let Some(hooks) = config.get_mut("hooks") {
+        for groups in hooks
+            .as_object_mut()
+            .context("hooks must be an object")?
+            .values_mut()
+        {
+            let groups = groups
+                .as_array_mut()
+                .context("hook groups must be an array")?;
+            let mut emptied = Vec::new();
+            for (index, group) in groups.iter_mut().enumerate() {
+                group
+                    .as_object_mut()
+                    .context("hook group must be an object")?;
+                if let Some(handlers) = group.get_mut("hooks") {
+                    let handlers = handlers
+                        .as_array_mut()
+                        .context("hook handlers must be an array")?;
+                    for handler in handlers.iter() {
+                        handler
+                            .as_object()
+                            .context("hook handler must be an object")?;
+                    }
+                    let before = handlers.len();
+                    handlers.retain(|handler| {
+                        !(handler.get("commandWindows").is_none()
+                            && handler.get("command_windows").is_none()
+                            && handler["type"] == "command"
+                            && handler["command"].as_str().is_some_and(|command| {
+                                commands.iter().any(|owned| owned == command)
+                            }))
+                    });
+                    if before != handlers.len() {
+                        changed = true;
+                        if handlers.is_empty()
+                            && group.as_object().is_some_and(|group| group.len() == 1)
+                        {
+                            emptied.push(index);
+                        }
+                    }
+                }
+            }
+            for index in emptied.into_iter().rev() {
+                groups.remove(index);
+            }
+        }
+    }
+    Ok(changed)
+}
+
 /// Write a config template if none exists. Never overwrites an existing config.
 fn scaffold_config(cfg: &Config) -> Result<()> {
     let path = cfg.state_dir.join("config.toml");

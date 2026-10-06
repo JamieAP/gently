@@ -11,6 +11,7 @@
 //! locked" errors. A down collector simply means the outbox grows and the next
 //! exporter run retries - the durability that makes the pipeline self-healing.
 
+mod backup;
 mod health;
 mod open_spans;
 mod outbox;
@@ -37,6 +38,10 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("incompatible development state schema; stop Gently and explicitly reset its state database before continuing")]
     IncompatibleSchema,
+    #[error("invalid or incompatible encrypted-state backup")]
+    InvalidBackup,
+    #[error("backup tenant/device differs from the configured local namespace")]
+    BackupNamespace,
     #[error("invalid encrypted raw object")]
     InvalidRawObject,
     #[error("encrypted raw reference already names a different object")]

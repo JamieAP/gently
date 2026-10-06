@@ -7,6 +7,7 @@ mod cmd_init;
 mod cmd_mcp;
 mod cmd_query;
 mod cmd_raw;
+mod cmd_state;
 mod cmd_status;
 mod collector;
 mod config;
@@ -66,6 +67,18 @@ enum Command {
         /// Retry retained ciphertext previously rejected by the collector.
         #[arg(long)]
         retry_raw_quarantine: bool,
+    },
+    /// Back up or restore encrypted local state without unlocking a reader.
+    State {
+        #[command(subcommand)]
+        command: cmd_state::StateCommand,
+    },
+    /// Remove only this executable's managed hooks and MCP registrations.
+    Uninstall {
+        #[arg(long, required_unless_present = "codex", conflicts_with = "codex")]
+        claude: bool,
+        #[arg(long, required_unless_present = "claude", conflicts_with = "claude")]
+        codex: bool,
     },
     /// Manage encrypted raw-value reader enrollment and public trust policy.
     Raw {
@@ -203,6 +216,8 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
                 cmd_export::run(preserve_backlog, retry_raw_quarantine)
             }
         }
+        Command::State { command } => cmd_state::run(command),
+        Command::Uninstall { codex, .. } => cmd_init::run_uninstall(codex),
         Command::Raw { command } => cmd_raw::run(command),
         Command::Status => cmd_status::run(),
         Command::Config { check, .. } => {
