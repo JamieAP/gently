@@ -259,3 +259,39 @@ fn uninstall_refuses_invalid_selected_json_shapes_before_other_edits() {
         }
     }
 }
+
+#[test]
+fn malformed_selected_mcp_entries_preserve_installed_hooks() {
+    for harness in ["--codex", "--claude"] {
+        let home = tempfile::tempdir().unwrap();
+        command(home.path())
+            .args(["init", harness])
+            .assert()
+            .success();
+        let hooks = home.path().join(if harness == "--codex" {
+            ".codex/config.toml"
+        } else {
+            ".claude/settings.json"
+        });
+        if harness == "--codex" {
+            let mut doc: toml_edit::DocumentMut =
+                std::fs::read_to_string(&hooks).unwrap().parse().unwrap();
+            doc["mcp_servers"]["invalid"] = toml_edit::value("synthetic-invalid");
+            let contents = doc.to_string();
+            let _: toml::Value = toml::from_str(&contents).unwrap();
+            std::fs::write(&hooks, contents).unwrap();
+        } else {
+            std::fs::write(
+                home.path().join(".claude.json"),
+                br#"{"mcpServers":{"invalid":"synthetic-invalid"}}"#,
+            )
+            .unwrap();
+        }
+        let before = std::fs::read(&hooks).unwrap();
+        command(home.path())
+            .args(["uninstall", harness])
+            .assert()
+            .failure();
+        assert_eq!(std::fs::read(&hooks).unwrap(), before);
+    }
+}

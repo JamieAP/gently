@@ -140,6 +140,9 @@ fn uninstall_claude(home: &Path, exe: &Path, commands: &[String]) -> Result<()> 
             let servers = servers
                 .as_object_mut()
                 .context("MCP servers must be an object")?;
+            for server in servers.values() {
+                server.as_object().context("MCP server must be an object")?;
+            }
             match servers.get("gently") {
                 Some(server)
                     if server["command"] == exe.to_string_lossy().as_ref()
@@ -197,6 +200,11 @@ fn remove_codex_registrations(
     }
     if let Some(servers) = doc.get_mut("mcp_servers") {
         let servers = require_table(servers, "mcp_servers")?;
+        for (_, server) in servers.iter() {
+            server
+                .as_table_like()
+                .context("MCP server must be a table")?;
+        }
         if servers.get("gently").is_some_and(|server| {
             server.get("command").and_then(Item::as_str) == Some(exe.to_string_lossy().as_ref())
                 && server
