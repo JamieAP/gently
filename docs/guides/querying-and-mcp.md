@@ -224,7 +224,8 @@ chain.
 Messages are newline-delimited and limited to 1 MiB per input frame. Malformed or
 oversized frames receive a parse error (`-32700`) and are drained before reading
 the next frame. Well-formed JSON with an invalid RPC envelope receives
-`-32600`. Error messages omit private payloads, URLs and filter source.
+`-32600`. Notifications and client responses (the server sends no requests)
+receive no reply. Error messages omit private payloads, URLs and filter source.
 
 See the [MCP lifecycle](https://modelcontextprotocol.io/specification/2025-06-18/basic/lifecycle)
 and [tool error contract](https://modelcontextprotocol.io/specification/2025-06-18/server/tools).

@@ -266,3 +266,22 @@ fn lifecycle_gates_tools_until_initialized_and_allows_early_ping() {
     assert_eq!(rows[4]["error"]["message"], "Already initialized");
     assert!(rows[5]["result"]["tools"].is_array());
 }
+
+#[test]
+fn client_responses_are_ignored_without_a_reply() {
+    let responses = concat!(
+        r#"{"jsonrpc":"2.0","id":4,"result":{}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":5,"error":{"code":-32603,"message":"synthetic"}}"#,
+        "\n",
+    );
+    let input = format!(
+        "{responses}{}{responses}{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}}\n",
+        handshake()
+    );
+    let rows = run_messages(input);
+    assert_eq!(rows.len(), 2, "replies only to initialize and ping");
+    assert_eq!(rows[0]["result"]["serverInfo"]["name"], "gently");
+    assert_eq!(rows[1]["id"], 2);
+    assert_eq!(rows[1]["result"], serde_json::json!({}));
+}

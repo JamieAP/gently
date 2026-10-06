@@ -97,63 +97,138 @@ fn serve(
     client: &QueryClient,
     runtime: &tokio::runtime::Runtime,
 ) -> Result<()> {
-    let mut initialized = false;
-    let mut negotiated = false;
+    let mut lifecycle = Lifecycle::AwaitingInitialize;
     while let Some(bytes) = frame(&mut input)? {
-        if !bytes.is_empty() && bytes.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        let response = match crate::json_fidelity::parse_bytes(&bytes) {
-            Err(_) => Some(rpc_error(
-                Value::Null,
-                rpc_failure(-32700, "Invalid or oversized JSON frame"),
-            )),
-            Ok(req) => {
-                let id = req.get("id").cloned().unwrap_or(Value::Null);
-                if !req.is_object()
-                    || req.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
-                    || req.get("method").and_then(Value::as_str).is_none()
-                    || (req.get("id").is_some() && !valid_id(&id))
-                {
-                    Some(rpc_error(
-                        if valid_id(&id) { id } else { Value::Null },
-                        rpc_failure(-32600, "Invalid JSON-RPC request"),
-                    ))
-                } else {
-                    let method = req["method"].as_str().unwrap();
-                    let params = req.get("params").cloned().unwrap_or(json!({}));
-                    if req.get("id").is_none() {
-                        if method == "notifications/initialized" && negotiated {
-                            initialized = true;
-                        }
-                        None
-                    } else {
-                        let result = if method == "initialize" && negotiated {
-                            Err(rpc_failure(-32600, "Already initialized"))
-                        } else if !initialized && !matches!(method, "initialize" | "ping") {
-                            Err(rpc_failure(-32600, "Initialize the MCP session first"))
-                        } else {
-                            handle(method, &params, client, runtime)
-                        };
-                        match result {
-                            Ok(result) => {
-                                if method == "initialize" {
-                                    negotiated = true;
-                                }
-                                Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
-                            }
-                            Err(error) => Some(rpc_error(id, error)),
-                        }
-                    }
-                }
-            }
-        };
-        if let Some(response) = response {
-            writeln!(output, "{response}")?;
+        let reply;
+        (lifecycle, reply) = step(lifecycle, decode(&bytes), |method, params| {
+            handle(method, params, client, runtime)
+        });
+        if let Some(reply) = reply {
+            writeln!(output, "{reply}")?;
             output.flush()?;
         }
     }
     Ok(())
+}
+
+/// One stdio frame, classified before any lifecycle rule applies.
+#[derive(Debug, PartialEq)]
+enum Incoming {
+    /// A whitespace-only line between frames.
+    Blank,
+    /// Malformed JSON or an oversized frame; no id can be recovered.
+    Unparseable,
+    /// Well-formed JSON that is not a request; carries the id if it is valid.
+    Invalid(Value),
+    /// A response to a request this server never sent; JSON-RPC ignores it.
+    Response,
+    Notification(String),
+    Request {
+        id: Value,
+        method: String,
+        params: Value,
+    },
+}
+
+fn decode(bytes: &[u8]) -> Incoming {
+    if !bytes.is_empty() && bytes.iter().all(u8::is_ascii_whitespace) {
+        return Incoming::Blank;
+    }
+    let Ok(message) = crate::json_fidelity::parse_bytes(bytes) else {
+        return Incoming::Unparseable;
+    };
+    let versioned = message.get("jsonrpc").and_then(Value::as_str) == Some("2.0");
+    let method = message.get("method");
+    if versioned
+        && method.is_none()
+        && (message.get("result").is_some() || message.get("error").is_some())
+    {
+        return Incoming::Response;
+    }
+    match (versioned, method.and_then(Value::as_str), message.get("id")) {
+        (true, Some(method), None) => Incoming::Notification(method.into()),
+        (true, Some(method), Some(id)) if valid_id(id) => Incoming::Request {
+            id: id.clone(),
+            method: method.into(),
+            params: message.get("params").cloned().unwrap_or(json!({})),
+        },
+        (_, _, Some(id)) if valid_id(id) => Incoming::Invalid(id.clone()),
+        _ => Incoming::Invalid(Value::Null),
+    }
+}
+
+/// The MCP session lifecycle. Stdio shutdown is the client closing input,
+/// which ends `serve`, so it needs no state of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lifecycle {
+    AwaitingInitialize,
+    AwaitingInitialized,
+    Ready,
+}
+
+/// Every lifecycle rule, one per arm: the next state and the reply, if any.
+fn step(
+    lifecycle: Lifecycle,
+    incoming: Incoming,
+    handle: impl FnOnce(&str, &Value) -> std::result::Result<Value, RpcError>,
+) -> (Lifecycle, Option<Value>) {
+    use Incoming::*;
+    use Lifecycle::*;
+    match (lifecycle, incoming) {
+        (_, Blank | Response) => (lifecycle, None),
+        (_, Unparseable) => (
+            lifecycle,
+            Some(rpc_error(
+                Value::Null,
+                rpc_failure(-32700, "Invalid or oversized JSON frame"),
+            )),
+        ),
+        (_, Invalid(id)) => (
+            lifecycle,
+            Some(rpc_error(
+                id,
+                rpc_failure(-32600, "Invalid JSON-RPC request"),
+            )),
+        ),
+        (AwaitingInitialized, Notification(method)) if method == "notifications/initialized" => {
+            (Ready, None)
+        }
+        (_, Notification(_)) => (lifecycle, None),
+        (AwaitingInitialize, Request { id, method, params }) if method == "initialize" => {
+            match handle(&method, &params) {
+                Ok(result) => (AwaitingInitialized, Some(rpc_result(id, result))),
+                Err(error) => (AwaitingInitialize, Some(rpc_error(id, error))),
+            }
+        }
+        (_, Request { id, method, .. }) if method == "initialize" => (
+            lifecycle,
+            Some(rpc_error(id, rpc_failure(-32600, "Already initialized"))),
+        ),
+        (Ready, Request { id, method, params }) => {
+            (Ready, Some(rpc_reply(id, handle(&method, &params))))
+        }
+        (_, Request { id, method, params }) if method == "ping" => {
+            (lifecycle, Some(rpc_reply(id, handle(&method, &params))))
+        }
+        (_, Request { id, .. }) => (
+            lifecycle,
+            Some(rpc_error(
+                id,
+                rpc_failure(-32600, "Initialize the MCP session first"),
+            )),
+        ),
+    }
+}
+
+fn rpc_reply(id: Value, outcome: std::result::Result<Value, RpcError>) -> Value {
+    match outcome {
+        Ok(result) => rpc_result(id, result),
+        Err(error) => rpc_error(id, error),
+    }
+}
+
+fn rpc_result(id: Value, result: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
 
 fn handle(
@@ -694,5 +769,88 @@ mod schema_tests {
             message(json!({"trace_id": "t", "caller-chosen-key": 1})),
             "Unknown tool argument"
         );
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    fn dispatch(method: &str, _: &Value) -> std::result::Result<Value, RpcError> {
+        Ok(json!({ "handled": method }))
+    }
+    fn request(method: &str) -> Incoming {
+        Incoming::Request {
+            id: json!(7),
+            method: method.into(),
+            params: json!({}),
+        }
+    }
+    #[test]
+    fn lifecycle_rules_are_one_transition_each() {
+        use Lifecycle::*;
+        let initialized = || Incoming::Notification("notifications/initialized".into());
+        let code = |reply: Option<Value>| reply.unwrap()["error"]["code"].clone();
+        let handled = |reply: Option<Value>| reply.unwrap()["result"]["handled"].clone();
+
+        let (state, reply) = step(AwaitingInitialize, request("ping"), dispatch);
+        assert_eq!((state, handled(reply)), (AwaitingInitialize, json!("ping")));
+        let (state, reply) = step(AwaitingInitialize, request("tools/list"), dispatch);
+        assert_eq!((state, code(reply)), (AwaitingInitialize, json!(-32600)));
+        assert_eq!(
+            step(AwaitingInitialize, initialized(), dispatch),
+            (AwaitingInitialize, None)
+        );
+        let (state, reply) = step(AwaitingInitialize, request("initialize"), |_, _| {
+            Err(rpc_failure(-32602, "Missing initialization fields"))
+        });
+        assert_eq!((state, code(reply)), (AwaitingInitialize, json!(-32602)));
+        let (state, reply) = step(AwaitingInitialize, request("initialize"), dispatch);
+        assert_eq!(
+            (state, handled(reply)),
+            (AwaitingInitialized, json!("initialize"))
+        );
+
+        let (state, reply) = step(AwaitingInitialized, request("tools/list"), dispatch);
+        assert_eq!((state, code(reply)), (AwaitingInitialized, json!(-32600)));
+        assert_eq!(
+            step(AwaitingInitialized, initialized(), dispatch),
+            (Ready, None)
+        );
+
+        for state in [AwaitingInitialized, Ready] {
+            let (next, reply) = step(state, request("initialize"), dispatch);
+            assert_eq!(next, state);
+            assert_eq!(reply.unwrap()["error"]["message"], "Already initialized");
+        }
+        let (state, reply) = step(Ready, request("tools/list"), dispatch);
+        assert_eq!((state, handled(reply)), (Ready, json!("tools/list")));
+        assert_eq!(step(Ready, initialized(), dispatch), (Ready, None));
+        for state in [AwaitingInitialize, AwaitingInitialized, Ready] {
+            assert_eq!(step(state, Incoming::Response, dispatch), (state, None));
+            assert_eq!(step(state, Incoming::Blank, dispatch), (state, None));
+        }
+    }
+    #[test]
+    fn client_responses_decode_as_responses_and_malformed_envelopes_as_invalid() {
+        for message in [
+            r#"{"jsonrpc":"2.0","id":4,"result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"x"}}"#,
+        ] {
+            assert_eq!(decode(message.as_bytes()), Incoming::Response, "{message}");
+        }
+        for (message, id) in [
+            (r#"{"jsonrpc":"1.0","id":4,"result":{}}"#, json!(4)),
+            (r#"{"jsonrpc":"2.0","id":42,"method":false}"#, json!(42)),
+            (r#"{"jsonrpc":"2.0","id":1.5,"method":"ping"}"#, Value::Null),
+            ("[]", Value::Null),
+        ] {
+            assert_eq!(
+                decode(message.as_bytes()),
+                Incoming::Invalid(id),
+                "{message}"
+            );
+        }
+        assert_eq!(decode(b""), Incoming::Unparseable);
+        assert_eq!(decode(b" \r\n"), Incoming::Blank);
     }
 }
