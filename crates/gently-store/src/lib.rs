@@ -17,14 +17,13 @@ mod outbox;
 pub mod private_fs;
 mod raw_objects;
 
-pub use health::Health;
+pub use health::{Health, QuarantineSummary};
 pub use open_spans::OpenSpan;
 pub use raw_objects::RawObjectStats;
 
 use std::path::Path;
 
-/// Hard cap on buffered outbox rows; older rows are dropped beyond this so a
-/// long collector outage cannot grow the db without bound.
+/// Default opt-in trim threshold; normal export preserves the entire backlog.
 pub const OUTBOX_CAP: usize = 10_000;
 /// Encrypted object JSON budget per tenant/device database. Never evicts rows.
 pub const RAW_OBJECT_CAP_BYTES: usize = 64 * 1024 * 1024;

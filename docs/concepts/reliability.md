@@ -10,8 +10,8 @@ queued or eventually delivered.
 A hook with a collector URL and token may start a detached one-shot exporter.
 Terminal events request a final drain; other events skip startup when an
 exporter lock is already held. Tokenless hooks only queue records and never
-request interactive credential unlock. Hook-spawned exporters pass
-`--preserve-backlog` to avoid deleting accumulated history.
+request interactive credential unlock. All exporters retain queued history by default. Hook-spawned exporters still pass
+`--preserve-backlog` for compatibility.
 
 A one-shot exporter drains until the queue is empty or a failure stops the run.
 It exits if another exporter already holds the file lock. A watcher retains the
@@ -35,7 +35,7 @@ needed to flush an idle queue.
 
 | Failure | Export behavior | Next step |
 | --- | --- | --- |
-| Authentication, `401` or `403` | Stop the run without retrying, falling back or quarantining the rejected send. Pending rows remain, subject to the capacity trimming below. | Correct the token and restart export or the watcher. |
+| Authentication, `401` or `403` | Stop the run without retrying, falling back or quarantining the rejected send. Pending rows remain unless explicit destructive trimming is selected. | Correct the token and restart export or the watcher. |
 | Network error, timeout, 5xx or other endpoint rejection such as `404`, `405`, `408` or `429` | Back off; undelivered rows remain queued. | Check the endpoint and connectivity, then retry. |
 | Payload rejection, `400`, `409`, `413` or `422` | Split batches to isolate rejected envelopes and retain them in quarantine. | Inspect the rejected envelope and collector limits. |
 | Malformed queued JSON | Move that envelope to quarantine with a fixed diagnostic reason. | Inspect local storage and the producing version. |
@@ -51,21 +51,14 @@ An event envelope can contain several spans: quarantine operates on the whole
 envelope, so valid siblings can remain with a rejected span. Quarantine retains
 the bytes; moving a row there does not mean it reached the collector.
 
-## Capacity and retention
+## Queue capacity and retention
 
-`outbox_cap` defaults to 10,000 envelope rows. At the start of each drain, rows
-beyond that cap are trimmed oldest first. Enqueueing does not enforce the cap,
-so a tokenless or idle queue can grow beyond it until a drain starts. The cap
-counts envelopes, not spans or bytes, and is not a bound on total database size.
-
-Capacity trimming happens before a request, including one that later fails
-authentication. Trimmed rows are lost. Each tenant/device database admits at
-most 64 MiB of encoded ciphertext envelopes; SQLite page/WAL overhead is extra.
-At capacity, capture retains metadata without new raw objects, and readers can
-decrypt cloud objects in memory while skipping cache insertion. Existing and
-pending ciphertext is never evicted automatically. Raw-value storage,
-quarantine and collector traces have no automatic retention policy; cloud
-quotas and scheduled deletion require a separate deployment policy.
+Export preserves the complete backlog by default. `--discard-oldest` explicitly
+drops oldest queued envelopes beyond `outbox_cap` before each drain, even if
+authentication subsequently fails. `--preserve-backlog` remains a compatibility
+no-op. Monitor disk space during outages; encrypted object capture has its own
+non-evicting byte budget. Quarantine is retained and may be summarized or retried
+with `gently quarantine`; no automatic local or collector retention is provided.
 
 ## Replays and lifecycle gaps
 

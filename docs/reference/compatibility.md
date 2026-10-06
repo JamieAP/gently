@@ -85,8 +85,7 @@ results can establish success/failure. See [hook mappings](hooks.md).
 ## Desktop queries without credential copies
 
 On Unix, start an unlocked
-`gently export --watch --serve-queries --preserve-backlog`. The last option
-keeps accumulated history instead of trimming it to the configured cap. The bundled
+`gently export --watch --serve-queries --preserve-backlog`. History is preserved by default; the last option is retained for compatibility. The bundled
 collector/export launchers enable this option. Tokenless CLI and MCP processes
 use `<state_dir>/tenants/<tenant_id>/devices/<device_id>/query.sock`, provided
 their state directory, tenant, device and collector URL match the watcher. The watcher holds the bearer token and forwards only

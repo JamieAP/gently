@@ -200,10 +200,10 @@ drains the queue continuously and reuses connections. Remote export can use
 HTTP/3, with a TCP fallback.
 
 The exporter drains the outbox with retry and backoff.
-Explicit exports default to a 10,000-envelope cap; excess oldest envelopes
-are dropped before sending. Hook-spawned exporters and the local launchers use
-`--preserve-backlog`, overriding that cap to avoid discarding queued history. The queue can grow
-beyond that cap while no exporter drains it. Authentication failures stop export
+All exports preserve queued history by default. `--discard-oldest` explicitly
+opts into dropping excess oldest envelopes at the configured `outbox_cap` before
+each drain. Queue storage can grow without a limit when history is preserved.
+Authentication failures stop export
 immediately; transient failures use backoff, and unprocessable envelopes can be
 quarantined.
 

@@ -502,6 +502,21 @@ mod tests {
         assert_eq!(store.raw_objects_pending("tenant-a", 16).unwrap().len(), 1);
     }
 
+    #[tokio::test]
+    async fn preserving_backlog_keeps_over_cap_rows_on_auth_failure() {
+        let (_directory, store) = fixture();
+        for _ in 0..10_001 {
+            enqueue(&store);
+        }
+        let transport = recorder(true, false);
+        assert!(matches!(
+            export_with_retry(&store, &transport, i64::MAX as usize, 100, None).await,
+            Err(ExportError::Authentication(401))
+        ));
+        assert_eq!(store.outbox_len().unwrap(), 10_002);
+        assert_eq!(store.quarantine_len().unwrap(), 0);
+    }
+
     struct Recorder {
         calls: AtomicUsize,
         auth_failure: bool,

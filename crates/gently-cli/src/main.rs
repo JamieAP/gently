@@ -5,6 +5,7 @@ mod cmd_export;
 mod cmd_hook;
 mod cmd_init;
 mod cmd_mcp;
+mod cmd_quarantine;
 mod cmd_query;
 mod cmd_raw;
 mod cmd_status;
@@ -56,16 +57,24 @@ enum Command {
         /// clients over an owner-only Unix socket. Requires --watch.
         #[arg(long, requires = "watch")]
         serve_queries: bool,
-        /// Keep queued envelopes even above outbox_cap; do not trim history
-        /// before exporting. Queue storage can grow without a limit.
-        #[arg(long)]
+        /// Compatibility option: preserving all queued history is now the default.
+        #[arg(long, hide = true, conflicts_with = "discard_oldest")]
         preserve_backlog: bool,
+        /// Explicitly discard oldest queued envelopes above outbox_cap before
+        /// each drain. This permanently loses history, even if export fails.
+        #[arg(long, conflicts_with = "preserve_backlog")]
+        discard_oldest: bool,
         /// Seconds between drains in watch mode.
         #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=60))]
         interval_secs: u64,
         /// Retry retained ciphertext previously rejected by the collector.
         #[arg(long)]
         retry_raw_quarantine: bool,
+    },
+    /// Inspect metadata quarantine summaries or explicitly requeue a row.
+    Quarantine {
+        #[command(subcommand)]
+        command: cmd_quarantine::QuarantineCommand,
     },
     /// Manage encrypted raw-value reader enrollment and public trust policy.
     Raw {
@@ -188,7 +197,8 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Export {
             watch,
             serve_queries,
-            preserve_backlog,
+            preserve_backlog: _,
+            discard_oldest,
             interval_secs,
             retry_raw_quarantine,
         } => {
@@ -196,13 +206,14 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
                 cmd_export::watch(
                     interval_secs,
                     serve_queries,
-                    preserve_backlog,
+                    !discard_oldest,
                     retry_raw_quarantine,
                 )
             } else {
-                cmd_export::run(preserve_backlog, retry_raw_quarantine)
+                cmd_export::run(!discard_oldest, retry_raw_quarantine)
             }
         }
+        Command::Quarantine { command } => cmd_quarantine::run(command),
         Command::Raw { command } => cmd_raw::run(command),
         Command::Status => cmd_status::run(),
         Command::Config { check, .. } => {
