@@ -26,9 +26,25 @@ acceptance. No repository settings, release tags, deployed resources or personal
 runtime state were changed by this batch. Checkboxes remain open until acceptance
 and merge; open PRs do not establish total native harness parity or v1 readiness.
 
+## Combined local validation
+
+An unpublished integration of the seven implementation PRs passed on 2026-10-06:
+307 Rust tests (one subprocess helper is listed as ignored), strict clippy and
+format checks, 59 Worker tests and TypeScript checks, 79 launcher/policy tests,
+9 documentation tests and a 20-page build, and real synthetic encrypted
+CLI/age/Wrangler/workerd/D1/MCP acceptance. The npm audit reported zero advisories.
+The combined source tree is `ae089391a4467b7d30ebbc092c933372bf91f0f0`.
+
+Validated implementation heads: #3 `d9607f4`, #4 `b4dc46a`, #5 `5a88ceb`,
+#6 `732d90b`, #7 `dd2db61`, #8 `bf9a590`, #9 `24f1d3f`. All PR branches descend
+from sanitized main `63aa64f`; the live checkout still matches GitHub main.
+Every published commit/push passed the disclosure guards with a per-command
+acknowledgement. Actions remain disabled pending repository protection review.
+Native desktop and cross-platform release evidence is still outstanding.
+
 ## Final release gates
 
-- [ ] Combine the reviewed PRs and repeat the full suite on the exact final tree.
+- [ ] Merge the reviewed PRs and repeat the full suite on the exact final tree.
 - [ ] Record passing macOS and Linux CI with the supported Node/Rust toolchains.
 - [ ] Record exact current versions and synthetic final-tree native evidence for Codex CLI/Desktop and Claude Code CLI/Desktop coding surfaces. Ordinary chat/Cowork is outside scope.
 - [ ] Review and apply repository protections, including secret scanning and push protection, then verify readback before enabling Actions.
