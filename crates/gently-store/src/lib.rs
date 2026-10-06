@@ -15,10 +15,12 @@ mod health;
 mod open_spans;
 mod outbox;
 pub mod private_fs;
+mod quarantine;
 mod raw_objects;
 
-pub use health::{Health, QuarantineSummary};
+pub use health::Health;
 pub use open_spans::OpenSpan;
+pub use quarantine::QuarantineSummary;
 pub use raw_objects::RawObjectStats;
 
 use std::path::Path;
