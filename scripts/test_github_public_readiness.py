@@ -20,14 +20,17 @@ FILES = {
     ".github/workflows/ci.yml": """name: code
 on:
   push:
+  pull_request:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   validate:
-    if: github.repository == 'JamieAP/gently' && github.actor == 'JamieAP' && github.triggering_actor == 'JamieAP' && (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
+      - name: Authorize owner-operated validation
+        if: ${{ !(github.repository == 'JamieAP/gently' && github.actor == 'JamieAP' && github.triggering_actor == 'JamieAP' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login == 'JamieAP' && github.event.pull_request.base.ref == 'main'))) }}
+        run: exit 1
       - uses: actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
         with:
           persist-credentials: false
@@ -66,6 +69,10 @@ class FakeAPI:
         self.repo = {"full_name": "JamieAP/gently", "owner": {"login": OWNER, "type": "User"},
                      "private": False, "visibility": "public", "default_branch": "main",
                      "permissions": {"admin": True}}
+        self.repo["security_and_analysis"] = {feature: {"status": "disabled"} for feature in guard_module.SECURITY_FEATURES}
+        self.ignore_security_updates = False
+        self.private_reporting = False
+        self.ignore_reporting_updates = False
         self.collaborators = [{"login": OWNER}]
         self.files = copy.deepcopy(FILES)
         self.main_sha = SHA
@@ -87,7 +94,13 @@ class FakeAPI:
         if path == "user":
             return copy.deepcopy(self.user)
         if path == "repos/JamieAP/gently":
+            if method == "PATCH" and not self.ignore_security_updates:
+                self.repo["security_and_analysis"].update(copy.deepcopy(body["security_and_analysis"]))
             return copy.deepcopy(self.repo)
+        if suffix == "private-vulnerability-reporting":
+            if method == "PUT" and not self.ignore_reporting_updates:
+                self.private_reporting = True
+            return {"enabled": self.private_reporting}
         if suffix == "collaborators":
             return copy.deepcopy(self.collaborators) if "page=1" in path else []
         if suffix == "actions/runs":
@@ -169,6 +182,126 @@ class ReadinessTests(unittest.TestCase):
 
     def apply(self):
         self.guard.apply(reviewed_main_sha=SHA, apps_reviewed=True)
+
+    def test_private_reporting_readback_precedes_actions_enable(self):
+        self.api.ignore_reporting_updates = True
+        with self.assertRaisesRegex(guard_module.GuardError, "did not confirm private vulnerability"):
+            self.apply()
+        self.assertFalse(self.api.actions["enabled"])
+        self.assertFalse(any(method == "PUT" and path.endswith("actions/permissions") and body.get("enabled") is True
+                             for method, path, body in self.api.calls))
+
+    def test_read_only_audit_detects_disabled_private_reporting(self):
+        self.apply()
+        self.api.private_reporting = False
+        self.assertTrue(any("Private vulnerability reporting" in issue for issue in self.guard.check(SHA, True)))
+
+    def test_authorization_rejects_quoted_spaced_and_later_conditions(self):
+        original = self.guard.files[".github/workflows/ci.yml"]
+        mutations = [original.replace("  validate:\n", "  validate:\n" + key + " false\n")
+                     for key in ['    "if":', "    'if':", "    if :"]]
+        mutations += [original.replace("        with:", key + " always()\n        with:")
+                      for key in ['        if:', '        "if":', "        'if':", "        if :"]]
+        mutations += [original.replace("      - uses:", key + " ${{ always() }}\n        uses:")
+                      for key in ['      - if:', '      - "if":', "      - 'if':", "      - if :",
+                                  "      -   if:", "      -  if:"]]
+        for changed in mutations:
+            with self.subTest(workflow=changed):
+                self.guard.files[".github/workflows/ci.yml"] = changed
+                self.api.files = copy.deepcopy(self.guard.files)
+                with self.assertRaises(guard_module.GuardError):
+                    self.guard.reviewed_workflows(SHA)
+
+    def test_shipped_workflows_pass_and_reviewed_bypass_variants_fail(self):
+        root = pathlib.Path(__file__).resolve().parent.parent
+        shipped = {name: (root / name).read_text(encoding="utf-8") for name in guard_module.FILES}
+        guard_module.Guard(self.api, shipped).validate_files()
+        ci, docs = shipped[".github/workflows/ci.yml"], shipped[".github/workflows/docs.yml"]
+        pin = "11d5960a326750d5838078e36cf38b85af677262"
+        checkout = f"      - uses: actions/checkout@{pin} # v4\n        with:\n          persist-credentials: false\n"
+        accept = ("      - name: Real CLI, encrypted readers, Wrangler and D1 acceptance\n"
+                  "        run: python3 scripts/acceptance-local.py")
+        self.assertIn(checkout, ci)
+        self.assertIn(accept, ci)
+        extra_job = (f'  "bypass":\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@{pin} # v4\n'
+                     "        with:\n          persist-credentials: false\n      - run: echo unguarded\n")
+        # Each variant is valid YAML that skips the job, runs a later step after
+        # the authorization step fails, or adds an ungated job.
+        ci_variants = {
+            "job quoted if": ci.replace("  validate:\n", '  validate:\n    "if": false\n'),
+            "job single-quoted spaced if": ci.replace("  validate:\n", "  validate:\n    'if' : false\n"),
+            "job spaced if": ci.replace("  validate:\n", "  validate:\n    if : false\n"),
+            "job escaped continue-on-error": ci.replace("  validate:\n", '  validate:\n    "continue\\x2don-error": true\n'),
+            "job merge key": ci.replace("  validate:\n", '  validate:\n    <<: {"if": false}\n'),
+            "checkout always()": ci.replace(checkout, "      - if: ${{ always() }}\n" + checkout.replace("      - uses:", "        uses:")),
+            "acceptance always()": ci.replace(accept, "      - if: ${{ always() }}\n" + accept.replace("      - name:", "        name:")),
+            "flow-mapping step": ci.replace(checkout, checkout + '      - {"if": "${{ always() }}", run: echo unguarded}\n'),
+            "checkout at column 10": ci.replace(checkout, "      -   if: ${{ always() }}\n" + "\n".join(
+                "  " + line for line in checkout.replace("      - uses:", "        uses:").splitlines()) + "\n"),
+            "acceptance at column 9": ci.replace(accept, "      -  if: ${{ always() }}\n" + "\n".join(
+                " " + line for line in accept.replace("      - name:", "        name:").splitlines())),
+            "quoted extra job": ci + extra_job,
+            "bare dash step": ci.replace(checkout, checkout + "      -\n        if: ${{ always() }}\n        run: echo unguarded\n"),
+            "quoted trigger": ci.replace("  workflow_dispatch:\n", '  workflow_dispatch:\n  "schedule":\n    - cron: "0 0 * * *"\n'),
+            "quoted top-level key": ci.replace("permissions:\n", '"defaults":\n  run:\n    shell: bash\npermissions:\n', 1),
+        }
+        docs_variants = {
+            "docs quoted extra job": docs.rstrip("\n") + "\n" + extra_job,
+            "docs job continue-on-error": docs.replace("    timeout-minutes: 10\n", "    timeout-minutes: 10\n    continue-on-error: true\n", 1),
+        }
+        for label, (name, text) in {**{k: (".github/workflows/ci.yml", v) for k, v in ci_variants.items()},
+                                    **{k: (".github/workflows/docs.yml", v) for k, v in docs_variants.items()}}.items():
+            with self.subTest(variant=label):
+                self.assertNotEqual(text, shipped[name])
+                with self.assertRaises(guard_module.GuardError):
+                    guard_module.Guard(self.api, {**shipped, name: text}).validate_files()
+
+    def test_required_checks_are_bound_and_conflicting_bindings_refused(self):
+        self.apply()
+        self.assertEqual(self.api.protection["required_status_checks"]["checks"],
+                         [{"context": context, "app_id": guard_module.ACTIONS_APP_ID} for context in guard_module.CONTEXTS])
+        self.api.protection["required_status_checks"]["checks"][0]["app_id"] = 7
+        with self.assertRaisesRegex(guard_module.GuardError, "different required-check App binding"):
+            self.apply()
+        self.assertFalse(self.api.actions["enabled"])
+
+    def test_security_readback_is_required_before_actions_enable(self):
+        self.api.ignore_security_updates = True
+        with self.assertRaisesRegex(guard_module.GuardError, "did not confirm secret scanning"):
+            self.apply()
+        self.assertFalse(self.api.actions["enabled"])
+        self.assertFalse(any(method == "PUT" and path.endswith("actions/permissions") and body.get("enabled") is True
+                             for method, path, body in self.api.calls))
+
+    def test_read_only_audit_detects_disabled_secret_scanning(self):
+        self.apply()
+        self.api.repo["security_and_analysis"]["secret_scanning"]["status"] = "disabled"
+        self.api.calls.clear()
+        issues = self.guard.check(reviewed_main_sha=SHA, apps_reviewed=True)
+        self.assertTrue(any("Secret scanning" in issue for issue in issues))
+        self.assertTrue(all(method == "GET" for method, _, _ in self.api.calls))
+
+    def test_owner_pull_request_guard_cannot_be_weakened(self):
+        self.guard.validate_files()
+        self.guard.files[".github/workflows/ci.yml"] = FILES[".github/workflows/ci.yml"].replace(
+            "github.event.pull_request.head.repo.full_name == github.repository && ", "")
+        with self.assertRaisesRegex(guard_module.GuardError, "exact owner"):
+            self.guard.validate_files()
+
+    def test_authorization_cannot_skip_required_jobs_or_follow_checkout(self):
+        original = FILES[".github/workflows/ci.yml"]
+        for changed in (
+            original.replace("  validate:\n", "  validate:\n    if: false\n"),
+            original.replace("        run: exit 1", "        run: exit 1\n        continue-on-error: true"),
+            original.replace("        run: exit 1", "        run: exit 1\n        if: false"),
+            original.replace("  validate:\n", "  validate:\n    continue-on-error: true\n"),
+            original.replace("    steps:\n", "    steps:\n      - run: echo unreviewed\n"),
+            original.replace("github.event.pull_request.user.login == 'JamieAP' && ", ""),
+        ):
+            with self.subTest():
+                self.guard.files[".github/workflows/ci.yml"] = changed
+                with self.assertRaisesRegex(guard_module.GuardError, "authorization step before checkout"):
+                    self.guard.validate_files()
 
     def test_check_never_mutates_and_reports_missing_policy(self):
         issues = self.guard.check(reviewed_main_sha=SHA)
