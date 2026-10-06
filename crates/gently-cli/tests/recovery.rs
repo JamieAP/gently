@@ -295,3 +295,90 @@ fn malformed_selected_mcp_entries_preserve_installed_hooks() {
         assert_eq!(std::fs::read(&hooks).unwrap(), before);
     }
 }
+
+#[test]
+fn uninstall_reports_zero_matches_and_retained_other_executable_paths() {
+    for harness in ["--claude", "--codex"] {
+        let home = tempfile::tempdir().unwrap();
+        command(home.path())
+            .args(["init", harness])
+            .assert()
+            .success();
+        let executable = assert_cmd::cargo::cargo_bin("gently");
+        let configs = if harness == "--codex" {
+            vec![home.path().join(".codex/config.toml")]
+        } else {
+            vec![
+                home.path().join(".claude/settings.json"),
+                home.path().join(".claude.json"),
+            ]
+        };
+        let mut before = Vec::new();
+        for path in &configs {
+            let text = std::fs::read_to_string(path).unwrap().replace(
+                executable.to_str().unwrap(),
+                "/synthetic-private-path/gently",
+            );
+            std::fs::write(path, &text).unwrap();
+            before.push(text);
+        }
+        let output = command(home.path())
+            .args(["uninstall", harness])
+            .assert()
+            .success();
+        let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+        assert!(stderr.contains("removed 0 hook handler(s) and 0 MCP registration(s)"));
+        assert!(stderr.contains("no exact registrations matched"));
+        assert!(stderr.contains("possible Gently registration(s)"));
+        assert!(!stderr.contains("synthetic-private-path"));
+        for (path, expected) in configs.iter().zip(before) {
+            assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_uninstall_skips_linked_legacy_without_reading_or_changing_its_target() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    for hard_link in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        command(home.path())
+            .args(["init", "--codex"])
+            .assert()
+            .success();
+        let target = home.path().join("user-owned-legacy");
+        let contents = b"synthetic private legacy content, deliberately not JSON";
+        std::fs::write(&target, contents).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let legacy = home.path().join(".codex/hooks.json");
+        if hard_link {
+            std::fs::hard_link(&target, &legacy).unwrap()
+        } else {
+            symlink(&target, &legacy).unwrap()
+        }
+        command(home.path())
+            .args(["uninstall", "--codex"])
+            .assert()
+            .success()
+            .stderr(predicates::str::contains("skipped legacy Codex hooks.json"));
+        assert_eq!(std::fs::read(&target).unwrap(), contents);
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(std::fs::symlink_metadata(legacy).is_ok());
+        let doc: toml::Value = toml::from_str(
+            &std::fs::read_to_string(home.path().join(".codex/config.toml")).unwrap(),
+        )
+        .unwrap();
+        assert!(doc
+            .get("mcp_servers")
+            .is_none_or(|servers| servers.get("gently").is_none()));
+        if let Some(hooks) = doc.get("hooks") {
+            for (_, groups) in hooks.as_table().unwrap() {
+                assert!(groups.as_array().unwrap().is_empty());
+            }
+        }
+    }
+}

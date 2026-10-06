@@ -1,14 +1,16 @@
 //! Consistent SQLite backups; raw objects remain opaque ciphertext.
 use crate::{private_fs, Result, Store, StoreError, SCHEMA_VERSION};
-use rusqlite::{Connection, DatabaseName, OpenFlags};
+use rusqlite::{
+    backup::{Backup, StepResult},
+    Connection, OpenFlags,
+};
 use std::path::{Path, PathBuf};
 
 impl Store {
     pub fn backup(&self, destination: &Path, tenant: &str, device: &str) -> Result<()> {
         validate_encrypted_schema(&self.conn)?;
         publish_database(destination, |temporary| {
-            self.conn.backup(DatabaseName::Main, temporary, None)?;
-            let copy = Connection::open(temporary)?;
+            let copy = snapshot(&self.conn, temporary)?;
             copy.pragma_update(None, "journal_mode", "DELETE")?;
             copy.execute_batch(
                 "CREATE TABLE IF NOT EXISTS backup_metadata (
@@ -61,12 +63,25 @@ impl Store {
             return Err(StoreError::InvalidBackup);
         }
         publish_database(destination, |temporary| {
-            source.backup(DatabaseName::Main, temporary, None)?;
-            let copy = Connection::open(temporary)?;
+            let copy = snapshot(&source, temporary)?;
             copy.pragma_update(None, "journal_mode", "DELETE")?;
             Ok(())
         })
     }
+}
+
+// One step holds a single read snapshot. Incremental steps can restart forever
+// when another connection commits between them. Busy locks fail for a retry.
+fn snapshot(source: &Connection, destination: &Path) -> Result<Connection> {
+    let mut copy = Connection::open(destination)?;
+    copy.busy_timeout(std::time::Duration::from_secs(2))?;
+    {
+        let backup = Backup::new(source, &mut copy)?;
+        if backup.step(-1)? != StepResult::Done {
+            return Err(StoreError::BackupBusy);
+        }
+    }
+    Ok(copy)
 }
 
 fn validate_encrypted_schema(connection: &Connection) -> Result<()> {
@@ -143,6 +158,64 @@ fn require_missing_database(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn backup_completes_during_continuous_writes_from_another_connection() {
+        use std::{
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc,
+            },
+            time::{Duration, Instant},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let store = Store::open(&source).unwrap();
+        store.conn.execute_batch("CREATE TABLE synthetic_backup_fixture (id INTEGER PRIMARY KEY, payload BLOB); WITH RECURSIVE ids(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM ids WHERE n<1024) INSERT INTO synthetic_backup_fixture SELECT n, zeroblob(16384) FROM ids;").unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let (ready, started) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let writer = Connection::open(source).unwrap();
+            writer.busy_timeout(Duration::from_secs(1)).unwrap();
+            writer.execute("INSERT INTO outbox(span_json, created_unix_nano, attempts) VALUES ('synthetic concurrent write', 1, 0)", []).unwrap();
+            ready.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while !stopped.load(Ordering::Relaxed) && Instant::now() < deadline {
+                writer
+                    .execute(
+                        "UPDATE outbox SET created_unix_nano=created_unix_nano+1",
+                        [],
+                    )
+                    .unwrap();
+            }
+        });
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        let began = Instant::now();
+        let backup = dir.path().join("backup.db");
+        let result = store.backup(&backup, "synthetic", "writer");
+        let elapsed = began.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        result.unwrap();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "backup did not finish while writer remained active"
+        );
+        let copy = Connection::open(backup).unwrap();
+        assert_eq!(
+            copy.query_row("SELECT COUNT(*) FROM synthetic_backup_fixture", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1024
+        );
+        assert_eq!(
+            copy.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+    }
+
     #[test]
     fn live_wal_backup_preserves_queue_quarantine_and_open_state() {
         let dir = tempfile::tempdir().unwrap();

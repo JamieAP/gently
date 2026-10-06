@@ -42,6 +42,8 @@ pub enum StoreError {
     InvalidBackup,
     #[error("backup tenant/device differs from the configured local namespace")]
     BackupNamespace,
+    #[error("backup could not acquire a consistent snapshot; pause writers and retry")]
+    BackupBusy,
     #[error("invalid encrypted raw object")]
     InvalidRawObject,
     #[error("encrypted raw reference already names a different object")]

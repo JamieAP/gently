@@ -9,7 +9,7 @@ Use `gently --help` or `gently <command> --help` for command syntax;
 | Command | Collector URL and token required? |
 | --- | --- |
 | `hook` | No. Events queue locally without credentials. |
-| `init`, `status`, `raw` | No. These use local configuration and files. |
+| `init`, `uninstall`, `status`, `state`, `raw` | No. These use local configuration and files. |
 | `waterfall` | No. Reads stdin without loading configuration or local state. |
 | `export` | Yes. |
 | `traces`, `trace`, `spans`, `stats`, `whoami`, `mcp` | URL plus token, or a local query watcher on Unix. |
