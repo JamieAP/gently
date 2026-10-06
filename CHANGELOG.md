@@ -5,19 +5,12 @@ The project is pre-1.0; pending changes appear under Unreleased.
 
 ## [Unreleased]
 
-- Refresh all 31 observational Claude Code and 12 Codex command-hook registrations,
-  including desktop coding runtimes; safely migrate covered legacy Codex JSON handlers.
-- Retain immutable event receipts and useful display, instruction, model/cache metadata;
-  encrypt complete hook payloads under the existing recipient policy when capture is enabled.
-- Preserve provisional tool visibility, invocation IDs and runtime durations; keep tool
-  rollups accurate across replay, unfinished invocations and permission observations.
-- Add tenant-bound tokenless local query delegation and backlog-preserving launchers.
-- Preserve SQLite locks during permission hardening and exact JSON numbers on hook input.
-- Require explicit public-repository review through commit/push hooks and inspect stored
-  Git objects even when replacement refs are installed.
-
 ### Added
 
+- Add tenant-bound tokenless local query delegation and backlog-preserving launchers.
+- Require explicit public-repository review through commit, message and push hooks;
+  inspect stored Git objects despite replacement refs and reject captured telemetry,
+  reader identities, ciphertext, database/archive contents and local home paths.
 - Encrypt raw event fields before local persistence with age and random opaque
   references; cloud sync and explicit reader resolution are separate opt-ins.
 - Sign tenant reader manifests, pin owner roots, minimum epochs and exact policy digests locally,
@@ -43,6 +36,12 @@ The project is pre-1.0; pending changes appear under Unreleased.
 
 ### Changed
 
+- Refresh all 31 observational Claude Code and 12 Codex command-hook registrations,
+  including desktop coding runtimes; safely migrate covered legacy Codex JSON handlers.
+- Retain immutable event receipts and useful display, instruction, model/cache metadata;
+  encrypt complete hook payloads under the existing recipient policy when capture is enabled.
+- Preserve provisional tool visibility, invocation IDs and runtime durations; keep tool
+  rollups accurate across replay, unfinished invocations and permission observations.
 - Replace secret-helper coupling with provider-neutral local launchers and
   credential-free preflight; keep optional foreground Mac provider wrappers.
 - Require environment-only client credentials and a per-host Worker secret map.
@@ -65,6 +64,12 @@ The project is pre-1.0; pending changes appear under Unreleased.
 
 ### Fixed
 
+- Protect local collector files with owner-only permissions and disable the
+  local Worker's DevTools inspector; bound startup and cleanup after runtime failures.
+- Retry query-broker accept failures without stopping export and report its concurrency cap.
+- Skip optional linked or foreign-owned Codex JSON migration without changing user files.
+- Explain staged whitespace and unavailable remote-history sanity failures without
+  printing Git output or weakening publication checks.
 - Preserve large integers and precise decimal JSON values in hook payloads;
   valid extreme exponents no longer cause the entire hook to be discarded.
   Keep user object keys literal in hooks, configuration rewrites and local queries.

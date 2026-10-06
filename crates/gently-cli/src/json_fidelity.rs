@@ -22,6 +22,8 @@ fn decode(raw: &RawValue, remaining: usize) -> Result<Value> {
         Some(b'{') => {
             // Typed maps preserve every user key literally. Value's generic
             // visitor reserves private keys when arbitrary precision is on.
+            // Each subtree is reparsed, so work grows with input size and depth;
+            // the depth limit bounds this tradeoff for ordinary hook payloads.
             let members: BTreeMap<String, &RawValue> = serde_json::from_str(input)?;
             let object = members
                 .into_iter()

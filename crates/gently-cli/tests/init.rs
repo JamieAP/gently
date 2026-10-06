@@ -470,12 +470,14 @@ fn codex_leaves_custom_json_handlers_and_platform_overrides_unchanged() {
 
 #[cfg(unix)]
 #[test]
-fn codex_refuses_symlinked_legacy_json_before_changing_inline_hooks() {
+fn codex_skips_symlinked_legacy_json_and_finishes_inline_setup() {
+    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let codex = dir.path().join(".codex");
     std::fs::create_dir(&codex).unwrap();
     let target = dir.path().join("user-settings.json");
     std::fs::write(&target, "{\"user\":true}").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
     std::os::unix::fs::symlink(&target, codex.join("hooks.json")).unwrap();
     let inline = "model = 'user-choice'\n";
     std::fs::write(codex.join("config.toml"), inline).unwrap();
@@ -485,12 +487,47 @@ fn codex_refuses_symlinked_legacy_json_before_changing_inline_hooks() {
         .env("HOME", dir.path())
         .env("GENTLY_STATE_DIR", dir.path().join(".gently"))
         .assert()
-        .failure();
+        .success()
+        .stderr(predicates::str::contains(
+            "skipped legacy Codex hooks.json migration",
+        ));
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"user\":true}");
     assert_eq!(
-        std::fs::read_to_string(codex.join("config.toml")).unwrap(),
-        inline
+        std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o644
     );
+    assert!(std::fs::symlink_metadata(codex.join("hooks.json"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    let updated = std::fs::read_to_string(codex.join("config.toml")).unwrap();
+    assert!(updated.contains("model = 'user-choice'"));
+    assert!(updated.contains("hook --harness codex"));
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_skips_hardlinked_legacy_json_without_changing_target() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    let codex = dir.path().join(".codex");
+    std::fs::create_dir(&codex).unwrap();
+    let target = dir.path().join("user-settings.json");
+    // Invalid JSON proves the optional path is skipped without being parsed.
+    std::fs::write(&target, "synthetic linked user configuration").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::hard_link(&target, codex.join("hooks.json")).unwrap();
+    run_init(dir.path(), "--codex");
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "synthetic linked user configuration"
+    );
+    let metadata = std::fs::metadata(&target).unwrap();
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o644);
+    assert_eq!(metadata.nlink(), 2);
+    assert!(std::fs::read_to_string(codex.join("config.toml"))
+        .unwrap()
+        .contains("hook --harness codex"));
 }
 
 #[test]

@@ -255,7 +255,7 @@ pub fn row_references(row: &SpanRow) -> Result<Vec<String>> {
     let Some(blob) = row.attrs_json.as_deref() else {
         return Ok(Vec::new());
     };
-    let attrs: Value = serde_json::from_str(blob).context("invalid span attributes")?;
+    let attrs = crate::json_fidelity::parse(blob).context("invalid span attributes")?;
     let mut refs = BTreeSet::new();
     for attr in attrs.as_array().context("invalid span attribute shape")? {
         let Some(base) = attr

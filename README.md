@@ -233,6 +233,21 @@ Claude Code / Codex hooks -> local SQLite outbox -> Worker -> D1
 The Rust workspace is in `crates/`, the collector in `worker/`, and local collector
 helpers in `scripts/`.
 
+Install the public-repository Git gates in every development checkout:
+
+```sh
+git config --local core.hooksPath .githooks
+```
+
+After reviewing the exact change for public disclosure, acknowledge each command
+with `GENTLY_PUBLIC_REPO_SANITY=1 git commit ...` or
+`GENTLY_PUBLIC_REPO_SANITY=1 git push ...`. The acknowledgement does not bypass
+checks. The gates inspect staged files, commit messages and complete outgoing
+history, including deleted files and annotated tags. Captured hook/OTLP JSON,
+encrypted raw objects, credentials, private state, databases, archives and local
+home paths are rejected; diagnostics withhold matched values. Keep all runtime
+state outside tracked files and review other confidential prose or code manually.
+
 ```sh
 cargo test
 cargo clippy --all-targets -- -D warnings

@@ -93,12 +93,16 @@ impl QueryBroker {
         let mut requests = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
-                accepted = listener.accept() => {
-                    let (stream, _) = accepted?;
+                accepted = accept_with_retry(|| listener.accept()) => {
+                    let (mut stream, _) = accepted;
                     // ACLs can grant access beyond BSD mode bits. Authenticate
                     // each socket peer before delegating the watcher credential.
                     if !stream.peer_cred().is_ok_and(|peer| peer.uid() == unsafe { libc::geteuid() }) { continue; }
-                    if requests.len() >= 16 { continue; }
+                    if requests.len() >= 16 {
+                        let _ = tokio::time::timeout(Duration::from_millis(100),
+                            stream.write_all(b"{\"error\":\"query broker busy\"}\n")).await;
+                        continue;
+                    }
                     let client = client.clone();
                     let url = cfg.collector_url.trim_end_matches('/').to_string();
                     let tenant = cfg.tenant_id.clone();
@@ -107,6 +111,26 @@ impl QueryBroker {
                     });
                 }
                 _ = requests.join_next(), if !requests.is_empty() => {}
+            }
+        }
+    }
+}
+
+async fn accept_with_retry<T, F, Fut>(mut accept: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    let mut delay = Duration::from_millis(25);
+    loop {
+        match accept().await {
+            Ok(value) => return value,
+            Err(_) => {
+                // Connection aborts and resource pressure must not stop export.
+                // Never log platform error text or any client-provided value.
+                tracing::warn!("local query broker accept failed; retrying");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(1));
             }
         }
     }
@@ -277,4 +301,24 @@ pub async fn query<T: for<'de> Deserialize<'de>>(
     })
     .await
     .context("local query watcher timed out")?
+}
+
+#[cfg(test)]
+mod retry_tests {
+    #[tokio::test]
+    async fn transient_accept_errors_do_not_stop_the_broker() {
+        let mut calls = 0;
+        let accepted = super::accept_with_retry(|| {
+            calls += 1;
+            std::future::ready(match calls {
+                1 => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+                2 => Err(std::io::Error::from(std::io::ErrorKind::ConnectionAborted)),
+                3 => Err(std::io::Error::from_raw_os_error(libc::EMFILE)),
+                _ => Ok("accepted synthetic connection"),
+            })
+        })
+        .await;
+        assert_eq!(accepted, "accepted synthetic connection");
+        assert_eq!(calls, 4);
+    }
 }

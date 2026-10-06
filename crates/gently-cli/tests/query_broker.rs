@@ -64,6 +64,44 @@ fn request(path: &std::path::Path, req: serde_json::Value) -> serde_json::Value 
 }
 
 #[test]
+fn broker_reports_busy_and_recovers_after_slots_are_released() {
+    let dir = tempfile::tempdir_in(if cfg!(target_os = "macos") {
+        std::path::PathBuf::from("/private/tmp")
+    } else {
+        std::env::temp_dir()
+    })
+    .unwrap();
+    let mut watcher = start(dir.path(), "http://127.0.0.1:9");
+    let socket = dir
+        .path()
+        .join("tenants/personal/devices/capture-host/query.sock");
+    wait_ready(&mut watcher, &socket);
+    std::thread::sleep(Duration::from_millis(50));
+    let holders: Vec<_> = (0..16)
+        .map(|_| UnixStream::connect(&socket).unwrap())
+        .collect();
+    std::thread::sleep(Duration::from_millis(50));
+    let req = serde_json::json!({
+        "collector_url":"http://127.0.0.1:9", "tenant_id":"personal", "params":[["op","write"]]
+    });
+    assert_eq!(request(&socket, req.clone())["error"], "query broker busy");
+    drop(holders);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let response = request(&socket, req.clone());
+        if response["error"] == "query operation is not read-only" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "broker did not release completed slots"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(watcher.0.try_wait().unwrap().is_none());
+}
+
+#[test]
 fn tokenless_cli_and_mcp_query_through_unlocked_watcher() {
     let dir = tempfile::tempdir_in(if cfg!(target_os = "macos") {
         std::path::PathBuf::from("/private/tmp")

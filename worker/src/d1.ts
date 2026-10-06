@@ -95,6 +95,8 @@ export async function insertSpans(env: Env, tenantId: string, deviceId: string, 
   // Equal-quality reports pick content by latest end; ties favour the newcomer.
   // Replays and out-of-order delivery otherwise converge. nanos are CAST to
   // INTEGER (< 2^63) only for comparison; the stored value stays the TEXT we got.
+  // Only fixed SQL aliases and attribute literals below may reach this helper;
+  // never pass request-derived strings here. User filters are bound separately.
   const hasAttr = (prefix: string, key: string, value?: string) =>
     `EXISTS (SELECT 1 FROM json_each(${prefix}attrs_json) a WHERE
       json_extract(a.value, '$.key') = '${key}'${value === undefined ? "" :

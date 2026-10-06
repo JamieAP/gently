@@ -87,7 +87,7 @@ fn scaffold_config(cfg: &Config) -> Result<()> {
         # OPTIONAL tunables (shown with their defaults; uncomment to change):\n\
         #\n\
         # prefer_quic = true          # prefer HTTP/3 (QUIC) for export, fall back to HTTP/2\n\
-        # outbox_cap = 10000          # max buffered envelope rows before the oldest are dropped\n\
+        # outbox_cap = 10000          # manual export cap; --preserve-backlog bypasses trimming\n\
         # export_batch = 512          # OTLP envelope rows per export request\n\
         # export_timeout_secs = 15    # per-request export timeout\n\
         # query_timeout_secs = 30     # per-request query / MCP timeout\n\
@@ -317,6 +317,22 @@ fn migrate_codex_json_hooks(
     exe: &Path,
     doc: &DocumentMut,
 ) -> Result<Option<(Value, usize)>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => anyhow::bail!("cannot inspect legacy Codex hooks.json for optional migration"),
+    };
+    #[cfg(unix)]
+    let unsafe_owner_or_links = {
+        use std::os::unix::fs::MetadataExt;
+        metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1
+    };
+    #[cfg(not(unix))]
+    let unsafe_owner_or_links = false;
+    if !metadata.file_type().is_file() || unsafe_owner_or_links {
+        eprintln!("gently: skipped legacy Codex hooks.json migration: path is linked, not regular, or not owned by this user; review duplicate Gently handlers manually");
+        return Ok(None);
+    }
     harden_existing_file(path)?;
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,

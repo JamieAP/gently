@@ -7,7 +7,42 @@ import subprocess
 import sys
 import time
 import re
+import stat
 from pathlib import Path
+
+
+def private_collector_state(repo):
+    """Protect local D1 metadata as well as ciphertext, without opening DB FDs."""
+    root = Path(repo) / "worker" / ".wrangler"
+    root.mkdir(mode=0o700, exist_ok=True)
+
+    def harden(path):
+        metadata = path.lstat()
+        directory = stat.S_ISDIR(metadata.st_mode)
+        if metadata.st_uid != os.geteuid() or not (directory or stat.S_ISREG(metadata.st_mode)) or \
+                not directory and metadata.st_nlink != 1:
+            raise RuntimeError("Local collector state must contain only owned, unlinked regular files and directories.")
+        # Path-based chmod does not close another SQLite descriptor and therefore
+        # cannot discard the process's POSIX database locks.
+        mode = 0o700 if directory else 0o600
+        if sys.platform == "linux":
+            # Older glibc rejects no-follow chmod. O_PATH pins the inode without
+            # creating a regular descriptor whose close would release SQLite locks.
+            descriptor = os.open(path, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                pinned = os.fstat(descriptor)
+                if pinned.st_dev != metadata.st_dev or pinned.st_ino != metadata.st_ino:
+                    raise RuntimeError("Local collector state changed during permission hardening.")
+                os.chmod(f"/proc/self/fd/{descriptor}", mode)
+            finally:
+                os.close(descriptor)
+        else:
+            os.chmod(path, mode, follow_symlinks=False)
+
+    harden(root)
+    for directory, directories, files in os.walk(root, followlinks=False):
+        for name in directories + files:
+            harden(Path(directory) / name)
 
 
 def public_setup(gently, check=False):
@@ -79,6 +114,7 @@ def stop_children(children):
 
 
 def main():
+    os.umask(0o077)
     if sys.argv[1] == "--check":
         public_setup(sys.argv[2], check=True)
         return 0
@@ -88,6 +124,7 @@ def main():
         os.execvpe(gently, [gently, "export", "--watch", "--serve-queries", "--preserve-backlog"], environment)
     node, gently, repo = sys.argv[1:]
     repo = Path(repo)
+    private_collector_state(repo)
     environment = local_environment(public_setup(gently))
     children = []
     stopping = False
@@ -113,9 +150,7 @@ def main():
         children.append(subprocess.Popen([gently, "export", "--watch", "--serve-queries", "--preserve-backlog"], cwd=repo,
             env=environment, start_new_session=True))
         children.append(subprocess.Popen([
-            node, str(repo / "worker/node_modules/wrangler/bin/wrangler.js"), "dev",
-            "--config", str(repo / "worker/wrangler.local.toml"), "--local",
-            "--ip", "127.0.0.1", "--port", "8787", "--env-file", "/dev/null",
+            node, str(repo / "worker/scripts/collector-local.mjs"),
         ], cwd=repo / "worker", env=worker_env, start_new_session=True))
         print("Gently collector and persistent exporter started.", flush=True)
         while not stopping:

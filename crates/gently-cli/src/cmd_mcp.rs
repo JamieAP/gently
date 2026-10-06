@@ -223,7 +223,7 @@ fn span_attr_keys(rows: &[crate::query_client::SpanRow]) -> Value {
 
 fn collect_attr_keys(blob: Option<&str>, keys: &mut BTreeSet<String>) {
     let Some(blob) = blob else { return };
-    let Ok(attrs) = serde_json::from_str::<Value>(blob) else {
+    let Ok(attrs) = crate::json_fidelity::parse(blob) else {
         return;
     };
     let Some(attrs) = attrs.as_array() else {

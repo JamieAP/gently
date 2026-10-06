@@ -2,7 +2,8 @@
 """Public-repository Git gate. Scan Git objects, never working-tree secrets."""
 
 import os
-from pathlib import PurePosixPath
+import json
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
@@ -17,20 +18,21 @@ SECRET_RULES = (
     ("OpenAI API key", re.compile(rb"\bsk-(?:proj-|svcacct-)[A-Za-z0-9_-]{24,255}\b|\bsk-[A-Za-z0-9]{48}\b")),
     ("AWS access key", re.compile(rb"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")),
     ("Google API key", re.compile(rb"\bAIza[A-Za-z0-9_-]{35}\b")),
+    ("age private identity", re.compile(rb"AGE-(?:SECRET-KEY-1|PLUGIN-SE-1)[A-Z0-9]+")),
 )
-PRIVATE_DIRS = {".gently", ".claude", ".codex", "agent-secrets", ".wrangler", "__pycache__", "node_modules", "target"}
-PRIVATE_SUFFIXES = (".db", ".db-wal", ".db-shm", ".db-journal", ".sqlite", ".sqlite3", ".jsonl", ".pem", ".p12", ".pfx", ".key", ".log", ".pyc", ".pyo")
+PRIVATE_DIRS = {".gently", ".claude", ".codex", ".aws", ".ssh", "agent-secrets", ".wrangler", "__pycache__", "node_modules", "target"}
+PRIVATE_SUFFIXES = (".db", ".db-wal", ".db-shm", ".db-journal", ".sqlite", ".sqlite3", ".jsonl", ".pem", ".p12", ".pfx", ".key", ".log", ".pyc", ".pyo", ".age", ".enc", ".zip", ".tar", ".tgz", ".gz", ".bz2", ".xz", ".zst", ".7z", ".rar", ".har", ".parquet", ".bak", ".backup")
 
 
 class CheckFailure(Exception):
     pass
 
 
-def git(*args):
+def git(*args, failure="Git could not inspect the requested objects; check aborted"):
     result = subprocess.run(["git", "--no-replace-objects", *args], capture_output=True, check=False)
     if result.returncode:
         # Git output might contain object contents or private values. Do not echo it.
-        raise CheckFailure("Git could not inspect the requested objects; check aborted")
+        raise CheckFailure(failure)
     return result.stdout
 
 
@@ -39,7 +41,7 @@ def private_path(path):
     name = parts[-1].lower() if parts else ""
     return (
         any(p.lower() in PRIVATE_DIRS for p in parts)
-        or bool(parts and parts[0].lower() in {"raw", "state"})
+        or bool(parts and parts[0].lower() in {"raw", "state", "traces", "captures", "exports", "backups", "keys", "policy", "tenants"})
         or name == ".env" or name.startswith(".env.") or name == ".envrc"
         or name == ".dev.vars" or name.startswith(".dev.vars.")
         or name.endswith(PRIVATE_SUFFIXES)
@@ -48,10 +50,83 @@ def private_path(path):
     )
 
 
-def scan_bytes(data, label):
+def scan_literal(data, label):
     for rule, pattern in SECRET_RULES:
         if pattern.search(data):
             raise CheckFailure(f"{label!r}: possible {rule}; matched value withheld")
+    public_home = str(Path.home()).encode()
+    if len(public_home) > 3 and (public_home in data or public_home.replace(b"/", b"\\") in data):
+        raise CheckFailure(f"{label!r}: local home path; matched value withheld")
+
+
+def scan_structured(value, label):
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            keys = set(item)
+            kind = item.get("type")
+            if (
+                "resourceSpans" in keys or "resource_spans" in keys
+                or {"hook_event_name", "session_id"} <= keys
+                or {"context", "ciphertext_b64"} <= keys
+                or bool(keys & {"trace_id", "traceId"}) and bool(keys & {"span_id", "spanId", "span_count", "attributes", "resource"})
+                or isinstance(kind, str) and kind in {"session_meta", "event_msg", "response_item", "user", "assistant", "progress"} and bool(keys & {"payload", "message"})
+            ):
+                raise CheckFailure(f"{label!r}: captured agent or telemetry data; values withheld")
+            if keys & {"claudeAiOauth", "access_token", "refresh_token", "api_key", "apiKey", "password", "secret", "private_key"} or {"token", "tenant_id", "device_id"} <= keys and item.get("token") != "HOST_CREDENTIAL_FROM_PROVIDER":
+                raise CheckFailure(f"{label!r}: credential-shaped JSON; values withheld")
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+        elif isinstance(item, str):
+            scan_literal(item.encode("utf-8"), label)
+
+
+def scan_json(data, label):
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeError:
+        return
+    try:
+        try:
+            scan_structured(json.loads(text), label)
+            return
+        except json.JSONDecodeError:
+            pass
+        # Renamed JSONL still needs inspection. Source files with JSON literals
+        # are not parsed as captures unless a whole line is valid JSON.
+        records = 0
+        source = PurePosixPath(label).suffix.lower() in {".rs", ".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs", ".sh", ".c", ".h", ".cpp", ".go"}
+        parsed = []
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                if source:
+                    return  # Source with embedded public JSON fixtures.
+                continue
+            records += 1
+            if records > 4096:
+                raise CheckFailure(f"{label!r}: structured data exceeds the review limit")
+            if source:
+                parsed.append(value)
+            else:
+                scan_structured(value, label)
+        for value in parsed:
+            scan_structured(value, label)
+    except (ValueError, RecursionError):
+        raise CheckFailure(f"{label!r}: structured data could not be safely inspected") from None
+
+
+def scan_bytes(data, label):
+    scan_literal(data, label)
+    signatures = (b"SQLite format 3\0", b"age-encryption.org/v1\n", b"-----BEGIN AGE ENCRYPTED FILE-----", b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08", b"\x1f\x8b", b"BZh", b"\xfd7zXZ\x00", b"7z\xbc\xaf\x27\x1c", b"Rar!\x1a\x07", b"\x28\xb5\x2f\xfd")
+    if data.startswith(signatures) or data[257:262] == b"ustar":
+        raise CheckFailure(f"{label!r}: database, encrypted data or archive; contents withheld")
+    scan_json(data, label)
 
 
 def scan_entries(entries, checked):
@@ -119,6 +194,7 @@ def push_commits(lines):
         commit = git("rev-parse", "--verify", local_oid + "^{commit}").decode().strip()
         args = ["rev-list", "--reverse", commit]
         if set(remote_oid) != {"0"}:
+            git("cat-file", "-e", remote_oid + "^{commit}", failure="Advertised remote commit is unavailable locally; fetch that remote and retry; history scan remains required")
             args.append("^" + remote_oid)
         # A zero advertised destination ID means a new ref. Local tracking refs
         # may be stale or from a redirected remote, so scan all reachable history.
@@ -131,12 +207,23 @@ def main(argv):
             f"Set {ACK_ENV}=1 on this Git command only after reviewing the change "
             "for publication to this public repository"
         )
-    if not argv or argv[0] not in {"pre-commit", "pre-push"}:
-        raise CheckFailure("Expected pre-commit or pre-push mode")
+    if not argv or argv[0] not in {"pre-commit", "commit-msg", "pre-push"}:
+        raise CheckFailure("Expected pre-commit, commit-msg or pre-push mode")
     checked = set()
     if argv[0] == "pre-commit":
         scan_entries(index_entries(), checked)
-        git("diff", "--cached", "--check")
+        git("diff", "--cached", "--check", failure="Staged whitespace or conflict-marker check failed; inspect git diff --cached --check locally")
+    elif argv[0] == "commit-msg":
+        if len(argv) != 2:
+            raise CheckFailure("Expected the commit message file")
+        try:
+            with open(argv[1], "rb") as message:
+                data = message.read(MAX_BLOB_BYTES + 1)
+        except OSError:
+            raise CheckFailure("Commit message could not be inspected; check aborted") from None
+        if len(data) > MAX_BLOB_BYTES:
+            raise CheckFailure("Commit message exceeds the public review limit")
+        scan_bytes(data, "commit message")
     else:
         if len(argv) != 3:
             raise CheckFailure("Expected the pre-push remote name and URL")

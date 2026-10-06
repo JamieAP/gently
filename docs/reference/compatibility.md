@@ -15,7 +15,7 @@ future release or desktop execution mode exposes the same events.
 
 The isolated versions are the latest releases listed in the official changelogs
 on 6 October. They were installed only in a temporary verification directory;
-the user's CLI and desktop installations were left at the versions listed above.
+the development machine's installed versions remain those listed above.
 Both native schemas exactly match Gently's event registrations. Claude's newer
 mod/plugin hooks such as `turn.step` and `tool.check` are a separate programmatic
 interface; this integration observes the documented command-hook contract.

@@ -1,4 +1,5 @@
 import os
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -67,7 +68,7 @@ class PublicRepoSanityTests(unittest.TestCase):
         self.assertNotIn(key, result.stderr + result.stdout)
 
     def test_private_artifacts_are_blocked_without_revealing_contents(self):
-        for name in [".env", "capture.jsonl", "state.db", "state.sqlite-wal", "state.sqlite3-shm", "state.sqlite3-journal", ".gently/raw/event.json", ".claude/settings.json", "capture.log", "scripts/__pycache__/module.pyc"]:
+        for name in [".env", "capture.jsonl", "state.db", "state.sqlite-wal", "state.sqlite3-shm", "state.sqlite3-journal", ".gently/raw/event.json", ".claude/settings.json", "capture.log", "scripts/__pycache__/module.pyc", "reader.age", "owner.enc", "export.zip", "export.har", "state.backup", "traces/event.json", ".aws/credentials"]:
             with self.subTest(name=name):
                 self.stage(name, "private synthetic content\n")
                 result = self.run_git("commit", "-qm", "test", ack=True, check=False)
@@ -75,6 +76,121 @@ class PublicRepoSanityTests(unittest.TestCase):
                 self.assertIn("private artifact path", result.stderr)
                 self.assertNotIn("private synthetic content", result.stderr)
                 self.run_git("rm", "--cached", "--", name)
+
+    def test_renamed_and_wrapped_captures_are_blocked(self):
+        captures = [
+            {"resourceSpans": []},
+            {"resource_spans": []},
+            {"hook_event_name": "SyntheticHook", "session_id": "fixture"},
+            {"context": {}, "ciphertext_b64": "synthetic"},
+            {"trace_id": "fixture", "span_id": "fixture"},
+            {"traceId": "fixture", "spanId": "fixture"},
+            {"type": "event_msg", "payload": {}},
+            {"type": "assistant", "message": {}},
+            {"access_token": "synthetic-credential-canary"},
+            {"token": "synthetic-credential-canary", "tenant_id": "fixture", "device_id": "fixture"},
+        ]
+        for capture in captures:
+            with self.subTest(shape=list(capture)):
+                self.stage("notes.txt", json.dumps({"wrapper": [capture], "private": "synthetic-capture-canary"}))
+                result = self.run_git("commit", "-qm", "fixture", ack=True, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("synthetic-capture-canary", result.stderr)
+                self.assertNotIn("synthetic-credential-canary", result.stderr)
+                self.run_git("rm", "--cached", "notes.txt")
+
+    def test_renamed_jsonl_capture_is_blocked(self):
+        self.stage("notes.txt", json.dumps({"kind": "public fixture"}) + "\n" + json.dumps({"resourceSpans": []}) + "\n")
+        result = self.run_git("commit", "-qm", "fixture", ack=True, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("captured agent or telemetry", result.stderr)
+
+    def test_scalar_bom_and_heading_prefixes_cannot_hide_captures(self):
+        capture = json.dumps({"resourceSpans": []})
+        for text in ['null\n' + capture, '\ufeff' + capture, 'Public-looking heading\n' + capture]:
+            with self.subTest(prefix=text[:5]):
+                self.stage("notes.txt", text)
+                result = self.run_git("commit", "-qm", "fixture", ack=True, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("captured agent or telemetry", result.stderr)
+                self.run_git("-c", "core.hooksPath=/dev/null", "commit", "-qm", "unsafe synthetic fixture")
+                self.run_git("rm", "notes.txt")
+                self.run_git("commit", "-qm", "clean tip", ack=True)
+                oid = self.run_git("rev-parse", "HEAD").stdout.strip()
+                result = self.push_hook(oid)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("captured agent or telemetry", result.stderr)
+
+    def test_long_public_source_file_does_not_hit_json_record_limit(self):
+        self.stage("example.py", 'public_code = 1\n' * 5000)
+        self.run_git("commit", "-qm", "public fixture", ack=True)
+
+    def test_json_escaping_cannot_hide_secret_or_local_home(self):
+        key = "gh" + "p_" + "A" * 36
+        for value in [key, str(Path.home())]:
+            encoded = ''.join('\\u%04x' % ord(char) for char in value)
+            self.stage("notes.txt", '{"description":"' + encoded + '"}')
+            result = self.run_git("commit", "-qm", "fixture", ack=True, check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn(value, result.stderr)
+            self.run_git("rm", "--cached", "notes.txt")
+
+    def test_renamed_database_ciphertext_and_archive_magic_are_blocked(self):
+        signatures = [b"SQLite format 3\0", b"age-encryption.org/v1\n", b"-----BEGIN AGE ENCRYPTED FILE-----", b"PK\x03\x04", b"\x1f\x8b", b"BZh", b"\xfd7zXZ\x00", b"7z\xbc\xaf\x27\x1c", b"Rar!\x1a\x07", b"\x28\xb5\x2f\xfd", b"\0" * 257 + b"ustar"]
+        for signature in signatures:
+            with self.subTest(signature=signature[:8]):
+                (self.root / "notes.txt").write_bytes(signature + b"synthetic-private-canary")
+                self.run_git("add", "notes.txt")
+                result = self.run_git("commit", "-qm", "fixture", ack=True, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("database, encrypted data or archive", result.stderr)
+                self.assertNotIn("synthetic-private-canary", result.stderr)
+                self.run_git("rm", "--cached", "notes.txt")
+
+    def test_private_reader_identity_and_local_home_paths_are_blocked(self):
+        for content in ["AGE-" + "PLUGIN-SE-1" + "A" * 40, str(Path.home() / "private-project/file.txt")]:
+            self.stage("notes.txt", content)
+            result = self.run_git("commit", "-qm", "fixture", ack=True, check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn(content, result.stderr)
+            self.run_git("rm", "--cached", "notes.txt")
+
+    def test_public_source_literals_and_unrelated_json_pass(self):
+        self.stage("example.py", 'fixture = {"resourceSpans": []}\n')
+        self.stage("example.rs", 'const FIXTURE: &str = r#"\n{"trace_id":"fixture","span_id":"fixture"}\n"#;\n')
+        self.stage("package.json", json.dumps({"name": "public-fixture", "type": ["synthetic"], "scripts": {"test": "python3"}}))
+        self.run_git("commit", "-qm", "public fixtures", ack=True)
+
+    def test_renaming_entire_jsonl_capture_as_source_does_not_bypass_scan(self):
+        self.stage("example.rs", 'null\n' + json.dumps({"resourceSpans": []}) + '\n')
+        result = self.run_git("commit", "-qm", "fixture", ack=True, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("captured agent or telemetry", result.stderr)
+
+    def test_deleted_capture_is_still_blocked_from_push_history(self):
+        self.stage("notes.txt", json.dumps({"wrapper": [{"resourceSpans": []}]}))
+        self.run_git("-c", "core.hooksPath=/dev/null", "commit", "-qm", "unsafe synthetic fixture")
+        self.run_git("rm", "notes.txt")
+        self.run_git("commit", "-qm", "clean tip", ack=True)
+        oid = self.run_git("rev-parse", "HEAD").stdout.strip()
+        result = self.push_hook(oid)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("captured agent or telemetry", result.stderr)
+
+    def test_staged_whitespace_has_a_fixed_actionable_diagnostic(self):
+        self.stage("notes.txt", "synthetic public content  \n")
+        result = self.run_git("commit", "-qm", "fixture", ack=True, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("git diff --cached --check", result.stderr)
+        self.assertNotIn("synthetic public content", result.stderr)
+
+    def test_missing_remote_commit_requires_fetch_without_weakening_scan(self):
+        self.stage("notes.txt", "synthetic public fixture\n")
+        self.run_git("commit", "-qm", "fixture", ack=True)
+        oid = self.run_git("rev-parse", "HEAD").stdout.strip()
+        result = self.push_hook(oid, old="1" * 40)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("fetch that remote and retry", result.stderr)
 
     def test_clean_push_requires_review(self):
         self.stage("hello.txt", "synthetic content\n")
@@ -110,7 +226,7 @@ class PublicRepoSanityTests(unittest.TestCase):
     def test_push_scans_commit_and_annotated_tag_messages(self):
         self.stage("hello.txt", "synthetic content\n")
         key = "gh" + "p_" + "A" * 36
-        self.run_git("commit", "-qm", key, ack=True)
+        self.run_git("-c", "core.hooksPath=/dev/null", "commit", "-qm", key)
         oid = self.run_git("rev-parse", "HEAD").stdout.strip()
         result = self.push_hook(oid)
         self.assertNotEqual(result.returncode, 0)
@@ -122,6 +238,15 @@ class PublicRepoSanityTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("outgoing annotated tag", result.stderr)
         self.assertNotIn(key, result.stderr)
+
+    def test_commit_message_secret_is_blocked_before_creating_history(self):
+        self.stage("hello.txt", "synthetic public content\n")
+        key = "gh" + "p_" + "A" * 36
+        result = self.run_git("commit", "-qm", key, ack=True, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("commit message", result.stderr)
+        self.assertNotIn(key, result.stderr)
+        self.assertNotEqual(self.run_git("rev-parse", "--verify", "HEAD", check=False).returncode, 0)
 
     def test_push_scans_nested_annotated_tag_messages(self):
         self.stage("hello.txt", "synthetic content\n")

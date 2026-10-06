@@ -51,14 +51,13 @@ class LauncherTests(unittest.TestCase):
         self.executable("node", 'import json, os, sys, time\nfrom pathlib import Path\n'
             'assert os.environ["WRANGLER_WRITE_LOGS"] == "false"\n'
             'assert os.environ["WRANGLER_SEND_METRICS"] == "false"\n'
-            'assert os.environ["WRANGLER_LOG"] == "log"\n'
+            'assert os.environ["WRANGLER_LOG"] == "none"\n'
             'assert "GENTLY_TOKEN" not in os.environ\n'
             'hosts = json.loads(os.environ["GENTLY_HOSTS"])\n'
             'setup = json.loads(os.environ["FIXTURE_PUBLIC_SETUP"])\n'
             'assert hosts == [{"token": "synthetic-fixture-only", "tenant_id": setup["tenant_id"], "device_id": setup["device_id"], "capabilities": ["ingest", "read"]}]\n'
-            'assert Path.cwd().resolve() == Path(sys.argv[1]).parents[3].resolve()\n'
-            'assert sys.argv[2:4] == ["dev", "--config"]\n'
-            'assert sys.argv[5:] == ["--local", "--ip", "127.0.0.1", "--port", "8787", "--env-file", "/dev/null"]\n'
+            'assert Path.cwd().resolve() == Path(sys.argv[1]).parents[1].resolve()\n'
+            'assert Path(sys.argv[1]).name == "collector-local.mjs" and len(sys.argv) == 2\n'
             'Path(os.environ["FIXTURE_DIR"], "collector.pid").write_text(str(os.getpid()))\n'
             'time.sleep(0.3)\n')
 

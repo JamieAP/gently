@@ -67,7 +67,7 @@ impl SpanRow {
     /// blob is absent, unparseable, or lacks the key.
     pub fn resource_attr(&self, key: &str) -> Option<String> {
         let blob = self.resource_json.as_deref()?;
-        let attrs: serde_json::Value = serde_json::from_str(blob).ok()?;
+        let attrs = crate::json_fidelity::parse(blob).ok()?;
         attrs.as_array()?.iter().find_map(|kv| {
             (kv.get("key")?.as_str()? == key)
                 .then(|| {
@@ -171,6 +171,7 @@ fn hydrate_cached_payload(
 
 impl QueryClient {
     pub fn new(cfg: &Config) -> Result<Self> {
+        cfg.require_collector_url()?;
         #[cfg(unix)]
         let query_socket = if cfg.token.is_empty() {
             let path = cfg.runtime_dir().join("query.sock");

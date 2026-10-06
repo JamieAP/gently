@@ -84,9 +84,12 @@ agent-secrets run default -- ./scripts/collector-local
 The provider unlocks once, then Gently starts the Worker and
 `gently export --watch`. The supervisor creates the Worker's `GENTLY_HOSTS`
 authorization map in memory from the inherited token and tenant/device IDs;
+it sets an owner-only creation mask and hardens local Wrangler directories and
+files to `0700`/`0600`, including existing D1 databases, without releasing SQLite locks;
 it removes `GENTLY_TOKEN` from the Worker environment. No plaintext secret file
-or token argument is created. The Worker binds to loopback, Wrangler telemetry
-and disk diagnostics are disabled. Either child's exit stops both owned process
+or token argument is created. The Worker binds to loopback; the launcher uses
+Wrangler's API to disable its DevTools inspector, remote bindings, telemetry
+and diagnostic output. Either child's exit stops both owned process
 groups, including descendants of a parent that has already exited.
 
 Leave the terminal open. Stop both services with Ctrl+C, and stop an old
@@ -111,19 +114,19 @@ gently status
 ```
 
 Look for a recent `last_success` and a draining `pending (outbox)` count. A
-running launcher alone does not prove delivery. From a separate process with
-an inherited read credential:
+running launcher alone does not prove delivery. While the local exporter serves
+queries, a separate CLI or MCP process can use its same-user, tenant/device-scoped
+Unix socket without inheriting the token:
 
 ```sh
 gently traces
 gently trace TRACE_ID --waterfall
 ```
 
-Replace `TRACE_ID` with an ID from the trace list. An optional helper invocation
-is `agent-secrets run default -- gently traces`. The watcher's credential does
-not authenticate another CLI or MCP process. Tokenless desktop hooks can queue
-for the watcher; authenticated desktop MCP access and Claude Chat/Cowork
-integration remain incomplete.
+Replace `TRACE_ID` with an ID from the trace list. For direct HTTP access instead,
+supply a read credential through your provider. Tokenless desktop hooks queue
+for the watcher; desktop MCP uses the local query broker. Claude Chat/Cowork
+integration is outside the coding-agent scope.
 
 ## State and failures
 
