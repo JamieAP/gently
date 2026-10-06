@@ -32,6 +32,41 @@ const RAW_FIELDS: &[&str] = &[
     "gently.instruction_file",
 ];
 
+/// Inspect only authenticated public policy. This never opens a reader identity.
+pub fn policy_health(cfg: &Config) -> (&'static str, Option<u64>) {
+    if !cfg.capture_raw_values {
+        return ("disabled", None);
+    }
+    let inspect = || -> Result<u64> {
+        let signed: SignedManifest =
+            read_public_json(cfg.raw_manifest.as_deref().context("missing policy")?)?;
+        let pin: TrustPin = read_public_json(cfg.raw_trust.as_deref().context("missing trust")?)?;
+        let verified = VerifiedManifest::verify_at(&signed, &pin, 0)?;
+        ensure!(
+            verified.manifest().tenant_id == cfg.tenant_id,
+            "wrong tenant"
+        );
+        Ok(verified.manifest().expires_unix_secs)
+    };
+    match inspect() {
+        Err(_) => ("unavailable", None),
+        Ok(expires) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|v| v.as_secs())
+                .unwrap_or(u64::MAX);
+            let state = if expires <= now {
+                "expired"
+            } else if expires.saturating_sub(now) <= 7 * 24 * 3600 {
+                "expiring_soon"
+            } else {
+                "valid"
+            };
+            (state, Some(expires))
+        }
+    }
+}
+
 /// In-memory raw material plus authenticated public recipient policy. Capture
 /// never opens an identity file or invokes a private-key provider.
 pub struct PreparedRaw {

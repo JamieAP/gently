@@ -132,11 +132,19 @@ queue storage can grow without a limit. A tokenless queue can grow past this cap
 before export begins. See [reliability](../concepts/reliability.md) for delivery,
 retry, and quarantine behavior.
 
-## `gently status`
+## `gently status [--json]`
 
 Print local queue depth, quarantine count, configured collector URL, transport
 preference, consecutive failures, last attempt, last success, and last error.
-It does not contact the collector or verify that a token works.
+It does not contact the collector or verify that a token works. Capture health is
+separate from export health: last capture time/outcome and lifetime fixed-category
+counts reveal metadata fallback, expired/missing policy, oversized payloads,
+ciphertext budget exhaustion and invalid hooks. `--json` exposes these fields for
+monitoring without raw payloads or exporter error strings. Recipient policy is
+verified using only public files, with a seven-day expiry warning; status never
+unlocks a reader. The capture-health table is an additive encrypted-schema-2
+extension and preserves existing queued state. Failures before the state database
+can be opened cannot be recorded there.
 
 ## `gently traces`
 

@@ -17,7 +17,96 @@ pub struct Health {
     pub consecutive_failures: u64,
 }
 
+/// Fixed categories only: capture health never stores payloads or error strings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureOutcome {
+    MetadataOnly,
+    Encrypted,
+    PolicyUnavailable,
+    PolicyExpired,
+    Oversized,
+    RawCapacity,
+    SealFailed,
+    InvalidHook,
+    CaptureFailed,
+}
+impl CaptureOutcome {
+    pub const ALL: [Self; 9] = [
+        Self::MetadataOnly,
+        Self::Encrypted,
+        Self::PolicyUnavailable,
+        Self::PolicyExpired,
+        Self::Oversized,
+        Self::RawCapacity,
+        Self::SealFailed,
+        Self::InvalidHook,
+        Self::CaptureFailed,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::MetadataOnly => "metadata_only",
+            Self::Encrypted => "encrypted",
+            Self::PolicyUnavailable => "policy_unavailable",
+            Self::PolicyExpired => "policy_expired",
+            Self::Oversized => "oversized",
+            Self::RawCapacity => "raw_capacity",
+            Self::SealFailed => "seal_failed",
+            Self::InvalidHook => "invalid_hook",
+            Self::CaptureFailed => "capture_failed",
+        }
+    }
+}
+#[derive(Clone, Debug, Default)]
+pub struct CaptureHealth {
+    pub last_capture_unix_nano: Option<u64>,
+    pub last_outcome: Option<CaptureOutcome>,
+    pub counts: std::collections::BTreeMap<&'static str, u64>,
+}
+
 impl Store {
+    pub fn capture_record(&self, outcome: CaptureOutcome, now: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO capture_health (outcome, count, last_unix_nano)
+            VALUES (?1, 1, ?2) ON CONFLICT(outcome) DO UPDATE SET
+            count = count + 1, last_unix_nano = max(last_unix_nano, ?2)",
+            rusqlite::params![outcome.label(), now as i64],
+        )?;
+        Ok(())
+    }
+    pub fn capture_snapshot(&self) -> Result<CaptureHealth> {
+        let mut snapshot = CaptureHealth::default();
+        for outcome in CaptureOutcome::ALL {
+            snapshot.counts.insert(outcome.label(), 0);
+        }
+        // One SELECT gives a consistent SQLite snapshot under concurrent hooks.
+        let mut query = self
+            .conn
+            .prepare("SELECT outcome, count, last_unix_nano FROM capture_health")?;
+        let rows = query.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as u64,
+                r.get::<_, i64>(2)? as u64,
+            ))
+        })?;
+        for row in rows {
+            let (label, count, when) = row?;
+            let Some(outcome) = CaptureOutcome::ALL.into_iter().find(|v| v.label() == label) else {
+                continue;
+            };
+            snapshot.counts.insert(outcome.label(), count);
+            if count > 0
+                && snapshot
+                    .last_capture_unix_nano
+                    .is_none_or(|last| when > last)
+            {
+                snapshot.last_capture_unix_nano = Some(when);
+                snapshot.last_outcome = Some(outcome);
+            }
+        }
+        Ok(snapshot)
+    }
+
     /// Move whole queued envelopes into quarantine with a reason.
     /// Returns how many outbox rows were quarantined.
     pub fn outbox_quarantine(&self, ids: &[i64], reason: &str) -> Result<usize> {
@@ -135,5 +224,37 @@ mod tests {
         assert_eq!(h.consecutive_failures, 0);
         assert_eq!(h.last_error, None);
         assert_eq!(h.last_ok_unix_nano, Some(300));
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use crate::{CaptureOutcome, Store};
+    #[test]
+    fn capture_extension_reopens_existing_encrypted_schema_without_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        {
+            let store = Store::open(&path).unwrap();
+            store.outbox_enqueue("synthetic metadata").unwrap();
+        }
+        {
+            let db = rusqlite::Connection::open(&path).unwrap();
+            db.execute("DROP TABLE capture_health", []).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.outbox_len().unwrap(), 1);
+        assert!(store.capture_snapshot().unwrap().last_outcome.is_none());
+        for (when, outcome) in [
+            (1, CaptureOutcome::Encrypted),
+            (2, CaptureOutcome::RawCapacity),
+            (3, CaptureOutcome::Encrypted),
+        ] {
+            store.capture_record(outcome, when).unwrap();
+        }
+        let health = store.capture_snapshot().unwrap();
+        assert_eq!(health.last_outcome, Some(CaptureOutcome::Encrypted));
+        assert_eq!(health.counts["raw_capacity"], 1);
+        assert_eq!(health.counts["encrypted"], 2);
     }
 }

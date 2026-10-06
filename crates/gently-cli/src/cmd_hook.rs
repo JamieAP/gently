@@ -12,7 +12,7 @@ use crate::local_raw;
 use crate::HarnessKind;
 use gently_core::{OtlpRequest, Resource, Span, SpanId, SpanKind, Status, TraceId};
 use gently_harness::{apply, ClaudeCode, Codex, Harness, Parsed};
-use gently_store::Store;
+use gently_store::{CaptureOutcome, Store};
 use std::io::Read;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -42,20 +42,42 @@ fn process(harness: HarnessKind) -> anyhow::Result<()> {
 
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw)?;
-    let value = crate::json_fidelity::parse(&raw)?;
-
     let store = Store::open(&cfg.state_db())?;
+    let value = match crate::json_fidelity::parse(&raw) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = store.capture_record(CaptureOutcome::InvalidHook, now_nanos());
+            return Err(error);
+        }
+    };
 
     let adapter: &dyn Harness = match harness {
         HarnessKind::Claude => &ClaudeCode,
         HarnessKind::Codex => &Codex,
     };
-    let mut parsed = adapter.parse(&value)?;
+    let mut parsed = match adapter.parse(&value) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let _ = store.capture_record(CaptureOutcome::InvalidHook, now_nanos());
+            return Err(error.into());
+        }
+    };
     let mut metadata_parsed = parsed.clone();
     local_raw::metadata_only(&mut metadata_parsed);
+    let mut outcome = CaptureOutcome::MetadataOnly;
     let prepared_raw = match local_raw::prepare(&cfg, &value, &mut parsed, adapter.name()) {
-        Ok(prepared) => prepared,
+        Ok(prepared) => {
+            if prepared.is_some() {
+                outcome = CaptureOutcome::Encrypted;
+            }
+            prepared
+        }
         Err(_) => {
+            outcome = if local_raw::policy_health(&cfg).0 == "expired" {
+                CaptureOutcome::PolicyExpired
+            } else {
+                CaptureOutcome::PolicyUnavailable
+            };
             tracing::warn!("encrypted raw capture unavailable; preserving length-only telemetry");
             None
         }
@@ -68,17 +90,44 @@ fn process(harness: HarnessKind) -> anyhow::Result<()> {
 
     let capturing = prepared_raw.is_some();
     let result = store.transaction::<_, anyhow::Error>(|store| {
-        enqueue_event(store, &cfg, &parsed, &value, &resource, prepared_raw)
+        enqueue_event(store, &cfg, &parsed, &value, &resource, prepared_raw)?;
+        store.capture_record(outcome, now_nanos())?;
+        Ok(())
     });
-    if capturing && result.is_err() {
+    if let Err(error) = result {
+        if !capturing {
+            let _ = store.capture_record(CaptureOutcome::CaptureFailed, now_nanos());
+            return Err(error);
+        }
+        outcome = if matches!(
+            error.downcast_ref::<gently_store::StoreError>(),
+            Some(gently_store::StoreError::RawCapacity)
+        ) {
+            CaptureOutcome::RawCapacity
+        } else if matches!(
+            error.downcast_ref::<gently_raw::Error>(),
+            Some(gently_raw::Error::Invalid(
+                "plaintext exceeds size limit" | "ciphertext exceeds size limit"
+            ))
+        ) {
+            CaptureOutcome::Oversized
+        } else if local_raw::policy_health(&cfg).0 == "expired" {
+            CaptureOutcome::PolicyExpired
+        } else {
+            CaptureOutcome::SealFailed
+        };
         // The ciphertext transaction has rolled back every lifecycle write and
         // ref. An oversized payload or expired policy must not lose telemetry.
         tracing::warn!("encrypted raw capture unavailable; preserving length-only telemetry");
-        store.transaction::<_, anyhow::Error>(|store| {
-            enqueue_event(store, &cfg, &metadata_parsed, &value, &resource, None)
-        })?;
-    } else {
-        result?;
+        let fallback = store.transaction::<_, anyhow::Error>(|store| {
+            enqueue_event(store, &cfg, &metadata_parsed, &value, &resource, None)?;
+            store.capture_record(outcome, now_nanos())?;
+            Ok(())
+        });
+        if let Err(error) = fallback {
+            let _ = store.capture_record(CaptureOutcome::CaptureFailed, now_nanos());
+            return Err(error);
+        }
     }
 
     // Reap provisional spans after crashes, older harness releases or missing

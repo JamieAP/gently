@@ -99,6 +99,7 @@ fn raw_capture_encrypts_public_only_and_binds_open_tool_input_to_completed_span(
         run_hook_capture(dir.path(), payload, true);
     }
     let store = Store::open(&runtime(dir.path()).join("state.db")).unwrap();
+    assert_eq!(store.capture_snapshot().unwrap().counts["encrypted"], 3);
     assert_eq!(store.raw_objects_len().unwrap(), 3);
     let objects = store.raw_objects_pending("personal", 10).unwrap();
     let identities = ReaderIdentities::from_native(vec![identity]);
@@ -241,6 +242,10 @@ fn expired_policy_preserves_metadata_and_never_creates_raw_references() {
     assert!(queued[0].1.contains("gently.prompt.bytes"));
     assert!(!queued[0].1.contains(".raw_ref"));
     assert!(!queued[0].1.contains("expired policy private fixture"));
+    assert_eq!(
+        store.capture_snapshot().unwrap().counts["policy_expired"],
+        1
+    );
 }
 
 #[test]
@@ -309,6 +314,7 @@ fn oversized_raw_payload_rolls_back_refs_but_preserves_metadata() {
     assert!(queued[0].1.contains("gently.prompt.bytes"));
     assert!(!queued[0].1.contains(".raw_ref"));
     assert!(!queued[0].1.contains("large-private-fixture"));
+    assert_eq!(store.capture_snapshot().unwrap().counts["oversized"], 1);
     let pending = store.open_span_attributes().unwrap();
     assert_eq!(pending.len(), 1);
     assert!(!pending[0].1.contains(".raw_ref"));
@@ -616,4 +622,80 @@ fn encrypted_receipt_retains_precise_nested_and_future_payload_fields() {
         .contains(&receipt["spanId"].as_str().unwrap().to_string()));
     assert!(!queued[0].1.contains("private summary"));
     assert!(!queued[0].1.contains(".sha256"));
+}
+
+#[test]
+fn capture_health_json_is_keyless_and_contains_no_payloads() {
+    let dir = tempfile::tempdir().unwrap();
+    enrollment_expiry(dir.path(), 1);
+    run_hook_capture(
+        dir.path(),
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"synthetic","prompt":"health-private-canary"}"#,
+        true,
+    );
+    let output = Command::cargo_bin("gently")
+        .unwrap()
+        .args(["status", "--json"])
+        .env("GENTLY_STATE_DIR", dir.path())
+        .env("GENTLY_TENANT_ID", "personal")
+        .env("GENTLY_DEVICE_ID", "capture-host")
+        .env("GENTLY_CAPTURE_RAW_VALUES", "1")
+        .env("GENTLY_RAW_MANIFEST", dir.path().join("manifest.json"))
+        .env("GENTLY_RAW_TRUST", dir.path().join("trust.json"))
+        .env("GENTLY_RAW_IDENTITY", dir.path().join("missing-reader.age"))
+        .env_remove("GENTLY_TOKEN")
+        .assert()
+        .success();
+    let health: serde_json::Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert_eq!(health["capture"]["degraded"], true);
+    assert_eq!(health["capture"]["counts"]["policy_expired"], 1);
+    assert_eq!(health["policy"]["state"], "expired");
+    assert_eq!(health["policy"]["expires_unix_secs"], 1);
+    assert!(health["capture"]["last_capture_unix_nano"]
+        .as_u64()
+        .is_some());
+    assert!(!health.to_string().contains("health-private-canary"));
+    assert!(output.get_output().stderr.is_empty());
+}
+
+#[test]
+fn missing_policy_is_observable_while_disabled_capture_is_healthy() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"synthetic","prompt":"never persist this fixture"}"#;
+    run_hook_capture(dir.path(), payload, true);
+    run_hook_capture(dir.path(), payload, false);
+    let store = Store::open(&runtime(dir.path()).join("state.db")).unwrap();
+    let health = store.capture_snapshot().unwrap();
+    assert_eq!(health.counts["policy_unavailable"], 1);
+    assert_eq!(health.counts["metadata_only"], 1);
+    assert_eq!(
+        health.last_outcome,
+        Some(gently_store::CaptureOutcome::MetadataOnly)
+    );
+}
+
+#[test]
+fn failed_encrypted_and_metadata_transactions_record_capture_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    enrollment(dir.path());
+    std::fs::create_dir_all(runtime(dir.path())).unwrap();
+    let db = runtime(dir.path()).join("state.db");
+    {
+        let _ = Store::open(&db).unwrap();
+    }
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection.execute_batch("CREATE TRIGGER synthetic_failure BEFORE INSERT ON outbox BEGIN SELECT RAISE(FAIL, 'synthetic failure'); END;").unwrap();
+    run_hook_capture(
+        dir.path(),
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"synthetic","prompt":"double-failure-canary"}"#,
+        true,
+    );
+    let store = Store::open(&db).unwrap();
+    assert_eq!(store.outbox_len().unwrap(), 0);
+    assert_eq!(store.raw_objects_len().unwrap(), 0);
+    assert_eq!(
+        store.capture_snapshot().unwrap().counts["capture_failed"],
+        1
+    );
+    assert_eq!(store.capture_snapshot().unwrap().counts["encrypted"], 0);
 }
