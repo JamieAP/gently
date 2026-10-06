@@ -7,7 +7,9 @@ use assert_cmd::Command;
 fn mcp_initialize_and_tools_list() {
     let dir = tempfile::tempdir().unwrap();
     let input = concat!(
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","_meta":{"$serde_json::private::Number":"ordinary metadata"}}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"synthetic-client","version":"1"},"_meta":{"$serde_json::private::Number":"ordinary metadata"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
         "\n",
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
         "\n",
@@ -62,7 +64,9 @@ fn mcp_initialize_and_tools_list() {
 fn mcp_response_fields_accepts_jq_filter() {
     let dir = tempfile::tempdir().unwrap();
     let input = concat!(
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"synthetic-client","version":"1"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
         "\n",
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"response_fields","arguments":{"tool":"sessions","jq":".fields"}}}"#,
         "\n",
@@ -92,7 +96,9 @@ fn mcp_response_fields_accepts_jq_filter() {
 fn mcp_metadata_handshake_does_not_unlock_or_require_an_opted_in_reader() {
     let dir = tempfile::tempdir().unwrap();
     let input = concat!(
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"synthetic-client","version":"1"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
         "\n",
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
         "\n",
@@ -122,4 +128,119 @@ fn mcp_metadata_handshake_does_not_unlock_or_require_an_opted_in_reader() {
         .iter()
         .all(|message| message.get("error").is_none()));
     assert!(assert.get_output().stderr.is_empty());
+}
+
+fn run_messages(input: String) -> Vec<serde_json::Value> {
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::cargo_bin("gently")
+        .unwrap()
+        .arg("mcp")
+        .env("GENTLY_STATE_DIR", dir.path())
+        .env("GENTLY_COLLECTOR_URL", "http://127.0.0.1:9")
+        .env("GENTLY_TOKEN", "synthetic-token")
+        .write_stdin(input)
+        .assert()
+        .success();
+    assert!(output.get_output().stderr.is_empty());
+    String::from_utf8(output.get_output().stdout.clone())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn handshake() -> String {
+    concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1900-01-01","capabilities":{},"clientInfo":{"name":"synthetic","version":"1"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        "\n",
+    ).into()
+}
+
+#[test]
+fn negotiation_ping_protocol_errors_and_tool_execution_errors() {
+    let mut input = handshake();
+    for (id, method, params) in [
+        (2, "ping", serde_json::json!({})),
+        (3, "unknown", serde_json::json!({})),
+        (4, "tools/call", serde_json::json!({"name":"unknown"})),
+        (5, "tools/call", serde_json::json!({"name":"get_trace"})),
+        (
+            6,
+            "tools/call",
+            serde_json::json!({"name":"search_spans","arguments":{"limit":4294967297u64}}),
+        ),
+        (
+            7,
+            "tools/call",
+            serde_json::json!({"name":"search_spans","arguments":{"order":"invalid"}}),
+        ),
+        (
+            8,
+            "tools/call",
+            serde_json::json!({"name":"trace_stats","arguments":{"jq":42}}),
+        ),
+        (9, "tools/call", serde_json::json!({"name":"trace_stats"})),
+        (
+            10,
+            "tools/call",
+            serde_json::json!({"name":"response_fields","arguments":{"jq":"["}}),
+        ),
+    ] {
+        input += &format!(
+            "{}\n",
+            serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
+        );
+    }
+    let rows = run_messages(input);
+    assert_eq!(rows[0]["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(rows[1]["result"], serde_json::json!({}));
+    assert_eq!(rows[2]["error"]["code"], -32601);
+    for row in &rows[3..8] {
+        assert_eq!(row["error"]["code"], -32602);
+    }
+    for row in &rows[8..] {
+        assert_eq!(row["result"]["isError"], true);
+        assert!(row.get("error").is_none());
+        assert!(!row.to_string().contains("synthetic-token"));
+    }
+}
+
+#[test]
+fn invalid_and_oversized_frames_recover_without_replying_to_notifications() {
+    let mut input = String::from("invalid JSON\n[]\n{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\n");
+    input += &"x".repeat(1024 * 1024 + 1);
+    input += "\n";
+    input += &handshake();
+    let rows = run_messages(input);
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0]["error"]["code"], -32700);
+    assert_eq!(rows[1]["error"]["code"], -32600);
+    assert_eq!(rows[2]["error"]["code"], -32700);
+    assert_eq!(rows[3]["result"]["serverInfo"]["name"], "gently");
+}
+
+#[test]
+fn schema_valid_empty_jq_is_a_noop() {
+    let input = handshake() + "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"response_fields\",\"arguments\":{\"tool\":\"sessions\",\"jq\":\"\"}}}\n";
+    let rows = run_messages(input);
+    assert_eq!(rows[1]["result"]["isError"], false);
+}
+
+#[test]
+fn invalid_envelopes_preserve_detected_integer_or_string_ids() {
+    let input = concat!(
+        r#"{"jsonrpc":"2.0","id":42,"method":false}"#,
+        "\n",
+        r#"{"jsonrpc":"wrong","id":"correlate","method":"ping"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":1.5,"method":"ping"}"#,
+        "\n",
+    );
+    let rows = run_messages(input.into());
+    assert_eq!(rows[0]["id"], 42);
+    assert_eq!(rows[1]["id"], "correlate");
+    assert!(rows[2]["id"].is_null());
+    assert!(rows.iter().all(|row| row["error"]["code"] == -32600));
 }

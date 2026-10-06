@@ -206,3 +206,17 @@ configuration/environment settings can still enable it. Decrypted output can
 enter the calling agent's model-provider context. Retained ciphertext remains
 after capture is disabled, and new readers cannot automatically decrypt older
 objects. See [security and privacy](../concepts/security-and-privacy.md).
+
+## MCP protocol contract
+
+The stdio server implements MCP `2025-06-18`. It returns that supported version
+when a client proposes another version; clients must accept it or disconnect.
+After `initialize`, send `notifications/initialized` before tool requests. `ping`
+works during initialization. Tool argument errors use JSON-RPC `-32602`; collector
+or local-filter execution failures return tool content with `isError: true`.
+Messages are newline-delimited and limited to 1 MiB per input frame. Invalid or
+oversized frames receive a parse error and are drained before reading the next
+frame. Error messages omit private payloads, URLs and filter source.
+
+See the [MCP lifecycle](https://modelcontextprotocol.io/specification/2025-06-18/basic/lifecycle)
+and [tool error contract](https://modelcontextprotocol.io/specification/2025-06-18/server/tools).

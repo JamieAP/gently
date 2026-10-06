@@ -14,6 +14,8 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::io::{BufRead, Write};
 
+const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
 pub fn run() -> Result<()> {
@@ -23,36 +25,113 @@ pub fn run() -> Result<()> {
         .enable_all()
         .build()?;
 
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
+    serve(stdin_lock(), &mut std::io::stdout(), &client, &runtime)
+}
+
+fn stdin_lock() -> std::io::StdinLock<'static> {
+    std::io::stdin().lock()
+}
+
+#[derive(Debug)]
+struct RpcError(i32, &'static str);
+
+fn valid_id(id: &Value) -> bool {
+    id.is_string() || id.as_i64().is_some() || id.as_u64().is_some()
+}
+
+fn rpc_error(id: Value, error: RpcError) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": error.0, "message": error.1}})
+}
+
+// Read bounded frames and drain an oversized frame without allocating its tail.
+fn frame(input: &mut impl BufRead) -> std::io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    let mut oversized = false;
+    loop {
+        let chunk = input.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok((!bytes.is_empty() || oversized).then_some(bytes));
+        }
+        let length = chunk
+            .iter()
+            .position(|&v| v == b'\n')
+            .map_or(chunk.len(), |i| i + 1);
+        let finished = chunk[length - 1] == b'\n';
+        if !oversized && bytes.len() + length <= MAX_FRAME_BYTES {
+            bytes.extend_from_slice(&chunk[..length]);
+        } else {
+            oversized = true;
+            bytes.clear();
+        }
+        input.consume(length);
+        if finished {
+            // An empty sentinel is an invalid/oversized frame, never a notification.
+            return Ok(Some(bytes));
+        }
+    }
+}
+
+fn serve(
+    mut input: impl BufRead,
+    output: &mut impl Write,
+    client: &QueryClient,
+    runtime: &tokio::runtime::Runtime,
+) -> Result<()> {
+    let mut initialized = false;
+    let mut negotiated = false;
+    while let Some(bytes) = frame(&mut input)? {
+        if !bytes.is_empty() && bytes.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let req: Value = match crate::json_fidelity::parse(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let response = match crate::json_fidelity::parse_bytes(&bytes) {
+            Err(_) => Some(rpc_error(
+                Value::Null,
+                RpcError(-32700, "Invalid or oversized JSON frame"),
+            )),
+            Ok(req) => {
+                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                if !req.is_object()
+                    || req.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+                    || req.get("method").and_then(Value::as_str).is_none()
+                    || (req.get("id").is_some() && !valid_id(&id))
+                {
+                    Some(rpc_error(
+                        if valid_id(&id) { id } else { Value::Null },
+                        RpcError(-32600, "Invalid JSON-RPC request"),
+                    ))
+                } else {
+                    let method = req["method"].as_str().unwrap();
+                    let params = req.get("params").cloned().unwrap_or(json!({}));
+                    if req.get("id").is_none() {
+                        if method == "notifications/initialized" && negotiated {
+                            initialized = true;
+                        }
+                        None
+                    } else {
+                        let result = if method == "initialize" && negotiated {
+                            Err(RpcError(-32600, "Already initialized"))
+                        } else if !initialized && !matches!(method, "initialize" | "ping") {
+                            Err(RpcError(-32600, "Initialize the MCP session first"))
+                        } else {
+                            handle(method, &params, client, runtime)
+                        };
+                        match result {
+                            Ok(result) => {
+                                if method == "initialize" {
+                                    negotiated = true;
+                                }
+                                Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+                            }
+                            Err(error) => Some(rpc_error(id, error)),
+                        }
+                    }
+                }
+            }
         };
-        // Notifications have no id and expect no response.
-        let Some(id) = req.get("id").cloned() else {
-            continue;
-        };
-        let method = req
-            .get("method")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let params = req.get("params").cloned().unwrap_or(Value::Null);
-
-        let response = match handle(method, &params, &client, &runtime) {
-            Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-            Err(e) => json!({
-                "jsonrpc": "2.0", "id": id,
-                "error": {"code": -32000, "message": e.to_string()}
-            }),
-        };
-        writeln!(stdout, "{response}")?;
-        stdout.flush()?;
+        if let Some(response) = response {
+            writeln!(output, "{response}")?;
+            output.flush()?;
+        }
     }
     Ok(())
 }
@@ -62,18 +141,99 @@ fn handle(
     params: &Value,
     client: &QueryClient,
     rt: &tokio::runtime::Runtime,
-) -> Result<Value> {
-    match method {
-        "initialize" => Ok(json!({
-            "protocolVersion": params.get("protocolVersion")
-                .and_then(Value::as_str).unwrap_or(PROTOCOL_VERSION),
-            "capabilities": {"tools": {}},
-            "serverInfo": {"name": "gently", "version": env!("CARGO_PKG_VERSION")},
-        })),
-        "tools/list" => Ok(json!({"tools": tool_specs()})),
-        "tools/call" => call_tool(params, client, rt),
-        other => anyhow::bail!("unknown method: {other}"),
+) -> std::result::Result<Value, RpcError> {
+    if !params.is_object() {
+        return Err(RpcError(-32602, "Expected object parameters"));
     }
+    match method {
+        "initialize" => {
+            if params
+                .get("protocolVersion")
+                .and_then(Value::as_str)
+                .is_none()
+                || !params.get("capabilities").is_some_and(Value::is_object)
+                || params
+                    .get("clientInfo")
+                    .and_then(|v| v.get("name"))
+                    .and_then(Value::as_str)
+                    .is_none()
+                || params
+                    .get("clientInfo")
+                    .and_then(|v| v.get("version"))
+                    .and_then(Value::as_str)
+                    .is_none()
+            {
+                return Err(RpcError(-32602, "Missing initialization fields"));
+            }
+            Ok(json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "gently", "version": env!("CARGO_PKG_VERSION")},
+            }))
+        }
+        "ping" => Ok(json!({})),
+        "tools/list" if params.get("cursor").is_some() => {
+            Err(RpcError(-32602, "No tool-list cursor is available"))
+        }
+        "tools/list" => Ok(json!({"tools": tool_specs()})),
+        "tools/call" => {
+            validate_tool(params)?;
+            // Execution errors belong in CallToolResult, not JSON-RPC errors. Do
+            // not expose collector URLs, credentials, payloads or filter source.
+            Ok(call_tool(params, client, rt).unwrap_or_else(|_| json!({
+                "isError": true,
+                "content": [{"type": "text", "text": "Tool query or local filter failed; check local collector health and arguments."}]
+            })))
+        }
+        _ => Err(RpcError(-32601, "Method not found")),
+    }
+}
+
+fn validate_tool(params: &Value) -> std::result::Result<(), RpcError> {
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or(RpcError(-32602, "Missing tool name"))?;
+    let specs = tool_specs();
+    let spec = specs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == name)
+        .ok_or(RpcError(-32602, "Unknown tool"))?;
+    let empty = json!({});
+    let args = params
+        .get("arguments")
+        .unwrap_or(&empty)
+        .as_object()
+        .ok_or(RpcError(-32602, "Expected object arguments"))?;
+    let schema = &spec["inputSchema"];
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        for key in required {
+            if !args.contains_key(key.as_str().unwrap()) {
+                return Err(RpcError(-32602, "Missing required tool argument"));
+            }
+        }
+    }
+    for (key, value) in args {
+        let property = schema["properties"]
+            .get(key)
+            .ok_or(RpcError(-32602, "Unknown tool argument"))?;
+        let valid = match property["type"].as_str() {
+            Some("string") => value.as_str().is_some(),
+            Some("integer") => value.as_u64().is_some_and(|v| (1..=1000).contains(&v)),
+            _ => false,
+        };
+        if !valid
+            || property
+                .get("enum")
+                .and_then(Value::as_array)
+                .is_some_and(|v| !v.contains(value))
+        {
+            return Err(RpcError(-32602, "Invalid tool argument"));
+        }
+    }
+    Ok(())
 }
 
 fn call_tool(params: &Value, client: &QueryClient, rt: &tokio::runtime::Runtime) -> Result<Value> {
@@ -144,6 +304,7 @@ fn call_tool(params: &Value, client: &QueryClient, rt: &tokio::runtime::Runtime)
 
     // MCP tool results return content blocks; embed the JSON as text.
     Ok(json!({
+        "isError": false,
         "content": [{"type": "text", "text": serde_json::to_string_pretty(&payload)?}]
     }))
 }
@@ -241,8 +402,8 @@ fn tool_specs() -> Value {
         {
             "name": "list_traces",
             "description": "List harness sessions/traces, newest first by default.",
-            "inputSchema": {"type": "object", "properties": {
-                "limit": {"type": "integer", "description": "max traces"},
+            "inputSchema": {"type": "object", "additionalProperties": false, "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "max traces"},
                 "harness": {"type": "string", "description": "filter by harness, e.g. claude-code"},
                 "session_id": {"type": "string", "description": "filter by exact session id"},
                 "since": {"type": "string", "description": "minimum start_unix_nano"},
@@ -254,8 +415,8 @@ fn tool_specs() -> Value {
         {
             "name": "sessions",
             "description": "Alias for list_traces; returns harness sessions/traces.",
-            "inputSchema": {"type": "object", "properties": {
-                "limit": {"type": "integer", "description": "max sessions"},
+            "inputSchema": {"type": "object", "additionalProperties": false, "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "max sessions"},
                 "harness": {"type": "string", "description": "filter by harness, e.g. claude-code"},
                 "session_id": {"type": "string", "description": "filter by exact session id"},
                 "since": {"type": "string", "description": "minimum start_unix_nano"},
@@ -267,7 +428,7 @@ fn tool_specs() -> Value {
         {
             "name": "get_trace",
             "description": "Get all spans for a trace id (for tree reconstruction).",
-            "inputSchema": {"type": "object", "required": ["trace_id"], "properties": {
+            "inputSchema": {"type": "object", "additionalProperties": false, "required": ["trace_id"], "properties": {
                 "trace_id": {"type": "string"},
                 "jq": {"type": "string", "description": "local jq filter applied to this tool's JSON result before returning"}
             }}
@@ -275,7 +436,7 @@ fn tool_specs() -> Value {
         {
             "name": "search_spans",
             "description": "Search spans by indexed columns; newest first by default.",
-            "inputSchema": {"type": "object", "properties": {
+            "inputSchema": {"type": "object", "additionalProperties": false, "properties": {
                 "trace_id": {"type": "string"},
                 "session_id": {"type": "string"},
                 "harness": {"type": "string", "description": "filter by harness, e.g. codex"},
@@ -285,7 +446,7 @@ fn tool_specs() -> Value {
                 "kind": {"type": "string", "description": "OTLP span kind code"},
                 "since": {"type": "string", "description": "start_unix_nano lower bound"},
                 "until": {"type": "string", "description": "start_unix_nano upper bound"},
-                "limit": {"type": "integer"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
                 "order": {"type": "string", "enum": ["start_desc", "start_asc"], "description": "sort order"},
                 "jq": {"type": "string", "description": "local jq filter applied to this tool's JSON result before returning"}
             }}
@@ -293,14 +454,14 @@ fn tool_specs() -> Value {
         {
             "name": "trace_stats",
             "description": "Per-tool rollups: span counts, error counts, average duration.",
-            "inputSchema": {"type": "object", "properties": {
+            "inputSchema": {"type": "object", "additionalProperties": false, "properties": {
                 "jq": {"type": "string", "description": "local jq filter applied to this tool's JSON result before returning"}
             }}
         },
         {
             "name": "response_fields",
             "description": "Describe top-level JSON response fields for gently MCP tools.",
-            "inputSchema": {"type": "object", "properties": {
+            "inputSchema": {"type": "object", "additionalProperties": false, "properties": {
                 "tool": {"type": "string", "enum": ["list_traces", "sessions", "get_trace", "search_spans", "trace_stats", "span_attr_keys"]},
                 "jq": {"type": "string", "description": "local jq filter applied to the schema result before returning"}
             }}
@@ -308,7 +469,7 @@ fn tool_specs() -> Value {
         {
             "name": "span_attr_keys",
             "description": "Discover span/resource attribute keys across recent matching spans.",
-            "inputSchema": {"type": "object", "properties": {
+            "inputSchema": {"type": "object", "additionalProperties": false, "properties": {
                 "trace_id": {"type": "string"},
                 "session_id": {"type": "string"},
                 "harness": {"type": "string", "description": "filter by harness, e.g. codex"},
@@ -318,7 +479,7 @@ fn tool_specs() -> Value {
                 "kind": {"type": "string", "description": "OTLP span kind code"},
                 "since": {"type": "string", "description": "start_unix_nano lower bound"},
                 "until": {"type": "string", "description": "start_unix_nano upper bound"},
-                "limit": {"type": "integer", "description": "max spans to inspect"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "max spans to inspect"},
                 "order": {"type": "string", "enum": ["start_desc", "start_asc"], "description": "sort order"},
                 "jq": {"type": "string", "description": "local jq filter applied to the discovered keys before returning"}
             }}
