@@ -37,9 +37,10 @@ See the [CLI reference](../reference/cli.md) for every command and flag.
 | Single trace | All rows, raw start ascending | Fixed order |
 | Tool stats | All tool groups, largest span count first | Fixed order |
 
-Trace-list and span-search limits cap at 1,000. Missing or non-positive limits
-use the default. There is no cursor or offset pagination. Equal ordering keys do
-not have a defined tie-breaker.
+CLI trace-list and span-search limits cap at 1,000. Missing or non-positive CLI
+limits use the default. MCP accepts only schema-valid integer limits from 1 to
+1,000; out-of-range values produce `-32602`. There is no cursor or offset
+pagination. Equal ordering keys do not have a defined tie-breaker.
 
 Text filters use exact matches. `since` and `until` are inclusive bounds on raw
 `start_unix_nano`, supplied as decimal strings. Keep nanosecond values as strings
@@ -54,7 +55,8 @@ digit lengths or leading zeros do not have reliable numeric ordering here.
 
 MCP uses string values for `status` and `kind`, such as `"2"` and `"3"`, and
 integer values for `limit`. CLI flags use the equivalent text arguments.
-Unknown ordering values fall back to descending start order in the Worker.
+Unknown CLI/direct-Worker ordering values fall back to descending start order.
+MCP rejects ordering values outside its advertised enum with `-32602`.
 Unparseable `status` or `kind` filters are ignored, so use numeric codes rather
 than labels such as `error`.
 
@@ -209,3 +211,24 @@ configuration/environment settings can still enable it. Decrypted output can
 enter the calling agent's model-provider context. Retained ciphertext remains
 after capture is disabled, and new readers cannot automatically decrypt older
 objects. See [security and privacy](../concepts/security-and-privacy.md).
+
+## MCP protocol contract
+
+The stdio server implements MCP `2025-06-18`. It returns that supported version
+when a client proposes another version; clients must accept it or disconnect.
+After `initialize`, send `notifications/initialized` before tool requests. `ping`
+works during initialization. Tool argument errors use JSON-RPC `-32602`; collector
+or tool execution failures return content with `isError: true`. Fixed messages
+distinguish invalid jq filters, raw-resolution budget limits, unavailable
+readers, readers that cannot decrypt (a prompt not approved within 60 seconds,
+or a reader not enrolled for older objects), watcher failures and collector
+errors relayed by a healthy watcher, without exposing the underlying error
+chain.
+Messages are newline-delimited and limited to 1 MiB per input frame. Malformed or
+oversized frames receive a parse error (`-32700`) and are drained before reading
+the next frame. Well-formed JSON with an invalid RPC envelope receives
+`-32600`. Notifications and client responses (the server sends no requests)
+receive no reply. Error messages omit private payloads, URLs and filter source.
+
+See the [MCP lifecycle](https://modelcontextprotocol.io/specification/2025-06-18/basic/lifecycle)
+and [tool error contract](https://modelcontextprotocol.io/specification/2025-06-18/server/tools).

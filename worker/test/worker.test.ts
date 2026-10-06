@@ -1,10 +1,11 @@
 import { env, SELF } from "cloudflare:test";
-import { describe, it, expect, beforeAll } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import worker from "../src/index";
 import type { Env } from "../src/d1";
 import { insertSpans, tracePage, tracePageSql } from "../src/d1";
 import { flatten } from "../src/otlp";
 import { applySchema } from "./schema";
+import { resetDatabase } from "./reset";
 
 const BEARER = "Bearer test-token-secret";
 
@@ -103,13 +104,12 @@ function makeSingleSpanTrace(
   };
 }
 
-beforeAll(async () => {
-  await applySchema(env.DB);
+beforeEach(async () => {
+  // Vitest 4 isolates storage per file. Reset every test explicitly so data and
+  // authorization assertions do not depend on execution order.
+  await resetDatabase(env.DB);
 
-  // Seed the fixture here so it persists into every isolated test (pool-workers
-  // rolls back per-test writes, but beforeAll writes form the shared baseline).
-  // The query tests depend on this seed; the POST tests re-insert the same
-  // span_ids, so their counts stay at 2 (INSERT OR REPLACE is idempotent).
+  // Seed a fresh baseline for every test; POST fixtures use these same IDs.
   await SELF.fetch("https://x/v1/traces?tenant_id=personal", {
     method: "POST",
     headers: { Authorization: BEARER, "Content-Type": "application/json" },

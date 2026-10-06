@@ -40,7 +40,7 @@ Worker dependencies and create its database:
 
 ```sh
 cd worker
-npm ci
+npm ci --ignore-scripts
 npx wrangler d1 create gently
 ```
 

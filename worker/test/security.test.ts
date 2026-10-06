@@ -1,8 +1,8 @@
 import { env, SELF } from "cloudflare:test";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index";
 import type { Env } from "../src/d1";
-import { applySchema } from "./schema";
+import { resetDatabase } from "./reset";
 
 const TOKEN = "test-token-secret";
 const OTHER = "other-tenant-token";
@@ -47,8 +47,47 @@ function postSpans(body: unknown, token = TOKEN, tenant = "personal") {
   });
 }
 
-beforeAll(async () => {
-  await applySchema(env.DB);
+beforeEach(async () => {
+  // Vitest 4 isolates storage per file. Reset every test explicitly so data and
+  // authorization assertions do not depend on execution order.
+  await resetDatabase(env.DB);
+});
+
+describe("test database reset", () => {
+  it("drops rows and tables it was not told about, then reapplies the schema", async () => {
+    expect((await postSpans(otlp())).status).toBe(200);
+    await env.DB.prepare("CREATE TABLE stray_probe (value TEXT)").run();
+    await env.DB.prepare("INSERT INTO stray_probe (value) VALUES ('synthetic')").run();
+    await resetDatabase(env.DB);
+    const tables = await env.DB.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('spans', 'raw_values', 'stray_probe') ORDER BY name",
+    ).all<{ name: string }>();
+    expect(tables.results.map(row => row.name)).toEqual(["raw_values", "spans"]);
+    expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM spans").first("n")).toBe(0);
+  });
+
+  it("recreates schema.sql's multi-statement triggers whole, and they still fire", async () => {
+    const triggers = () => env.DB.prepare(
+      "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY name",
+    ).all<{ name: string; sql: string }>();
+    const generations = () => env.DB.prepare("SELECT COUNT(*) AS n FROM trace_generations").first("n");
+    expect((await postSpans(otlp())).status).toBe(200);
+    await env.DB.prepare("DELETE FROM spans").run();
+    expect(await generations()).toBe(1);
+
+    await resetDatabase(env.DB);
+    const { results } = await triggers();
+    expect(results.map(row => row.name)).toEqual([
+      "trace_generation_on_delete",
+      "trace_generation_on_insert",
+      "trace_generation_on_start",
+    ]);
+    for (const { sql } of results) expect(sql).toMatch(/generation \+ 1;\s*END$/);
+    expect(await generations()).toBe(0);
+    expect((await postSpans(otlp())).status).toBe(200);
+    await env.DB.prepare("DELETE FROM spans").run();
+    expect(await generations()).toBe(1);
+  });
 });
 
 describe("tenant and device authorization", () => {

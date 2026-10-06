@@ -1,0 +1,10 @@
+{
+  "advisories": [
+    {
+      "id": "GHSA-wq5f-xc86-pv6w",
+      "package": "sharp",
+      "justification": "Published 2026-10-06 with no compatible upstream release: the latest miniflare (5.20261001.0-alpha, required exactly by wrangler 4.147.0 and @cloudflare/vitest-plugin 1.3.6) pins sharp 0.35.4. Miniflare imports sharp only to emulate the Images binding and cf.image resizing; the collector and its test configuration use neither, so no SVG is decoded. Remove when miniflare ships sharp 0.35.5 or later.",
+      "expires": "2026-11-05"
+    }
+  ]
+}
