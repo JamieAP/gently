@@ -68,32 +68,90 @@ pub fn run_claude(resolve_raw_values: bool) -> Result<()> {
     Ok(())
 }
 
-#[derive(Default)]
-struct UninstallCounts {
-    hooks: usize,
-    mcp: usize,
-    retained: usize,
+/// The coding agent whose registrations a command edits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Harness {
+    Claude,
+    Codex,
 }
-impl UninstallCounts {
-    fn changed(&self) -> bool {
-        self.hooks + self.mcp > 0
-    }
-    fn include(&mut self, other: Self) {
-        self.hooks += other.hooks;
-        self.mcp += other.mcp;
-        self.retained += other.retained;
+
+impl Harness {
+    fn review_paths(self) -> &'static str {
+        match self {
+            Harness::Claude => "~/.claude/settings.json and ~/.claude.json",
+            Harness::Codex => "~/.codex/config.toml and optional ~/.codex/hooks.json",
+        }
     }
 }
+
+/// How one harness entry relates to this executable. Install migration and
+/// uninstall share this verdict so their notions of ownership cannot drift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ownership {
+    /// An exact registration Gently emitted for this executable.
+    Managed,
+    /// Gently-shaped but not exactly ours: another path, wrapper or override.
+    Lookalike,
+    Foreign,
+}
+
+/// The handler fields that decide ownership, read from JSON or TOML.
+#[derive(Clone, Copy)]
+struct HandlerFields<'a> {
+    kind: Option<&'a str>,
+    command: Option<&'a str>,
+    platform_override: bool,
+}
+
+fn json_handler(handler: &Value) -> HandlerFields<'_> {
+    HandlerFields {
+        kind: handler.get("type").and_then(Value::as_str),
+        command: handler.get("command").and_then(Value::as_str),
+        platform_override: handler.get("commandWindows").is_some()
+            || handler.get("command_windows").is_some(),
+    }
+}
+
+fn toml_handler(handler: &Table) -> HandlerFields<'_> {
+    HandlerFields {
+        kind: handler.get("type").and_then(Item::as_str),
+        command: handler.get("command").and_then(Item::as_str),
+        platform_override: handler.get("commandWindows").is_some()
+            || handler.get("command_windows").is_some(),
+    }
+}
+
+fn classify(handler: HandlerFields, owned: &[String]) -> Ownership {
+    match handler {
+        HandlerFields {
+            kind: Some("command"),
+            command: Some(command),
+            platform_override: false,
+        } if owned.iter().any(|owned| owned == command) => Ownership::Managed,
+        HandlerFields {
+            command: Some(command),
+            ..
+        } if looks_like_gently_hook(command) => Ownership::Lookalike,
+        _ => Ownership::Foreign,
+    }
+}
+
+/// A server named `gently` is ours only with this executable and `mcp` alone.
+fn classify_server(command: Option<&str>, args: Option<Vec<&str>>, exe: &Path) -> Ownership {
+    match (command, args.as_deref()) {
+        (Some(command), Some(["mcp"])) if command == exe.to_string_lossy() => Ownership::Managed,
+        _ => Ownership::Lookalike,
+    }
+}
+
 fn looks_like_gently_hook(command: &str) -> bool {
     command.contains("gently") && command.contains(" hook")
 }
 
-/// Remove exact registrations for this executable; preserve state, policy,
-/// identities, user wrappers, preferences and unknown harness configuration.
-pub fn run_uninstall(codex: bool) -> Result<()> {
-    let home = dirs::home_dir().context("cannot determine home directory")?;
-    let exe = std::env::current_exe().context("cannot resolve executable")?;
-    let commands: Vec<_> = [shell_quote(&exe), legacy_shell_quote(&exe)]
+/// Every hook command Gently has emitted for this executable, in current and
+/// legacy quoting, for both harness flavours.
+fn managed_commands(exe: &Path) -> Vec<String> {
+    [shell_quote(exe), legacy_shell_quote(exe)]
         .into_iter()
         .flat_map(|quoted| {
             [
@@ -101,29 +159,103 @@ pub fn run_uninstall(codex: bool) -> Result<()> {
                 format!("{quoted} hook --harness codex"),
             ]
         })
-        .collect();
-    let counts = match codex {
-        true => uninstall_codex(&home, &exe, &commands)?,
-        false => uninstall_claude(&home, &exe, &commands)?,
-    };
-    eprintln!(
+        .collect()
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct UninstallCounts {
+    hooks: usize,
+    mcp: usize,
+    retained: usize,
+    /// Optional legacy files skipped unread because they are not ours to read.
+    unread: usize,
+}
+
+impl UninstallCounts {
+    fn changed(&self) -> bool {
+        self.hooks + self.mcp > 0
+    }
+
+    fn include(&mut self, other: Self) {
+        self.hooks += other.hooks;
+        self.mcp += other.mcp;
+        self.retained += other.retained;
+        self.unread += other.unread;
+    }
+
+    fn handlers(verdicts: impl IntoIterator<Item = Ownership>) -> Self {
+        verdicts
+            .into_iter()
+            .fold(Self::default(), |mut counts, verdict| {
+                match verdict {
+                    Ownership::Managed => counts.hooks += 1,
+                    Ownership::Lookalike => counts.retained += 1,
+                    Ownership::Foreign => (),
+                }
+                counts
+            })
+    }
+
+    fn server(verdict: Option<Ownership>) -> Self {
+        match verdict {
+            Some(Ownership::Managed) => Self {
+                mcp: 1,
+                ..Self::default()
+            },
+            Some(_) => Self {
+                retained: 1,
+                ..Self::default()
+            },
+            None => Self::default(),
+        }
+    }
+}
+
+/// What uninstall tells the user, as a pure function of what it found.
+fn uninstall_summary(harness: Harness, counts: &UninstallCounts) -> Vec<String> {
+    let mut lines = vec![format!(
         "gently: removed {} hook handler(s) and {} MCP registration(s).",
         counts.hooks, counts.mcp
-    );
+    )];
     if !counts.changed() {
-        eprintln!(
+        lines.push(
             "gently: no exact registrations matched this executable; no registrations removed."
+                .into(),
         );
     }
     if counts.retained > 0 {
-        let location = if codex {
-            "~/.codex/config.toml and optional ~/.codex/hooks.json"
-        } else {
-            "~/.claude/settings.json and ~/.claude.json"
-        };
-        eprintln!("gently: retained {} possible Gently registration(s) for other paths, wrappers or platform overrides; review {location} manually.", counts.retained);
+        lines.push(format!(
+            "gently: retained {} possible Gently registration(s) for other paths, wrappers or platform overrides; review {} manually.",
+            counts.retained,
+            harness.review_paths()
+        ));
     }
-    eprintln!("gently: retained local state, policy, keys and user configuration. Restart the coding agent.");
+    if counts.unread > 0 {
+        lines.push(format!(
+            "gently: retained {} unread legacy hook file(s): ~/.codex/hooks.json is linked, not regular, or not owned by this user, so it was not read. Codex merges it with config.toml, so it may still register Gently hooks; remove them before deleting this binary.",
+            counts.unread
+        ));
+    }
+    lines.push(
+        "gently: retained local state, policy, keys and user configuration. Restart the coding agent."
+            .into(),
+    );
+    lines
+}
+
+/// Remove exact registrations for this executable; preserve state, policy,
+/// identities, user wrappers, preferences and unknown harness configuration.
+pub fn run_uninstall(harness: Harness) -> Result<()> {
+    let home = dirs::home_dir().context("cannot determine home directory")?;
+    let exe = std::env::current_exe().context("cannot resolve executable")?;
+    let commands = managed_commands(&exe);
+    let counts = match harness {
+        Harness::Codex => uninstall_codex(&home, &exe, &commands)?,
+        Harness::Claude => uninstall_claude(&home, &exe, &commands)?,
+    };
+    for line in uninstall_summary(harness, &counts) {
+        eprintln!("{line}");
+    }
     Ok(())
 }
 
@@ -132,7 +264,8 @@ fn uninstall_codex(home: &Path, exe: &Path, commands: &[String]) -> Result<Unins
     let legacy_path = home.join(".codex/hooks.json");
     // Stage and validate all selected files before publishing any edit.
     let mut doc = path.exists().then(|| read_toml_doc(&path)).transpose()?;
-    let mut legacy = safe_legacy_codex_file(&legacy_path)?
+    let legacy_file = legacy_codex_file(&legacy_path)?;
+    let mut legacy = (legacy_file == LegacyFile::Regular)
         .then(|| read_json(&legacy_path))
         .transpose()?;
     let mut changed = doc
@@ -152,6 +285,7 @@ fn uninstall_codex(home: &Path, exe: &Path, commands: &[String]) -> Result<Unins
         write_json(&legacy_path, legacy.as_ref().unwrap())?;
     }
     changed.include(legacy_changed);
+    changed.unread += usize::from(legacy_file == LegacyFile::Unsafe);
     Ok(changed)
 }
 
@@ -169,34 +303,27 @@ fn uninstall_claude(home: &Path, exe: &Path, commands: &[String]) -> Result<Unin
             .context("MCP configuration must be an object")?;
     }
     let mut counts = UninstallCounts::default();
-    let mcp_changed = match config
+    if let Some(servers) = config
         .as_mut()
         .and_then(|config| config.get_mut("mcpServers"))
     {
-        None => false,
-        Some(servers) => {
-            let servers = servers
-                .as_object_mut()
-                .context("MCP servers must be an object")?;
-            for server in servers.values() {
-                server.as_object().context("MCP server must be an object")?;
-            }
-            match servers.get("gently") {
-                Some(server)
-                    if server["command"] == exe.to_string_lossy().as_ref()
-                        && server["args"] == json!(["mcp"]) =>
-                {
-                    servers.remove("gently");
-                    true
-                }
-                Some(_) => {
-                    counts.retained += 1;
-                    false
-                }
-                None => false,
-            }
+        let servers = servers
+            .as_object_mut()
+            .context("MCP servers must be an object")?;
+        for server in servers.values() {
+            server.as_object().context("MCP server must be an object")?;
         }
-    };
+        let verdict = servers.get("gently").map(|server| {
+            let args = server["args"]
+                .as_array()
+                .and_then(|args| args.iter().map(Value::as_str).collect());
+            classify_server(server["command"].as_str(), args, exe)
+        });
+        if verdict == Some(Ownership::Managed) {
+            servers.remove("gently");
+        }
+        counts.include(UninstallCounts::server(verdict));
+    }
     let hooks_changed = hooks
         .as_mut()
         .map(|config| remove_json_hooks(config, commands))
@@ -205,10 +332,9 @@ fn uninstall_claude(home: &Path, exe: &Path, commands: &[String]) -> Result<Unin
     if hooks_changed.changed() {
         write_json(&settings, hooks.as_ref().unwrap())?;
     }
-    if mcp_changed {
+    if counts.mcp > 0 {
         write_json(&mcp, config.as_ref().unwrap())?;
     }
-    counts.mcp = usize::from(mcp_changed);
     counts.include(hooks_changed);
     Ok(counts)
 }
@@ -227,25 +353,18 @@ fn remove_codex_registrations(
             for (index, group) in groups.iter_mut().enumerate() {
                 if let Some(handlers) = group.get_mut("hooks") {
                     let handlers = require_groups(handlers, "hook handlers")?;
-                    let before = handlers.len();
+                    let found = UninstallCounts::handlers(
+                        handlers
+                            .iter()
+                            .map(|handler| classify(toml_handler(handler), commands)),
+                    );
                     handlers.retain(|handler| {
-                        let managed = managed_toml_handler(handler, commands);
-                        if !managed
-                            && handler
-                                .get("command")
-                                .and_then(Item::as_str)
-                                .is_some_and(looks_like_gently_hook)
-                        {
-                            counts.retained += 1;
-                        }
-                        !managed
+                        classify(toml_handler(handler), commands) != Ownership::Managed
                     });
-                    if handlers.len() != before {
-                        counts.hooks += before - handlers.len();
-                        if handlers.is_empty() && group.len() == 1 {
-                            emptied.push(index);
-                        }
+                    if found.hooks > 0 && handlers.is_empty() && group.len() == 1 {
+                        emptied.push(index);
                     }
+                    counts.include(found);
                 }
             }
             for index in emptied.into_iter().rev() {
@@ -260,33 +379,25 @@ fn remove_codex_registrations(
                 .as_table_like()
                 .context("MCP server must be a table")?;
         }
-        if servers.get("gently").is_some_and(|server| {
-            server.get("command").and_then(Item::as_str) == Some(exe.to_string_lossy().as_ref())
-                && server
-                    .get("args")
-                    .and_then(Item::as_array)
-                    .is_some_and(|args| {
-                        args.len() == 1
-                            && args.get(0).and_then(toml_edit::Value::as_str) == Some("mcp")
-                    })
-        }) {
+        let verdict = servers.get("gently").map(|server| {
+            let args = server
+                .get("args")
+                .and_then(Item::as_array)
+                .and_then(|args| {
+                    args.iter()
+                        .map(toml_edit::Value::as_str)
+                        .collect::<Option<Vec<_>>>()
+                });
+            classify_server(server.get("command").and_then(Item::as_str), args, exe)
+        });
+        if verdict == Some(Ownership::Managed) {
             servers.remove("gently");
-            counts.mcp += 1;
-        } else if servers.get("gently").is_some() {
-            counts.retained += 1;
         }
+        counts.include(UninstallCounts::server(verdict));
     }
     Ok(counts)
 }
-fn managed_toml_handler(handler: &Table, commands: &[String]) -> bool {
-    handler.get("commandWindows").is_none()
-        && handler.get("command_windows").is_none()
-        && handler.get("type").and_then(Item::as_str) == Some("command")
-        && handler
-            .get("command")
-            .and_then(Item::as_str)
-            .is_some_and(|command| commands.iter().any(|owned| owned == command))
-}
+
 fn remove_json_hooks(config: &mut Value, commands: &[String]) -> Result<UninstallCounts> {
     config
         .as_object_mut()
@@ -315,31 +426,21 @@ fn remove_json_hooks(config: &mut Value, commands: &[String]) -> Result<Uninstal
                             .as_object()
                             .context("hook handler must be an object")?;
                     }
-                    let before = handlers.len();
+                    let found = UninstallCounts::handlers(
+                        handlers
+                            .iter()
+                            .map(|handler| classify(json_handler(handler), commands)),
+                    );
                     handlers.retain(|handler| {
-                        let managed = handler.get("commandWindows").is_none()
-                            && handler.get("command_windows").is_none()
-                            && handler["type"] == "command"
-                            && handler["command"].as_str().is_some_and(|command| {
-                                commands.iter().any(|owned| owned == command)
-                            });
-                        if !managed
-                            && handler["command"]
-                                .as_str()
-                                .is_some_and(looks_like_gently_hook)
-                        {
-                            counts.retained += 1;
-                        }
-                        !managed
+                        classify(json_handler(handler), commands) != Ownership::Managed
                     });
-                    if before != handlers.len() {
-                        counts.hooks += before - handlers.len();
-                        if handlers.is_empty()
-                            && group.as_object().is_some_and(|group| group.len() == 1)
-                        {
-                            emptied.push(index);
-                        }
+                    if found.hooks > 0
+                        && handlers.is_empty()
+                        && group.as_object().is_some_and(|group| group.len() == 1)
+                    {
+                        emptied.push(index);
                     }
+                    counts.include(found);
                 }
             }
             for index in emptied.into_iter().rev() {
@@ -594,10 +695,22 @@ fn legacy_shell_quote(p: &Path) -> String {
     }
 }
 
-fn safe_legacy_codex_file(path: &Path) -> Result<bool> {
+/// The optional legacy Codex hooks.json, judged by metadata alone so an
+/// unsafe file is never opened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyFile {
+    Absent,
+    Regular,
+    /// Linked, not a regular file, or owned by someone else.
+    Unsafe,
+}
+
+fn legacy_codex_file(path: &Path) -> Result<LegacyFile> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LegacyFile::Absent)
+        }
         Err(_) => anyhow::bail!("cannot inspect legacy Codex hooks.json for optional operation"),
     };
     #[cfg(unix)]
@@ -607,11 +720,10 @@ fn safe_legacy_codex_file(path: &Path) -> Result<bool> {
     };
     #[cfg(not(unix))]
     let unsafe_owner_or_links = false;
-    if !metadata.file_type().is_file() || unsafe_owner_or_links {
-        eprintln!("gently: skipped legacy Codex hooks.json: path is linked, not regular, or not owned by this user; review duplicate Gently handlers manually");
-        return Ok(false);
+    match metadata.file_type().is_file() && !unsafe_owner_or_links {
+        true => Ok(LegacyFile::Regular),
+        false => Ok(LegacyFile::Unsafe),
     }
-    Ok(true)
 }
 
 fn migrate_codex_json_hooks(
@@ -619,8 +731,13 @@ fn migrate_codex_json_hooks(
     exe: &Path,
     doc: &DocumentMut,
 ) -> Result<Option<(Value, usize)>> {
-    if !safe_legacy_codex_file(path)? {
-        return Ok(None);
+    match legacy_codex_file(path)? {
+        LegacyFile::Absent => return Ok(None),
+        LegacyFile::Unsafe => {
+            eprintln!("gently: skipped legacy Codex hooks.json migration: path is linked, not regular, or not owned by this user; review duplicate Gently handlers manually");
+            return Ok(None);
+        }
+        LegacyFile::Regular => (),
     }
     harden_existing_file(path)?;
     let text = match std::fs::read_to_string(path) {
@@ -633,15 +750,7 @@ fn migrate_codex_json_hooks(
     }
     let mut json: Value = crate::json_fidelity::parse(&text)
         .with_context(|| format!("parsing {}", path.display()))?;
-    let commands: Vec<String> = [shell_quote(exe), legacy_shell_quote(exe)]
-        .into_iter()
-        .flat_map(|quoted| {
-            [
-                format!("{quoted} hook"),
-                format!("{quoted} hook --harness codex"),
-            ]
-        })
-        .collect();
+    let commands = managed_commands(exe);
     let Some(hooks) = json.get_mut("hooks").and_then(Value::as_object_mut) else {
         return Ok(None);
     };
@@ -658,14 +767,8 @@ fn migrate_codex_json_hooks(
                 return true;
             };
             let before = handlers.len();
-            handlers.retain(|handler| {
-                !(handler["type"] == "command"
-                    && handler.get("commandWindows").is_none()
-                    && handler.get("command_windows").is_none()
-                    && handler["command"]
-                        .as_str()
-                        .is_some_and(|command| commands.iter().any(|owned| owned == command)))
-            });
+            handlers
+                .retain(|handler| classify(json_handler(handler), &commands) != Ownership::Managed);
             removed += before - handlers.len();
             before == handlers.len() || !handlers.is_empty()
         });
@@ -701,16 +804,11 @@ fn codex_inline_covers(doc: &DocumentMut, event: &str, json: &Value, commands: &
                 .get("hooks")
                 .and_then(Item::as_array_of_tables)
                 .is_some_and(|handlers| {
-                    handlers.iter().any(|handler| {
-                        handler.get("type").and_then(Item::as_str) == Some("command")
-                            && handler.get("commandWindows").is_none()
-                            && handler.get("command_windows").is_none()
-                            && handler.get("command").and_then(Item::as_str).is_some_and(
-                                |command| {
-                                    command.ends_with(" hook --harness codex")
-                                        && commands.iter().any(|owned| owned == command)
-                                },
-                            )
+                    handlers.iter().map(toml_handler).any(|handler| {
+                        classify(handler, commands) == Ownership::Managed
+                            && handler
+                                .command
+                                .is_some_and(|command| command.ends_with(" hook --harness codex"))
                     })
                 })
     })
@@ -991,5 +1089,74 @@ trust_level = "trusted"
         assert_eq!(second, 0, "second merge adds nothing");
         let groups = doc["hooks"]["PreToolUse"].as_array_of_tables().unwrap();
         assert_eq!(groups.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    fn handler<'a>(kind: &'a str, command: &'a str, platform_override: bool) -> HandlerFields<'a> {
+        HandlerFields {
+            kind: Some(kind),
+            command: Some(command),
+            platform_override,
+        }
+    }
+
+    #[test]
+    fn classify_separates_exact_lookalike_and_foreign_handlers() {
+        let owned = managed_commands(Path::new("/synthetic/bin/gently"));
+        let exact = "'/synthetic/bin/gently' hook --harness codex";
+        let legacy = "/synthetic/bin/gently hook";
+        assert_eq!(
+            classify(handler("command", exact, false), &owned),
+            Ownership::Managed
+        );
+        assert_eq!(
+            classify(handler("command", legacy, false), &owned),
+            Ownership::Managed
+        );
+        for lookalike in [
+            handler("command", exact, true),
+            handler("prompt", exact, false),
+            handler("command", "'/other/gently' hook", false),
+        ] {
+            assert_eq!(classify(lookalike, &owned), Ownership::Lookalike);
+        }
+        assert_eq!(
+            classify(handler("command", "user-check", false), &owned),
+            Ownership::Foreign
+        );
+        let exe = Path::new("/synthetic/bin/gently");
+        assert_eq!(
+            classify_server(Some("/synthetic/bin/gently"), Some(vec!["mcp"]), exe),
+            Ownership::Managed
+        );
+        assert_eq!(
+            classify_server(Some("/synthetic/bin/gently"), Some(vec!["mcp", "-v"]), exe),
+            Ownership::Lookalike
+        );
+    }
+
+    #[test]
+    fn clean_uninstall_summary_has_no_retention_warnings() {
+        let counts = UninstallCounts {
+            hooks: 12,
+            mcp: 1,
+            ..UninstallCounts::default()
+        };
+        let summary = uninstall_summary(Harness::Codex, &counts).join("\n");
+        assert!(summary.contains("removed 12 hook handler(s) and 1 MCP registration(s)."));
+        assert!(!summary.contains("possible"));
+        assert!(!summary.contains("unread"));
+        assert!(!summary.contains("no exact registrations"));
+        let unread = UninstallCounts {
+            unread: 1,
+            ..counts
+        };
+        let summary = uninstall_summary(Harness::Codex, &unread).join("\n");
+        assert!(summary.contains("retained 1 unread legacy hook file(s)"));
+        assert!(!summary.contains("duplicate"));
     }
 }

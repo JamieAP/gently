@@ -18,6 +18,7 @@ mod outbox;
 pub mod private_fs;
 mod raw_objects;
 
+pub use backup::{recovery_leftovers, remove_recovery_leftovers, Leftover};
 pub use health::Health;
 pub use open_spans::OpenSpan;
 pub use raw_objects::RawObjectStats;

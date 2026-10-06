@@ -259,6 +259,9 @@ Tools, examples, local `jq` behavior, and raw-value resolution are documented in
 including live WAL state; `state restore PATH` accepts supported encrypted backups
 into a missing database in the same tenant/device namespace. Both operate without
 unlocking a reader. Backups contain private metadata and require private storage.
+Backup reports private temporaries left by an interrupted backup in the
+destination directory; `state backup --remove-stale PATH` deletes only exact
+owner-only Gently temporaries and leaves lookalikes for review.
 
 `uninstall --codex` and `uninstall --claude` remove only the current executable's
 exact managed registrations, preserving custom hooks, state and keys. Use the

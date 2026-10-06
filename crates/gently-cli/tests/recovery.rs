@@ -1,6 +1,7 @@
 //! Disposable synthetic state only; never unlocks a reader or opens live settings.
 use assert_cmd::Command;
 use gently_store::Store;
+use predicates::prelude::*;
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -361,7 +362,16 @@ fn codex_uninstall_skips_linked_legacy_without_reading_or_changing_its_target() 
             .args(["uninstall", "--codex"])
             .assert()
             .success()
-            .stderr(predicates::str::contains("skipped legacy Codex hooks.json"));
+            .stderr(predicates::str::contains(
+                "removed 12 hook handler(s) and 1 MCP registration(s).",
+            ))
+            .stderr(predicates::str::contains(
+                "retained 1 unread legacy hook file(s)",
+            ))
+            .stderr(predicates::str::contains(
+                "may still register Gently hooks; remove them before deleting this binary",
+            ))
+            .stderr(predicates::str::contains("duplicate").not());
         assert_eq!(std::fs::read(&target).unwrap(), contents);
         assert_eq!(
             std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
@@ -381,4 +391,96 @@ fn codex_uninstall_skips_linked_legacy_without_reading_or_changing_its_target() 
             }
         }
     }
+}
+
+#[test]
+fn uninstall_reports_exact_counts_and_no_false_warnings_after_a_clean_install() {
+    for (harness, hooks) in [("--claude", 31), ("--codex", 12)] {
+        let home = tempfile::tempdir().unwrap();
+        command(home.path())
+            .args(["init", harness])
+            .assert()
+            .success();
+        let first = command(home.path())
+            .args(["uninstall", harness])
+            .assert()
+            .success();
+        let stderr = String::from_utf8_lossy(&first.get_output().stderr);
+        assert!(stderr.contains(&format!(
+            "removed {hooks} hook handler(s) and 1 MCP registration(s)."
+        )));
+        for absent in ["possible", "unread", "no exact registrations"] {
+            assert!(!stderr.contains(absent), "{harness}: unexpected {absent}");
+        }
+        let second = command(home.path())
+            .args(["uninstall", harness])
+            .assert()
+            .success();
+        let stderr = String::from_utf8_lossy(&second.get_output().stderr);
+        assert!(stderr.contains("removed 0 hook handler(s) and 0 MCP registration(s)."));
+        assert!(stderr.contains("no exact registrations matched"));
+        assert!(!stderr.contains("possible"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn state_backup_reports_interrupted_temporaries_and_removes_only_ours_on_request() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    command(home.path())
+        .args(["init", "--claude"])
+        .assert()
+        .success();
+    let database = home
+        .path()
+        .join(".gently/tenants/synthetic-tenant/devices/synthetic-device/state.db");
+    std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+    Store::open(&database)
+        .unwrap()
+        .outbox_enqueue("synthetic metadata")
+        .unwrap();
+    let backups = home.path().join("backups");
+    std::fs::create_dir(&backups).unwrap();
+    let ours = backups.join(format!(".gently-recovery-{}.db-journal", "e".repeat(32)));
+    let readable = backups.join(format!(".gently-recovery-{}.db", "f".repeat(32)));
+    for (path, mode) in [(&ours, 0o600), (&readable, 0o644)] {
+        std::fs::write(path, b"synthetic interrupted copy").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    let reported = command(home.path())
+        .args(["state", "backup"])
+        .arg(backups.join("first.db"))
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&reported.get_output().stderr);
+    assert!(stderr.contains("found 1 interrupted backup temporary file(s)"));
+    assert!(stderr.contains("--remove-stale"));
+    assert!(stderr.contains("left 1 file(s) named like backup temporaries"));
+    assert!(!stderr.contains(home.path().to_str().unwrap()));
+    assert!(ours.exists() && readable.exists());
+
+    let removed = command(home.path())
+        .args(["state", "backup", "--remove-stale"])
+        .arg(backups.join("second.db"))
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&removed.get_output().stderr);
+    assert!(stderr.contains("removed 1 interrupted backup temporary file(s)"));
+    assert!(!ours.exists());
+    assert_eq!(
+        std::fs::read(&readable).unwrap(),
+        b"synthetic interrupted copy"
+    );
+    assert!(backups.join("second.db").exists());
+
+    std::fs::remove_file(&readable).unwrap();
+    command(home.path())
+        .args(["state", "backup"])
+        .arg(backups.join("third.db"))
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("interrupted").not())
+        .stderr(predicates::str::contains("temporaries").not());
 }

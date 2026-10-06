@@ -32,9 +32,9 @@ gently state backup /private-backups/gently-state.db
 ```
 
 The parent directory must already exist. SQLite's backup API includes live WAL
-changes in one snapshot; copying just state.db is unsafe. The snapshot can
-briefly block writers, and lock contention fails for an explicit retry. Backup publication is exclusive and
-never overwrites an existing path. The file is owner-only and pins the configured
+changes in one snapshot; copying just state.db is unsafe. Writers continue; the
+WAL may grow until the snapshot completes. Lock contention fails for an explicit
+retry. Backup publication is exclusive and never overwrites an existing path. The file is owner-only and pins the configured
 tenant/device. It contains private metadata and opaque encrypted raw objects;
 it is not encrypted as a whole and must never be committed or uploaded publicly.
 Capture and backup need no reader key. No credentials, policy files or reader
@@ -42,10 +42,19 @@ identities are copied by this command.
 
 Exclude `.gently-recovery-*.db*` from sync and general backup selection. A killed
 process can leave an owner-only partial temporary database or journal in the
-destination directory. These contain private metadata. After confirming no
-backup/restore process is running, remove those temporary files privately; do not
-use them for restore or share their contents. Normal completion and ordinary
-errors clean up the operation’s temporary files.
+destination directory. These contain private metadata; do not use them for
+restore or share their contents. Normal completion and ordinary errors clean up
+the operation’s temporary files. Each backup reports interrupted temporaries it
+finds beside the destination. After confirming no other backup or restore is
+running, add `--remove-stale` to delete them:
+
+```sh
+gently state backup --remove-stale /private-backups/gently-state.db
+```
+
+Only files with the exact temporary name that are regular, single-link,
+owner-only and owned by you are removed. Lookalikes are reported and left in
+place for manual review.
 
 Keep signed public policy, trust pins and an independent recovery reader through
 your existing secure recovery process. A database backup cannot replace a lost
@@ -83,7 +92,9 @@ keys. Registrations for another executable path remain for manual review. The co
 reports hook/MCP removal counts and warns about retained possible registrations;
 zero matches succeeds with an explicit no-removal message. Linked, multiply linked
 or unowned legacy Codex hooks.json is skipped without reading its target, with a
-warning; canonical TOML cleanup continues. Malformed regular selected files still
+warning; canonical TOML cleanup continues. Codex merges that file with
+config.toml, so the summary counts it as an unread retained file that may still
+register Gently hooks; remove them before deleting the binary. Malformed regular selected files still
 abort before any edits. Restart
 coding agents and stop local collector/export processes separately. It does not
 remove the credential vault or delete captured history.

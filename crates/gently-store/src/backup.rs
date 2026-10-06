@@ -98,13 +98,126 @@ fn validate_encrypted_schema(connection: &Connection) -> Result<()> {
     }
 }
 
-fn publish_database(destination: &Path, write: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
-    require_missing_database(destination)?;
-    let parent = destination
+const TEMPORARY_PREFIX: &str = ".gently-recovery-";
+const SQLITE_SUFFIXES: [&str; 4] = ["", "-wal", "-shm", "-journal"];
+
+fn directory_of(destination: &Path) -> &Path {
+    destination
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let temporary = parent.join(format!(".gently-recovery-{}.db", gently_raw::new_raw_ref()));
+        .unwrap_or(Path::new("."))
+}
+
+/// A file beside a backup destination that is named like the private partial
+/// copy an interrupted backup leaves behind.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Leftover {
+    /// Exact temporary name, and a regular single-link owner-only file owned
+    /// by this user: only this tool creates such a file.
+    Ours(PathBuf),
+    /// Shares the prefix but cannot be proven ours; it is only ever reported.
+    Unverified(PathBuf),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TemporaryName {
+    Unrelated,
+    Exact,
+    Prefixed,
+}
+
+/// `.gently-recovery-<32 lowercase hex>.db` plus an optional SQLite sidecar.
+fn temporary_name(name: &str) -> TemporaryName {
+    let Some(rest) = name.strip_prefix(TEMPORARY_PREFIX) else {
+        return TemporaryName::Unrelated;
+    };
+    let exact = rest.split_once(".db").is_some_and(|(id, suffix)| {
+        id.len() == 32
+            && id
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            && SQLITE_SUFFIXES.contains(&suffix)
+    });
+    match exact {
+        true => TemporaryName::Exact,
+        false => TemporaryName::Prefixed,
+    }
+}
+
+fn private_regular_file(path: &Path) -> Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    #[cfg(unix)]
+    let private = {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.nlink() == 1
+            && metadata.permissions().mode() & 0o077 == 0
+    };
+    // Ownership cannot be proven here, so nothing is ever classed as ours.
+    #[cfg(not(unix))]
+    let private = false;
+    Ok(metadata.file_type().is_file() && private)
+}
+
+/// List interrupted-backup temporaries beside `destination`. Read-only; a
+/// missing directory has none.
+pub fn recovery_leftovers(destination: &Path) -> Result<Vec<Leftover>> {
+    let directory = directory_of(destination);
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut leftovers = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = directory.join(entry.file_name());
+        match temporary_name(&entry.file_name().to_string_lossy()) {
+            TemporaryName::Unrelated => (),
+            TemporaryName::Exact if private_regular_file(&path)? => {
+                leftovers.push(Leftover::Ours(path))
+            }
+            TemporaryName::Exact | TemporaryName::Prefixed => {
+                leftovers.push(Leftover::Unverified(path))
+            }
+        }
+    }
+    leftovers.sort();
+    Ok(leftovers)
+}
+
+/// Remove only leftovers proven ours, re-checking each just before unlinking.
+/// Returns how many were removed; unverified entries are never touched.
+pub fn remove_recovery_leftovers(leftovers: &[Leftover]) -> Result<usize> {
+    let mut removed = 0;
+    for leftover in leftovers {
+        let Leftover::Ours(path) = leftover else {
+            continue;
+        };
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if temporary_name(&name) != TemporaryName::Exact || !private_regular_file(path)? {
+            continue;
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(removed)
+}
+
+fn publish_database(destination: &Path, write: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+    require_missing_database(destination)?;
+    let parent = directory_of(destination);
+    let temporary = parent.join(format!(
+        "{TEMPORARY_PREFIX}{}.db",
+        gently_raw::new_raw_ref()
+    ));
     let file = private_fs::create_private_file(&temporary)?;
     // Keep the precreated private handle open until SQLite finishes. Failure
     // removes only this operation's newly created temporary files.
@@ -115,10 +228,8 @@ fn publish_database(destination: &Path, write: impl FnOnce(&Path) -> Result<()>)
         Ok(())
     });
     drop(file);
-    for suffix in ["", "-wal", "-shm", "-journal"] {
-        let mut name = temporary.as_os_str().to_os_string();
-        name.push(suffix);
-        let _ = std::fs::remove_file(PathBuf::from(name));
+    for path in sqlite_paths(&temporary) {
+        let _ = std::fs::remove_file(path);
     }
     outcome?;
     private_fs::harden_existing_file(destination)?;
@@ -128,7 +239,7 @@ fn publish_database(destination: &Path, write: impl FnOnce(&Path) -> Result<()>)
 }
 
 fn sqlite_paths(path: &Path) -> Vec<PathBuf> {
-    ["", "-wal", "-shm", "-journal"]
+    SQLITE_SUFFIXES
         .into_iter()
         .map(|suffix| {
             let mut name = path.as_os_str().to_os_string();
@@ -214,6 +325,107 @@ mod tests {
                 .unwrap(),
             "ok"
         );
+    }
+
+    #[test]
+    fn busy_snapshot_fails_for_retry_without_publishing_or_leaving_temporaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("source.db")).unwrap();
+        // SQLite refuses to snapshot a source that is mid-write.
+        store.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let backup = dir.path().join("backup.db");
+        assert!(matches!(
+            store.backup(&backup, "synthetic", "synthetic"),
+            Err(StoreError::BackupBusy)
+        ));
+        for path in sqlite_paths(&backup) {
+            assert!(std::fs::symlink_metadata(path).is_err());
+        }
+        assert_eq!(recovery_leftovers(&backup).unwrap(), Vec::new());
+        store.conn.execute_batch("ROLLBACK").unwrap();
+        store.backup(&backup, "synthetic", "synthetic").unwrap();
+    }
+
+    #[test]
+    fn temporary_names_match_only_the_exact_private_pattern() {
+        let id = "0123456789abcdef0123456789abcdef";
+        for suffix in SQLITE_SUFFIXES {
+            assert_eq!(
+                temporary_name(&format!(".gently-recovery-{id}.db{suffix}")),
+                TemporaryName::Exact
+            );
+        }
+        for prefixed in [
+            ".gently-recovery-notes.txt".to_string(),
+            format!(".gently-recovery-{}.db", id.to_uppercase()),
+            format!(".gently-recovery-{id}0.db"),
+            format!(".gently-recovery-{id}.db-other"),
+            format!(".gently-recovery-{id}.db.bak"),
+        ] {
+            assert_eq!(temporary_name(&prefixed), TemporaryName::Prefixed);
+        }
+        for unrelated in ["backup.db", "gently-recovery-x.db", ".gently-state.db"] {
+            assert_eq!(temporary_name(unrelated), TemporaryName::Unrelated);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leftovers_report_lookalikes_and_remove_only_exact_private_temporaries() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("backup.db");
+        let named = |id: char, suffix: &str| {
+            dir.path().join(format!(
+                ".gently-recovery-{}.db{suffix}",
+                id.to_string().repeat(32)
+            ))
+        };
+        let write = |path: &Path, mode: u32| {
+            std::fs::write(path, b"synthetic partial copy").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let ours = [named('a', ""), named('a', "-journal")];
+        for path in &ours {
+            write(path, 0o600);
+        }
+        let readable = named('b', "");
+        write(&readable, 0o644);
+        let target = elsewhere.path().join("user-file");
+        write(&target, 0o600);
+        let symlinked = named('c', "");
+        std::os::unix::fs::symlink(&target, &symlinked).unwrap();
+        let hard_linked = named('d', "-wal");
+        std::fs::hard_link(&target, &hard_linked).unwrap();
+        let prefixed = dir.path().join(".gently-recovery-notes.txt");
+        write(&prefixed, 0o600);
+        let unrelated = dir.path().join("keep.db");
+        write(&unrelated, 0o600);
+
+        let leftovers = recovery_leftovers(&destination).unwrap();
+        let mut expected = vec![
+            Leftover::Ours(ours[0].clone()),
+            Leftover::Ours(ours[1].clone()),
+            Leftover::Unverified(readable.clone()),
+            Leftover::Unverified(symlinked.clone()),
+            Leftover::Unverified(hard_linked.clone()),
+            Leftover::Unverified(prefixed.clone()),
+        ];
+        expected.sort();
+        assert_eq!(leftovers, expected);
+
+        assert_eq!(remove_recovery_leftovers(&leftovers).unwrap(), 2);
+        for path in &ours {
+            assert!(std::fs::symlink_metadata(path).is_err());
+        }
+        for kept in [&readable, &symlinked, &hard_linked, &prefixed, &unrelated] {
+            assert!(std::fs::symlink_metadata(kept).is_ok());
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"synthetic partial copy");
+        assert!(recovery_leftovers(&dir.path().join("missing/backup.db"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

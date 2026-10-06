@@ -21,6 +21,7 @@ mod query_client;
 mod waterfall;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use cmd_init::Harness;
 use cmd_query::{Format, TraceFormat};
 use query_client::{SpanFilters, TraceFilters};
 
@@ -198,7 +199,9 @@ fn main() {
 fn dispatch(command: Command) -> anyhow::Result<()> {
     match command {
         Command::State { command } => cmd_state::run(command),
-        Command::Uninstall { codex, .. } => cmd_init::run_uninstall(codex),
+        Command::Uninstall { claude: true, .. } => cmd_init::run_uninstall(Harness::Claude),
+        Command::Uninstall { codex: true, .. } => cmd_init::run_uninstall(Harness::Codex),
+        Command::Uninstall { .. } => anyhow::bail!("choose --claude or --codex"),
         Command::Hook { .. } => unreachable!("handled in main"),
         Command::Export {
             watch,
