@@ -734,6 +734,9 @@ mod schema_tests {
             anyhow::anyhow!(private).context(QueryFailure::RawDecrypt),
             anyhow::anyhow!(private).context(QueryFailure::WatcherUnavailable),
             anyhow::anyhow!(private).context(QueryFailure::WatcherRelayed),
+            anyhow::anyhow!(private).context(QueryFailure::TraceRawBudget),
+            anyhow::anyhow!(private).context(QueryFailure::TraceTooLarge),
+            anyhow::anyhow!(private).context(QueryFailure::TraceUnstable),
         ] {
             assert!(!tool_failure(&error).contains(private));
         }
@@ -890,5 +893,19 @@ mod result_tests {
         assert_ne!(text, COLLECTOR_FAILURE);
         assert!(text.contains("over the 8388608-byte limit"));
         assert!(text.contains("select fields with jq"));
+    }
+
+    #[test]
+    fn trace_assembly_limits_reach_the_client_by_name() {
+        use crate::query_client::QueryFailure;
+        for failure in [
+            QueryFailure::TraceRawBudget,
+            QueryFailure::TraceTooLarge,
+            QueryFailure::TraceUnstable,
+        ] {
+            let text = tool_failure(&failure.into());
+            assert_eq!(text, failure.to_string());
+            assert_ne!(text, COLLECTOR_FAILURE);
+        }
     }
 }

@@ -157,14 +157,14 @@ enum TraceNext {
 struct TraceAssembly<'a> {
     trace_id: &'a str,
     byte_limit: usize,
-    over_limit: &'static str,
+    over_limit: QueryFailure,
     rows: Vec<SpanRow>,
     spans: std::collections::BTreeSet<String>,
     cursors: std::collections::BTreeSet<String>,
     bytes: usize,
 }
 impl<'a> TraceAssembly<'a> {
-    fn new(trace_id: &'a str, byte_limit: usize, over_limit: &'static str) -> Self {
+    fn new(trace_id: &'a str, byte_limit: usize, over_limit: QueryFailure) -> Self {
         Self {
             trace_id,
             byte_limit,
@@ -209,7 +209,6 @@ impl<'a> TraceAssembly<'a> {
         self.bytes = self.bytes.saturating_add(serde_json::to_vec(&row)?.len());
         anyhow::ensure!(
             self.bytes <= self.byte_limit && self.rows.len() < MAX_TRACE_ROWS,
-            "{}",
             self.over_limit
         );
         self.rows.push(row);
@@ -245,7 +244,7 @@ impl Drop for CachedRawPayload {
 
 /// Closed safe categories for callers that must not expose error chains. Each
 /// names the component that failed; an untagged error is a collector failure.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Copy, Debug, thiserror::Error)]
 pub enum QueryFailure {
     #[error("raw resolution exceeds the 8 MiB budget; narrow your query")]
     RawBudget,
@@ -263,6 +262,21 @@ pub enum QueryFailure {
         "Local query watcher relayed a collector or query error; check collector availability, authorization and query arguments."
     )]
     WatcherRelayed,
+    #[error(
+        "trace exceeds the 8 MiB raw-resolution budget; \
+         read it without raw values (GENTLY_RESOLVE_RAW_VALUES=0)"
+    )]
+    TraceRawBudget,
+    #[error(
+        "trace exceeds local assembly limits (100,000 rows or 32 MiB); \
+         use the collector cursor API for bounded pages"
+    )]
+    TraceTooLarge,
+    #[error(
+        "trace changed during pagination on {TRACE_READ_ATTEMPTS} attempts; \
+         repeat the query once capture for it is idle"
+    )]
+    TraceUnstable,
 }
 
 /// Decryption fails locally: a reader prompt not approved in time, a reader
@@ -418,18 +432,10 @@ impl QueryClient {
     /// so with it enabled the read stops there rather than after every page.
     fn trace_assembly<'a>(&self, trace_id: &'a str) -> TraceAssembly<'a> {
         match self.local_raw_store {
-            Some(_) => TraceAssembly::new(
-                trace_id,
-                MAX_RAW_QUERY_BYTES,
-                "trace exceeds the 8 MiB raw-resolution budget; \
-                 read it without raw values (GENTLY_RESOLVE_RAW_VALUES=0)",
-            ),
-            None => TraceAssembly::new(
-                trace_id,
-                MAX_TRACE_BYTES,
-                "trace exceeds local assembly limits (100,000 rows or 32 MiB); \
-                 use the collector cursor API for bounded pages",
-            ),
+            Some(_) => {
+                TraceAssembly::new(trace_id, MAX_RAW_QUERY_BYTES, QueryFailure::TraceRawBudget)
+            }
+            None => TraceAssembly::new(trace_id, MAX_TRACE_BYTES, QueryFailure::TraceTooLarge),
         }
     }
 
@@ -492,10 +498,9 @@ impl QueryClient {
                 Err(error) if is_trace_changed(&error) && attempt < TRACE_READ_ATTEMPTS => {
                     attempt += 1
                 }
-                Err(error) if is_trace_changed(&error) => anyhow::bail!(
-                    "trace changed during pagination on {TRACE_READ_ATTEMPTS} attempts; \
-                     repeat the query once capture for it is idle"
-                ),
+                Err(error) if is_trace_changed(&error) => {
+                    return Err(QueryFailure::TraceUnstable.into())
+                }
                 result => break result?,
             }
         };
