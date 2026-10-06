@@ -2,7 +2,7 @@ import { env, SELF } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 import worker from "../src/index";
 import type { Env } from "../src/d1";
-import schemaSql from "../schema.sql?raw";
+import { applySchema } from "./schema";
 
 const TOKEN = "test-token-secret";
 const OTHER = "other-tenant-token";
@@ -48,9 +48,7 @@ function postSpans(body: unknown, token = TOKEN, tenant = "personal") {
 }
 
 beforeAll(async () => {
-  for (const statement of schemaSql.split(";").map(s => s.trim()).filter(Boolean)) {
-    await env.DB.prepare(statement).run();
-  }
+  await applySchema(env.DB);
 });
 
 describe("tenant and device authorization", () => {

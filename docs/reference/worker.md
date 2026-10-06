@@ -31,7 +31,7 @@ Every path below also requires `tenant_id=TENANT` in its query string.
 | --- | --- | --- |
 | `POST /v1/traces` | ingest | Flatten metadata OTLP/JSON and merge spans |
 | `GET /v1/query?op=traces` | read | Trace/session summaries |
-| `GET /v1/query?op=trace&trace_id=TRACE_ID` | read | One trace, with effective bounds |
+| `GET /v1/query?op=trace&trace_id=TRACE_ID` | read | One trace, with effective bounds; add `page=1` (and `cursor`, `limit`) for [bounded pages](#bounded-full-trace-queries) |
 | `GET /v1/query?op=spans` | read | Limited, filtered span search |
 | `GET /v1/query?op=stats` | read | Tenant-wide tool rollups |
 | `POST /v1/raw-values` | ingest | Store an immutable encrypted raw object |
@@ -82,7 +82,7 @@ arguments. Use the [CLI](cli.md) for tables and waterfalls, or
 | Operation | Parameters |
 | --- | --- |
 | `traces` | `session_id`, `harness`, `since`, `until`, `limit`, `order` |
-| `trace` | `trace_id` |
+| `trace` | `trace_id`; with `page=1`, also `cursor` and `limit` (1–100) |
 | `spans` | `trace_id`, `session_id`, `harness`, `tool_name`, `name`, `status`, `kind`, `since`, `until`, `limit`, `order` |
 | `stats` | None |
 
@@ -95,6 +95,8 @@ canonical decimal timestamps emitted by Gently's hooks.
 
 `traces` and `spans` default to 50 rows and cap a requested limit at 1,000.
 Missing, non-numeric, or non-positive limits use 50. There is no cursor or offset.
+For `trace`, `limit` is strict and applies only to paged reads (`page=1`); an
+unpaged `trace` query ignores it.
 
 Trace ordering accepts `start_desc` (default), `start_asc`, `last_activity`,
 `last_activity_desc`, and `last_activity_asc`. `last_activity` is an alias for
@@ -183,6 +185,11 @@ The `spans` table keys rows by `(tenant_id, span_id)` and stores immutable
 capture-device ownership. Indexes start with tenant and cover trace, session,
 start, tool and common filters. Queries use explicit metadata projections;
 internal storage columns and raw ciphertext are not automatically included.
+Expression indexes on trace position, trace end and parent serve paged trace
+reads. `trace_generations` holds a per-trace counter that triggers on `spans`
+advance (see [bounded full-trace queries](#bounded-full-trace-queries)). These
+statements are idempotent, so reapplying `schema.sql` to an existing database
+adds them without touching stored rows.
 
 `raw_values` keys immutable envelopes by `(tenant_id, raw_ref)`, with capture
 device, key epoch and creation time. D1 stores bounded ciphertext directly;
@@ -250,8 +257,8 @@ npm run typecheck
 ```
 
 There is no built-in deletion, retention scheduler, token provisioning endpoint,
-or query pagination. Database maintenance and credential rotation are operator
-responsibilities. The [configuration guide](../getting-started/configuration.md)
+or pagination for trace lists and span searches. Database maintenance and
+credential rotation are operator responsibilities. The [configuration guide](../getting-started/configuration.md)
 describes exporter limits independently of database retention.
 
 ## Source
@@ -262,18 +269,50 @@ describes exporter limits independently of database retention.
 
 ## Bounded full-trace queries
 
-Use `op=trace&trace_id=TRACE_ID&page=1` for a page with `rows`, `next_cursor`
-and `complete`. `limit` accepts 1–100 (default 100). Follow `cursor=NEXT_CURSOR`
-until `complete` is true. Pages use numeric start time then span ID, so equal
-timestamps have stable ordering. Public cursor fields are validated against the
-requested tenant and trace; cursors are continuation positions, not credentials.
-All SQL queries retain authenticated tenant scope and global display bounds.
+Request `op=trace&trace_id=TRACE_ID&page=1` to read a trace in pages. Each page
+is `{"rows":[…],"next_cursor":…,"complete":…}`. Pass `cursor=NEXT_CURSOR` with
+`page=1` for the next page, until `complete` is true and `next_cursor` is null.
+`limit` sets the rows per page, from 1 to 100 (default 100). Other values return
+400. `limit` and `cursor` only apply with `page=1`.
 
-D1 selects a conservative byte-bounded prefix before returning metadata rows;
-responses are capped at 2 MiB. A single oversized row receives HTTP 413. Legacy
-array queries return a complete bounded trace or HTTP 413 directing the caller
-to pagination. The CLI, waterfall and MCP reconstruct pages up to 100,000 rows
-or 32 MiB of encoded metadata, failing explicitly beyond those limits. An older
-collector's complete array response remains supported under HTTP response caps.
-Paging is a live view, not a snapshot: ingests or monotonic merges between pages
-can change results; query a settled trace again when completeness matters.
+Rows come in order of start time, then span ID. Canonical unsigned decimal
+timestamps sort numerically over the whole u64 range. Any other stored start
+string is still returned, in a fixed place in that order. A page is an index
+seek: it reads its own rows, their direct children and two index entries for
+the trace-wide root bounds. Reading a whole trace therefore costs D1 work in
+proportion to its size.
+
+A page holds at most 2 MiB of JSON. A row too large to share a page is returned
+on a page of its own, up to 8 MiB. Every row that ingest accepts (at most 1 MiB
+per request) fits. A stored row beyond that returns 413 rather than a partial
+page. A cursor names the last row returned. It is checked against the
+authenticated tenant, the trace and that row's stored position; it is a
+position, not a credential. Malformed or forged cursors return 400.
+
+Paging is a live view with one guarantee: `complete: true` never hides a row
+that was stored for the whole read. Each cursor carries the trace's generation.
+Triggers advance it when a write could move a row behind a reader: an insert
+before the trace's last position (such as a late parent), a changed start time,
+or a delete. A page that sees a different generation returns 409. Repeat the
+whole read; the CLI does this up to three times. Appends at the end of a trace
+and merges that keep a start time do not advance the generation. They appear in
+the read if they land after the cursor.
+
+Without `page=1`, the query returns a complete JSON array of up to 10,000 rows
+and 8 MiB, the limits older clients accept. A larger trace returns 413
+`Trace requires cursor pagination (page=1)`. The CLI, waterfall and MCP read
+pages and assemble up to 100,000 rows or 32 MiB of row JSON. With raw-value
+resolution enabled the limit is 8 MiB, the raw-resolution budget. The read
+stops at that point instead of fetching every page first. The CLI shows the
+Worker's reason for a 400 or 413.
+
+### Rollout order
+
+1. Reapply `worker/schema.sql` to the D1 database. It adds three indexes, the
+   `trace_generations` table and its triggers. Every statement is idempotent,
+   and existing traces need no backfill: they start at generation 0.
+2. Deploy the Worker. Unpaged queries from older CLIs and watchers keep working
+   for traces up to 10,000 rows and 8 MiB.
+3. Upgrade the CLI, then restart `gently export --watch --serve-queries`. A
+   watcher started before this version rejects `page`. Until it restarts, the
+   new CLI falls back to the unpaged query through it, within those limits.

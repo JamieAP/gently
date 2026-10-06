@@ -299,70 +299,67 @@ export interface SpanRow {
 
 
 export interface TracePage { rows: SpanRow[]; next_cursor: string | null; complete: boolean }
-const PAGE_BYTES = 2 * 1024 * 1024;
+
+// Page budgets, in response bytes. A page holds up to `rows` rows within `bytes`;
+// a row too large to share a page comes back alone, up to `loneRowBytes`. Ingest
+// accepts at most 1 MiB per request, so every stored row fits on some page.
+interface Budget { rows: number; bytes: number; loneRowBytes: number }
 const PAGE_ROWS = 100;
-interface TraceCursor { v: number; tenant: string; trace: string; start: string; span: string }
-function decodeCursor(raw: string | null, tenant: string, trace: string): TraceCursor {
-  if (!raw) return { v: 1, tenant, trace, start: "-1", span: "" };
-  try {
-    if (raw.length > 4096 || !/^[A-Za-z0-9_-]+$/.test(raw)) throw new Error();
-    const cursor: TraceCursor = JSON.parse(new TextDecoder("utf-8", {fatal:true,ignoreBOM:false}).decode(Uint8Array.from(atob(raw.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0))));
-    if (cursor.v !== 1 || cursor.tenant !== tenant || cursor.trace !== trace
-        || typeof cursor.start !== "string" || cursor.start.length > 128
-        || typeof cursor.span !== "string" || cursor.span.length === 0 || cursor.span.length > 256) throw new Error();
-    return cursor;
-  } catch { throw new ClientError(400, "Invalid trace cursor"); }
-}
-function encodeCursor(cursor: TraceCursor): string {
-  if (!cursor.span || cursor.span.length > 256 || cursor.start.length > 128)
-    throw new ClientError(413, "Stored trace position exceeds the continuation budget");
-  const encoded = btoa(String.fromCharCode(...new TextEncoder().encode(JSON.stringify(cursor)))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  if (encoded.length > 4096) throw new ClientError(413, "Trace cursor exceeds the bounded continuation budget");
-  return encoded;
-}
+// Room for `{"rows":[…],"next_cursor":"<at most 4096 chars>","complete":false}`.
+const PAGE_ENVELOPE = 4096 + 64;
+const pageBudget = (rows: number): Budget => ({
+  rows, bytes: 2 * 1024 * 1024 - PAGE_ENVELOPE, loneRowBytes: 8 * 1024 * 1024 - PAGE_ENVELOPE,
+});
+// Unpaged callers predate pagination and accept responses of up to 8 MiB.
+const LEGACY: Budget = { rows: 10_000, bytes: 8 * 1024 * 1024, loneRowBytes: 8 * 1024 * 1024 };
 
-// Legacy callers receive a complete small trace or an explicit error; never a
-// silently truncated array. New clients request page=1 and follow next_cursor.
-export async function trace(env: Env, tenantId: string, traceId: string): Promise<SpanRow[]> {
-  const page = await tracePage(env, tenantId, traceId, null, null);
-  if (!page.complete) throw new ClientError(413, "Trace requires cursor pagination (page=1)");
-  return page.rows;
-}
+// Rows are read in position order, (length(start), start, span_id), folded into
+// one TEXT key so that an expression index serves both the keyset seek and the
+// ORDER BY. For canonical unsigned decimal nanos this is numeric order across
+// the whole u64 range; other stored strings still get one deterministic place,
+// so no row is skipped. These must stay structurally identical to the
+// idx_spans_trace_position and idx_spans_trace_end expressions in schema.sql.
+const position = (start: string, span: string) =>
+  `(printf('%09d', length(${start})) || ':' || ${start} || ':' || ${span})`;
+const POSITION = position("start_unix_nano", "span_id");
+const END = "COALESCE(end_unix_nano, start_unix_nano)";
+const END_POSITION = `(printf('%09d', length(${END})) || ':' || ${END})`;
+// Stored bytes never exceed a row's JSON size, so admitting rows by stored bytes
+// cannot exclude a row that fits; the exact JSON size is checked afterwards.
+const STORED_BYTES = SPAN_COLUMNS.map(column => `length(CAST(COALESCE(${column}, '') AS BLOB))`).join(" + ");
 
-// Derived display bounds: parentless records use trace-wide min/max; other
-// records use own/direct-child minimum start and retain non-provisional ends,
-// otherwise using direct-child maximum end or their own start. Two GROUP BYs,
-// no recursion. These observations do not prove capture completeness or actual
-// completion. Raw bounds remain unchanged; TEXT avoids JS integer rounding.
-export async function tracePage(env: Env, tenantId: string, trace_id: string, cursorRaw: string | null, limitRaw: string | null): Promise<TracePage> {
-  if (!trace_id || trace_id.length > 256) throw new ClientError(400, "Invalid trace_id");
-  const cursor = decodeCursor(cursorRaw, tenantId, trace_id);
-  if (limitRaw !== null && !/^(?:[1-9]|[1-9][0-9]|100)$/.test(limitRaw)) throw new ClientError(400, "Invalid page limit");
-  const limit = limitRaw === null ? PAGE_ROWS : Number(limitRaw);
-  // Six bytes per stored byte plus fixed overhead bounds JSON escaping and row
-  // fields conservatively, before D1 materializes payload-bearing rows in JS.
-  const weight = SPAN_COLUMNS.map(column => `length(CAST(COALESCE(${column}, '') AS BLOB))`).join(" + ");
-  const result = await env.DB.prepare(
-    `WITH candidate_keys AS (
-       SELECT span_id, start_unix_nano, 4096 + 6 * (${weight}) AS weight
-       FROM spans WHERE tenant_id = ?1 AND trace_id = ?2
-         AND (CAST(start_unix_nano AS INTEGER) > CAST(?3 AS INTEGER)
-           OR (CAST(start_unix_nano AS INTEGER) = CAST(?3 AS INTEGER) AND span_id > ?4))
-       ORDER BY CAST(start_unix_nano AS INTEGER), span_id LIMIT ?5
-     ), ranked_keys AS (
-       SELECT span_id, SUM(weight) OVER (ORDER BY CAST(start_unix_nano AS INTEGER), span_id) AS bytes
-       FROM candidate_keys
-     ), selected_keys AS (SELECT span_id FROM ranked_keys WHERE bytes <= ?6), agg AS (
-       SELECT MAX(CAST(COALESCE(end_unix_nano, start_unix_nano) AS INTEGER)) AS trace_max,
-              MIN(CAST(start_unix_nano AS INTEGER)) AS trace_min
-       FROM spans WHERE tenant_id = ?1 AND trace_id = ?2
-     ),
-     child_bounds AS (
+// Derived display bounds: parentless records use the trace's first start and
+// last end in position order (exact for canonical u64 text); other records use
+// own/direct-child minimum start and retain non-provisional ends, otherwise
+// using direct-child maximum end or their own start. A page reads only its own
+// rows and their direct children; the trace-wide bounds are two index seeks.
+// Parentless rows carry those bounds, so admission counts them as row bytes.
+// These observations do not prove capture completeness or actual completion.
+// Raw bounds remain unchanged; TEXT avoids JS integer rounding.
+export function tracePageSql(afterCursor: boolean): string {
+  return `WITH agg AS MATERIALIZED (
+       SELECT (SELECT start_unix_nano FROM spans WHERE tenant_id = ?1 AND trace_id = ?2
+               ORDER BY ${POSITION} LIMIT 1) AS trace_min,
+              (SELECT ${END} FROM spans WHERE tenant_id = ?1 AND trace_id = ?2
+               ORDER BY ${END_POSITION} DESC LIMIT 1) AS trace_max
+     ), candidate AS MATERIALIZED (
+       SELECT span_id, ${POSITION} AS position,
+              ${STORED_BYTES} + CASE WHEN parent_span_id IS NULL
+                THEN length(CAST(agg.trace_min AS BLOB)) + length(CAST(agg.trace_max AS BLOB)) ELSE 0 END AS stored_bytes
+       FROM spans CROSS JOIN agg WHERE tenant_id = ?1 AND trace_id = ?2
+         ${afterCursor ? `AND ${POSITION} > ${position("?3", "?4")}` : ""}
+       ORDER BY ${POSITION} LIMIT ?5 + 1
+     ), ranked AS MATERIALIZED (
+       SELECT span_id, position, ROW_NUMBER() OVER w AS rn, SUM(stored_bytes) OVER w AS bytes
+       FROM candidate WINDOW w AS (ORDER BY position)
+     ), page AS MATERIALIZED (
+       SELECT span_id, position FROM ranked WHERE rn <= ?5 AND (rn = 1 OR bytes <= ?6)
+     ), child_bounds AS MATERIALIZED (
        SELECT parent_span_id AS pid,
-              MAX(CAST(COALESCE(end_unix_nano, start_unix_nano) AS INTEGER)) AS cmax,
+              MAX(CAST(${END} AS INTEGER)) AS cmax,
               MIN(CAST(start_unix_nano AS INTEGER)) AS cmin
        FROM spans
-       WHERE tenant_id = ?1 AND trace_id = ?2 AND parent_span_id IS NOT NULL
+       WHERE tenant_id = ?1 AND trace_id = ?2 AND parent_span_id IN (SELECT span_id FROM page)
        GROUP BY parent_span_id
      )
      SELECT ${SPAN_COLUMNS.map(column => `s.${column}`).join(", ")},
@@ -382,26 +379,99 @@ export async function tracePage(env: Env, tenantId: string, trace_id: string, cu
               WHEN s.end_unix_nano IS NOT NULL AND s.end_unix_nano <> s.start_unix_nano
                 THEN CAST(s.end_unix_nano AS INTEGER)
               ELSE COALESCE(cb.cmax, CAST(s.start_unix_nano AS INTEGER))
-            END AS TEXT) AS effective_end_unix_nano
-     FROM spans s JOIN selected_keys selected ON selected.span_id = s.span_id
+            END AS TEXT) AS effective_end_unix_nano,
+            (SELECT COUNT(*) FROM candidate) AS candidates
+     FROM page JOIN spans s ON s.tenant_id = ?1 AND s.span_id = page.span_id
      CROSS JOIN agg LEFT JOIN child_bounds cb ON cb.pid = s.span_id
-     WHERE s.tenant_id = ?1 AND s.trace_id = ?2
-     ORDER BY CAST(s.start_unix_nano AS INTEGER), s.span_id ASC`,
-  )
-    .bind(tenantId, trace_id, cursor.start, cursor.span, limit, PAGE_BYTES)
-    .all<SpanRow>();
-  const rows = result.results;
-  const last = rows.at(-1);
-  const boundary = last ? { ...cursor, start: last.start_unix_nano, span: last.span_id } : cursor;
-  const more = await env.DB.prepare(`SELECT 1 AS found FROM spans WHERE tenant_id = ?1 AND trace_id = ?2
-    AND (CAST(start_unix_nano AS INTEGER) > CAST(?3 AS INTEGER)
-      OR (CAST(start_unix_nano AS INTEGER) = CAST(?3 AS INTEGER) AND span_id > ?4)) LIMIT 1`)
-    .bind(tenantId, trace_id, boundary.start, boundary.span).first();
-  if (!last && more) throw new ClientError(413, "A trace row exceeds the bounded page budget");
-  const page = { rows, next_cursor: more ? encodeCursor(boundary) : null, complete: !more };
-  if (new TextEncoder().encode(JSON.stringify(page)).byteLength > PAGE_BYTES)
-    throw new ClientError(413, "Trace page exceeds response budget");
-  return page;
+     ORDER BY page.position`;
+}
+
+// A cursor names the last row returned and the trace generation the read began
+// at. Its fields are positions, not credentials: every query stays tenant-scoped.
+interface TraceCursor { v: 1; tenant: string; trace: string; generation: string; start: string; span: string }
+
+function decodeCursor(raw: string | null, tenant: string, trace: string): TraceCursor | null {
+  if (!raw) return null;
+  try {
+    if (raw.length > 4096 || !/^[A-Za-z0-9_-]+$/.test(raw)) throw new Error();
+    const cursor = JSON.parse(new TextDecoder("utf-8", {fatal:true,ignoreBOM:false}).decode(Uint8Array.from(atob(raw.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0))));
+    if (cursor?.v !== 1 || cursor.tenant !== tenant || cursor.trace !== trace
+        || typeof cursor.generation !== "string" || !/^[0-9]{1,19}$/.test(cursor.generation)
+        || typeof cursor.start !== "string" || cursor.start.length > 128
+        || typeof cursor.span !== "string" || cursor.span.length === 0 || cursor.span.length > 256) throw new Error();
+    // Rebuild rather than spread: unknown fields never reach the next cursor.
+    return { v: 1, tenant, trace, generation: cursor.generation, start: cursor.start, span: cursor.span };
+  } catch { throw new ClientError(400, "Invalid trace cursor"); }
+}
+function encodeCursor(cursor: TraceCursor): string {
+  if (!cursor.span || cursor.span.length > 256 || cursor.start.length > 128)
+    throw new ClientError(413, "Stored trace position exceeds the continuation budget");
+  const encoded = btoa(String.fromCharCode(...new TextEncoder().encode(JSON.stringify(cursor)))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  if (encoded.length > 4096) throw new ClientError(413, "Trace cursor exceeds the bounded continuation budget");
+  return encoded;
+}
+
+function requireTraceId(traceId: string): void {
+  if (!traceId || traceId.length > 256) throw new ClientError(400, "Invalid trace_id");
+}
+
+// Legacy callers receive a complete bounded trace or an explicit error; never a
+// silently truncated array. New clients request page=1 and follow next_cursor.
+export async function trace(env: Env, tenantId: string, traceId: string): Promise<SpanRow[]> {
+  requireTraceId(traceId);
+  const slice = await traceSlice(env, tenantId, traceId, null, LEGACY);
+  if (slice.more) throw new ClientError(413, "Trace requires cursor pagination (page=1)");
+  return slice.rows;
+}
+
+export async function tracePage(env: Env, tenantId: string, traceId: string, cursorRaw: string | null, limitRaw: string | null): Promise<TracePage> {
+  requireTraceId(traceId);
+  const cursor = decodeCursor(cursorRaw, tenantId, traceId);
+  if (limitRaw !== null && !/^(?:[1-9]|[1-9][0-9]|100)$/.test(limitRaw)) throw new ClientError(400, "Invalid page limit");
+  const slice = await traceSlice(env, tenantId, traceId, cursor, pageBudget(limitRaw === null ? PAGE_ROWS : Number(limitRaw)));
+  const last = slice.rows.at(-1);
+  const next = slice.more && last
+    ? encodeCursor({ v: 1, tenant: tenantId, trace: traceId, generation: slice.generation, start: last.start_unix_nano, span: last.span_id })
+    : null;
+  return { rows: slice.rows, next_cursor: next, complete: next === null };
+}
+
+interface TraceSlice { rows: SpanRow[]; more: boolean; generation: string }
+
+// One page read. The generation and the page come from one D1 batch, which is
+// one transaction, so they describe the same state of the trace.
+async function traceSlice(env: Env, tenantId: string, traceId: string, cursor: TraceCursor | null, budget: Budget): Promise<TraceSlice> {
+  const state = env.DB.prepare(
+    `SELECT CAST(COALESCE((SELECT generation FROM trace_generations WHERE tenant_id = ?1 AND trace_id = ?2), 0) AS TEXT) AS generation,
+            (SELECT start_unix_nano FROM spans WHERE tenant_id = ?1 AND trace_id = ?2 AND span_id = ?3) AS cursor_start`,
+  ).bind(tenantId, traceId, cursor?.span ?? null);
+  const page = env.DB.prepare(tracePageSql(cursor !== null))
+    .bind(tenantId, traceId, cursor?.start ?? null, cursor?.span ?? null, budget.rows, budget.bytes);
+  const [stateResult, pageResult] = await env.DB.batch<Record<string, unknown>>([state, page]);
+  const { generation, cursor_start } = stateResult.results[0] as { generation: string; cursor_start: string | null };
+  if (cursor && cursor.generation !== generation) {
+    throw new ClientError(409, "Trace changed during pagination; repeat the query");
+  }
+  // An unchanged generation means the cursor's row has not moved, so a
+  // different stored start can only be a forged position.
+  if (cursor && cursor.start !== cursor_start) throw new ClientError(400, "Invalid trace cursor");
+  const fetched = pageResult.results as unknown as (SpanRow & { candidates: number })[];
+  const rows = fitRows(fetched.map(({ candidates: _, ...row }) => row), budget);
+  return { rows, more: (fetched[0]?.candidates ?? 0) > rows.length, generation };
+}
+
+// The longest prefix whose JSON array fits the budget, or a lone oversized row.
+function fitRows(rows: SpanRow[], budget: Budget): SpanRow[] {
+  const encoder = new TextEncoder();
+  let bytes = 2;
+  for (const [index, row] of rows.entries()) {
+    bytes += encoder.encode(JSON.stringify(row)).byteLength + (index > 0 ? 1 : 0);
+    if (bytes <= budget.bytes) continue;
+    if (index > 0) return rows.slice(0, index);
+    if (bytes > budget.loneRowBytes) throw new ClientError(413, "A trace row exceeds the bounded page budget");
+    return rows.slice(0, 1);
+  }
+  return rows;
 }
 
 export async function spans(
