@@ -1,9 +1,18 @@
 # Changelog
 
 Notable changes are recorded here using [Keep a Changelog](https://keepachangelog.com/).
-The project is pre-1.0; pending changes appear under Unreleased.
+Gently follows [Semantic Versioning](https://semver.org/) from 1.0.0; pending
+changes appear under Unreleased.
 
 ## [Unreleased]
+
+## [1.0.0] - 2026-10-09
+
+First release: local-first observational tracing for Claude Code and Codex in
+their CLI and desktop coding surfaces, with metadata-only capture by default,
+opt-in encrypted raw values and a self-hosted Cloudflare collector. Release
+archives cover macOS on Apple silicon and x86_64 Linux. See
+[release verification](docs/releases/1.0.0/verification.md) for the evidence.
 
 ### Security
 

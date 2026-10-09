@@ -31,3 +31,7 @@
 * [Harness hooks](reference/hooks.md)
 * [OTel format](reference/otel-format.md)
 * [Collector & Worker](reference/worker.md)
+
+## Releases
+
+* [1.0.0 verification](releases/1.0.0/verification.md)

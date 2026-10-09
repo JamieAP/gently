@@ -87,9 +87,11 @@ optional foreground Mac secret helper wraps those launchers externally. The
 supervisor builds `GENTLY_HOSTS` for the Worker in memory; the exporter receives
 the client credential. A watcher does not authenticate other CLI/MCP processes.
 
-Gently is pre-public. The encrypted-only schema replaces development state
-without migrations, digest aliases or dual readers. Incompatible local state
-requires an explicit reset while Gently is stopped. The external credential
+Gently 1.0 accepts only the encrypted local schema. Supported encrypted state
+opens without a reset; future schema changes need reviewed migrations or an
+explicit version refusal. Plaintext state from early development builds is not
+migrated (no digest aliases or dual readers) and requires an explicit reset
+while Gently is stopped. The external credential
 vault is preserved. See [local setup](../getting-started/local-collector.md),
 [raw enrollment](../guides/encrypted-raw-values.md),
 [trace model](trace-model.md) and [collector reference](../reference/worker.md).

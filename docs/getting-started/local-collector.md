@@ -30,8 +30,9 @@ cd ..
 ```
 
 The schema command initializes local D1. The local Wrangler configuration does
-not need a cloud database ID. Existing pre-public state must be explicitly
-reset before using the new tenant/encrypted schema; there is no migration.
+not need a cloud database ID. State from early development builds,
+before the tenant/encrypted schema, must be explicitly reset; there is no
+migration from it.
 
 ## 2. Configure capture
 

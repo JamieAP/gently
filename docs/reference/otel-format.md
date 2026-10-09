@@ -23,7 +23,7 @@ This synthetic example contains one session root with no parent:
       ]
     },
     "scopeSpans": [{
-      "scope": {"name":"gently","version":"0.1.0"},
+      "scope": {"name":"gently","version":"1.0.0"},
       "spans": [{
         "traceId":"11111111111111111111111111111111",
         "spanId":"2222222222222222",

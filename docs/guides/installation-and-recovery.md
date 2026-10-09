@@ -1,7 +1,8 @@
 # Installation, upgrade and recovery
 
-Current builds are pre-v1 source installs. No v1 release artifacts or tags are
-promised by this guide. macOS and Linux are the target platforms; Unix file/socket
+Gently 1.0.0 ships checksummed release archives with build provenance for macOS
+on Apple silicon and x86_64 Linux; see [install a release build](#install-a-release-build).
+Other platforms install from source. macOS and Linux are the target platforms; Unix file/socket
 permissions underpin local privacy. A release must name its tested OS and CPU
 architecture. Windows support has no v1 acceptance evidence.
 
@@ -10,7 +11,7 @@ also needs Node.js 22/npm and Python 3; encrypted capture needs public age reade
 policy, while decryption needs an enrolled reader and its supported age provider.
 Hardware readers require the platform plugin. Rust tests alone do not verify it.
 
-Pin a reviewed full commit (or a published release tag when available), then run:
+To build from source, pin a reviewed full commit or a release tag, then run:
 
 ```sh
 cargo install --locked --path crates/gently-cli
@@ -135,7 +136,6 @@ the exact reviewed source commit. Each tested OS/architecture needs checksummed
 artifacts, build provenance, a verified install/upgrade path and recovery checks.
 Builds must avoid embedding personal source paths. The release workflow checks
 each of these on every tested platform before an owner publishes; see
-[Release verification](releasing.md#release-workflow-and-publication). Artifact
-publication and a v1 tag remain pending until the final-tree Mac/Linux and native
-four-surface gates pass, as tracked in the
-[v1 readiness plan](../plans/2026-10-06-v1-readiness.md).
+[Release verification](releasing.md#release-workflow-and-publication). Each release
+records that evidence in `docs/releases/<version>/verification.md`; see
+[1.0.0](../releases/1.0.0/verification.md).
