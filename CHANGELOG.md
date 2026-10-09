@@ -5,6 +5,16 @@ The project is pre-1.0; pending changes appear under Unreleased.
 
 ## [Unreleased]
 
+### Security
+
+- Update rustls to 0.23.45 (RUSTSEC-2026-0285, TLS 1.3 handshake messages
+  accepted across encryption levels), quinn-proto to 0.11.15 (RUSTSEC-2026-0185,
+  memory exhaustion from out-of-order stream reassembly) and anyhow to 1.0.103
+  (RUSTSEC-2026-0190, unsound `Error::downcast_mut`).
+- Audit the locked Rust dependencies in CI with a pinned cargo-audit. Every
+  RustSec vulnerability or warning fails unless a reviewed, expiring exception
+  records it.
+
 ### Added
 
 - Add `gently export --discard-oldest`, the only way to trim queued history to

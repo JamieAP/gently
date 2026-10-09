@@ -96,8 +96,25 @@ reviewed exception in that project's `audit-allowlist.json`:
 
 An entry matches one GitHub advisory ID in one package, must expire within 90
 days and fails the audit once expired. Remove entries that no longer match.
-Rust dependencies are not audited by this check. For migration details see the
+For migration details see the
 [Cloudflare test-plugin guide](https://developers.cloudflare.com/workers/testing/vitest-integration/migration-guides/migrate-to-vitest-plugin/).
+
+Rust dependencies have their own gate. With
+[cargo-audit](https://crates.io/crates/cargo-audit) installed
+(`cargo install --locked cargo-audit`), run from the repository root:
+
+```sh
+python3 scripts/rust-audit.py
+```
+
+It audits the committed `Cargo.lock` against the RustSec advisory database and
+fails on every finding: vulnerabilities and every warning kind (unmaintained,
+unsound, yanked). Fix a finding with a targeted, semver-compatible update such as
+`cargo update -p CRATE --precise VERSION`, not a blanket upgrade. Otherwise record
+a reviewed exception in the root `audit-allowlist.json`, in the format above with
+a RustSec ID (`RUSTSEC-YYYY-NNNN`) and the crate name. Yanked crates have no
+RustSec ID and must be updated. CI installs a pinned cargo-audit and runs this
+gate on every push to `main`, after the npm audit.
 
 For local launcher changes:
 

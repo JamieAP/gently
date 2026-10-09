@@ -74,5 +74,9 @@ jobs:
       # Last, so a newly published advisory or an audit endpoint outage fails the
       # run without hiding functional results. Reviewed exceptions expire; see
       # CONTRIBUTING.md.
+      - name: Install pinned RustSec scanner
+        run: cargo install --locked cargo-audit --version 0.22.2 --root "$RUNNER_TEMP/cargo-audit"
       - name: Locked Node dependency advisory audit
         run: python3 scripts/npm-audit.py worker docs
+      - name: Locked Rust dependency advisory audit
+        run: python3 scripts/rust-audit.py --cargo-audit "$RUNNER_TEMP/cargo-audit/bin/cargo-audit"
