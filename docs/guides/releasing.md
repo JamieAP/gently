@@ -90,3 +90,54 @@ Release artifacts need a version matching the tag, an exact reviewed source
 commit, supported OS/architecture labels, checksums, build provenance, recovery
 verification and a documented installation path. No release is created by this
 checklist or by opening its implementation PRs.
+
+## Release workflow and publication
+
+`.github/workflows/release.yml` builds the artifacts. It runs only when the owner
+dispatches it on a `v*` tag; the readiness policy rejects any other trigger, an
+unguarded job, or a write permission beyond the attestation job's OIDC token and
+attestations. No job can write repository contents, so publishing stays an owner
+step after verification.
+
+Tag the reviewed `main` commit that carries the release evidence, push the tag,
+then dispatch the workflow on it:
+
+```sh
+git tag -a vX.Y.Z -m "Gently X.Y.Z" REVIEWED_FULL_MAIN_COMMIT
+git push origin vX.Y.Z
+gh workflow run release.yml --repo JamieAP/gently --ref vX.Y.Z
+```
+
+The workflow has three jobs:
+
+- **build**, on `macos-latest` (`aarch64-apple-darwin`) and `ubuntu-latest`
+  (`x86_64-unknown-linux-gnu`): `scripts/release-check.py version` requires the tag,
+  workspace version and newest dated CHANGELOG heading to agree, and the build
+  host to match the target label. A locked release build remaps the checkout,
+  Cargo and rustup paths, and `package` refuses a binary that still embeds them.
+  The archive, `gently-X.Y.Z-TARGET.tar.gz`, holds `gently`, `LICENSE`,
+  `README.md` and `CHANGELOG.md` with fixed owners, modes and timestamps.
+- **attest**: writes `SHA256SUMS` and records GitHub build provenance for every
+  archive with `actions/attest-build-provenance`.
+- **verify**, on both platforms: `gh attestation verify` against this workflow and
+  tag; `install` checks the archive against `SHA256SUMS` and its exact member list;
+  `upgrade` installs the previous version (the latest earlier tag, or for the first
+  release the last pre-1.0 `main` commit) at a stable path, queues synthetic events,
+  replaces the binary in place, re-runs `init`, then backs up, restores and
+  uninstalls; and the real CLI/Wrangler/D1 acceptance runs against the released
+  binary.
+
+When every job passes, download the verified bundle, check it locally and publish:
+
+```sh
+gh run download RUN_ID --repo JamieAP/gently --name release --dir release-X.Y.Z
+cd release-X.Y.Z
+shasum -a 256 -c SHA256SUMS
+gh attestation verify gently-X.Y.Z-aarch64-apple-darwin.tar.gz --repo JamieAP/gently \
+  --signer-workflow JamieAP/gently/.github/workflows/release.yml --source-ref refs/tags/vX.Y.Z
+gh release create vX.Y.Z --repo JamieAP/gently --verify-tag --title "Gently X.Y.Z" \
+  --notes-file NOTES.md gently-X.Y.Z-*.tar.gz SHA256SUMS
+```
+
+`NOTES.md` is the version's CHANGELOG section. Record the workflow run, digests
+and attestation links in `docs/releases/X.Y.Z/verification.md`.

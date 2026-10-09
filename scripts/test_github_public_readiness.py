@@ -57,6 +57,34 @@ jobs:
     environment:
       name: github-pages
 """,
+    ".github/workflows/release.yml": """name: release
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    if: github.repository == 'JamieAP/gently' && startsWith(github.ref, 'refs/tags/v') && github.actor == 'JamieAP' && github.triggering_actor == 'JamieAP'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        with:
+          persist-credentials: false
+  attest:
+    if: github.repository == 'JamieAP/gently' && startsWith(github.ref, 'refs/tags/v') && github.actor == 'JamieAP' && github.triggering_actor == 'JamieAP'
+    needs: build
+    permissions:
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/attest-build-provenance@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  verify:
+    if: github.repository == 'JamieAP/gently' && startsWith(github.ref, 'refs/tags/v') && github.actor == 'JamieAP' && github.triggering_actor == 'JamieAP'
+    needs: attest
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo verify
+""",
     ".github/CODEOWNERS": "* @JamieAP\n",
 }
 
@@ -116,7 +144,7 @@ class FakeAPI:
         if suffix == "git/ref/heads/main":
             return {"object": {"sha": self.main_sha}}
         if suffix == "contents/.github/workflows":
-            return ["ci.yml", "docs.yml"]
+            return sorted(pathlib.Path(name).name for name in self.files if name.startswith(".github/workflows/"))
         if suffix.startswith("contents/"):
             name = suffix.removeprefix("contents/")
             return {"type": "file", "encoding": "base64",
@@ -255,6 +283,42 @@ class ReadinessTests(unittest.TestCase):
                 self.assertNotEqual(text, shipped[name])
                 with self.assertRaises(guard_module.GuardError):
                     guard_module.Guard(self.api, {**shipped, name: text}).validate_files()
+
+    def test_shipped_release_workflow_passes_and_privilege_or_guard_regressions_fail(self):
+        root = pathlib.Path(__file__).resolve().parent.parent
+        shipped = {name: (root / name).read_text(encoding="utf-8") for name in guard_module.FILES}
+        release = shipped[".github/workflows/release.yml"]
+        guard = guard_module.RELEASE_CONDITION
+        self.assertEqual(release.count("    if: " + guard + "\n"), 3)
+        attest = "    permissions:\n      id-token: write\n      attestations: write\n"
+        self.assertIn(attest, release)
+        pin = "11d5960a326750d5838078e36cf38b85af677262"
+        variants = {
+            "tag push trigger": release.replace("on:\n  workflow_dispatch:\n", 'on:\n  push:\n    tags: ["v*"]\n  workflow_dispatch:\n'),
+            "contents write on attest": release.replace(attest, attest + "      contents: write\n"),
+            "write on build": release.replace("    runs-on: ${{ matrix.os }}\n    timeout-minutes: 30\n",
+                                              "    runs-on: ${{ matrix.os }}\n    timeout-minutes: 30\n    permissions:\n      contents: write\n", 1),
+            "workflow-level write": release.replace("permissions:\n  contents: read\n", "permissions:\n  contents: write\n", 1),
+            "unguarded verify": release.replace("  verify:\n    if: " + guard + "\n", "  verify:\n"),
+            "any ref": release.replace("startsWith(github.ref, 'refs/tags/v')", "startsWith(github.ref, 'refs/')", 1),
+            "any actor": release.replace("github.actor == 'JamieAP' && ", "", 1),
+            "continue on error": release.replace("    needs: attest\n", "    needs: attest\n    continue-on-error: true\n"),
+            "extra job": release.rstrip("\n") + f"\n  publish:\n    if: {guard}\n    runs-on: ubuntu-latest\n    steps:\n"
+                         f"      - uses: actions/checkout@{pin} # v4\n        with:\n          persist-credentials: false\n",
+            "third-party action": release.replace("actions/attest-build-provenance@", "someone/attest-build-provenance@"),
+            "unpinned action": release.replace("actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8", "actions/attest-build-provenance@v4"),
+            "stored secret": release.replace("GH_TOKEN: ${{ github.token }}", "GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}"),
+        }
+        for label, text in variants.items():
+            with self.subTest(variant=label):
+                self.assertNotEqual(text, release)
+                with self.assertRaises(guard_module.GuardError):
+                    guard_module.Guard(self.api, {**shipped, ".github/workflows/release.yml": text}).validate_files()
+
+    def test_release_workflow_must_be_on_main(self):
+        self.api.files.pop(".github/workflows/release.yml")
+        with self.assertRaisesRegex(guard_module.GuardError, "Unexpected workflow inventory"):
+            self.guard.reviewed_workflows(SHA)
 
     def test_required_checks_are_bound_and_conflicting_bindings_refused(self):
         self.apply()

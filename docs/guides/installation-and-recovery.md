@@ -25,6 +25,35 @@ Stop the exporter before replacing its binary, then refresh hooks/MCP with `init
 and restart coding agents so they load the new executable. `init` preserves user
 preferences and existing Gently configuration. Use a stable executable path.
 
+## Install a release build
+
+Each release publishes one archive per tested platform, a `SHA256SUMS` file and
+GitHub build provenance:
+
+| Archive | Platform |
+| --- | --- |
+| `gently-X.Y.Z-aarch64-apple-darwin.tar.gz` | macOS on Apple silicon |
+| `gently-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz` | 64-bit x86 Linux with glibc at least as new as GitHub's `ubuntu-latest` image |
+
+Other platforms install from source as above. Verify the checksum and provenance
+before installing (this example uses the Mac archive):
+
+```sh
+gh release download vX.Y.Z --repo JamieAP/gently \
+  --pattern 'gently-X.Y.Z-aarch64-apple-darwin.tar.gz' --pattern SHA256SUMS
+grep ' gently-X.Y.Z-aarch64-apple-darwin.tar.gz$' SHA256SUMS | shasum -a 256 -c
+gh attestation verify gently-X.Y.Z-aarch64-apple-darwin.tar.gz --repo JamieAP/gently
+tar -xzf gently-X.Y.Z-aarch64-apple-darwin.tar.gz
+install -m 0755 gently-X.Y.Z-aarch64-apple-darwin/gently ~/.local/bin/gently
+```
+
+Then run the `init`, `config --check` and `status` commands above with that
+binary. To upgrade, stop the exporter, install the new binary at the same path,
+re-run `init` for each coding agent and restart them. Every release is checked
+this way from the previous version before it is published. The Mac binary is
+not notarized; `gh` and `curl` downloads are not quarantined, so prefer them to a
+browser.
+
 ## Private consistent state backup
 
 ```sh
@@ -104,6 +133,9 @@ remove the credential vault or delete captured history.
 Before publishing binaries, the tag must match the workspace package version and
 the exact reviewed source commit. Each tested OS/architecture needs checksummed
 artifacts, build provenance, a verified install/upgrade path and recovery checks.
-Builds must avoid embedding personal source paths. Artifact publication and a v1
-tag remain pending until the final-tree Mac/Linux and native four-surface gates
-pass. The separate release-verification PR tracks those gates.
+Builds must avoid embedding personal source paths. The release workflow checks
+each of these on every tested platform before an owner publishes; see
+[Release verification](releasing.md#release-workflow-and-publication). Artifact
+publication and a v1 tag remain pending until the final-tree Mac/Linux and native
+four-surface gates pass, as tracked in the
+[v1 readiness plan](../plans/2026-10-06-v1-readiness.md).
