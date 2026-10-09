@@ -73,6 +73,30 @@ expiry. Redact runtime paths, IDs and values before any public evidence is saved
 A CLI/schema fixture pass does not prove native desktop behavior. Earlier evidence
 against a different tree does not close the release-candidate gate.
 
+`scripts/native-evidence.py` runs one surface per invocation with a
+release-candidate binary:
+
+```sh
+python3 scripts/native-evidence.py --harness claude --surface cli --binary target/release/gently
+python3 scripts/native-evidence.py --harness codex --surface desktop --binary target/release/gently
+```
+
+It starts an ephemeral Wrangler/D1 collector, enrolls a software reader, signs a
+recipient policy and writes the agent's hooks and the `gently` MCP server into a
+temporary project only. Claude Code loads project settings and an explicit MCP
+config; Codex runs with `--ignore-user-config` and receives them through `-c`
+(its CLI run bypasses persisted hook trust for those vetted hooks, so trust
+behavior comes from the desktop run). Your own agent configuration is neither
+read nor written, and the agents keep their sign-in. For a desktop surface it
+prints the project and prompt and waits while you run the session. It then
+requires native receipts for SessionStart, UserPromptSubmit, PreToolUse,
+PostToolUse and Stop, a tool span for the agent's own `list_traces` MCP call,
+keyless export of every envelope and encrypted value, tenant and capability
+rejection, reader decryption of the prompt and no plaintext canary in local
+state, D1 or collector output. Outage/restart retention and policy expiry are
+binary properties covered by `scripts/acceptance-local.py` and the Rust tests on
+the same tree.
+
 ## Dependency and artifact gates
 
 Audit locked Rust and Node dependencies, including development/test tooling.

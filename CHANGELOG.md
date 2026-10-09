@@ -26,6 +26,10 @@ archives cover macOS on Apple silicon and x86_64 Linux. See
 
 ### Added
 
+- Add `scripts/native-evidence.py`, which runs one real Claude Code or Codex session
+  (CLI or desktop) against isolated state, an enrolled reader and an ephemeral
+  local collector, and verifies native receipts, the agent's own MCP query,
+  encrypted export, reader decryption and canary absence for release evidence.
 - Add an owner-dispatched release workflow for `v*` tags. It builds locked macOS
   arm64 and Linux x86_64 binaries without local source paths, packages
   deterministic archives with `SHA256SUMS` and GitHub build provenance, then
