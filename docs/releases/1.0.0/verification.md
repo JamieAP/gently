@@ -10,7 +10,7 @@ only scripts and documentation, so the binary is identical.
 
 | Gate | Status | Evidence |
 | --- | --- | --- |
-| Repository policy `--plan` and `--check` on the final `main` | Pending | Re-run after #11, which adds `release.yml` to the reviewed workflows |
+| Repository policy `--plan` and `--check` on the final `main` | Passed 2026-10-09 | `--plan` names the three reviewed workflows; `--check --reviewed-main-sha 23abdc73fe8dada4229078314033bbe1acfa168f --apps-reviewed`: "Public repository policy verified (read-only)." A stuck docs deploy (Pages is not enabled) was cancelled first |
 | Local suite | Passed | macOS arm64: 354 Rust tests passed (1 ignored), clippy and fmt clean, scripts and docs suites pass. Local Node is 26, outside the supported 22, so CI is the supported-tool record |
 | Exact-tree CI, Mac and Linux | Passed | #12's PR CI on its head, whose tree the merge keeps; `main` push CI follows the merge |
 | Native evidence, Codex CLI | Passed 2026-10-09 | See below |
@@ -19,8 +19,8 @@ only scripts and documentation, so the binary is identical.
 | Native evidence, Claude desktop coding | Not rerun on this tree | As for Codex desktop |
 | Locked npm audit (`worker`, `docs`) | Passing in CI | One reviewed exception, GHSA-wq5f-xc86-pv6w (`sharp`), expires 2026-11-05 |
 | Locked Rust audit | Passing in CI | #10; see below |
-| Release artifacts, checksums, provenance, install/upgrade/recovery | Pending | #11's workflow, run on the tag |
-| Version, tag and CHANGELOG agree | Pending | This PR sets 1.0.0; `release-check.py version` runs in the release build |
+| Release artifacts, checksums, provenance, install/upgrade/recovery | Passed | Release run [37951865940](https://github.com/JamieAP/gently/actions/runs/37951865940) on `v1.0.0`; see below |
+| Version, tag and CHANGELOG agree | Passed | `release-check.py version` in both release builds: tag `v1.0.0`, workspace 1.0.0, `## [1.0.0] - 2026-10-09` |
 
 ## Rust dependency audit
 
@@ -60,3 +60,23 @@ prompt and no plaintext canary in local state, D1 or collector output.
 The Codex CLI run used `--dangerously-bypass-hook-trust` for these vetted hooks,
 so it does not exercise hook trust. The desktop surfaces were not rerun on this
 tree; this release does not claim fresh desktop evidence.
+
+## Release artifacts
+
+Tag `v1.0.0` (annotated) points at `main` `23abdc73fe8dada4229078314033bbe1acfa168f`.
+The release workflow run
+[37951865940](https://github.com/JamieAP/gently/actions/runs/37951865940) passed
+every job: both builds, `attest`, and `verify` on macOS arm64 and Linux x86_64
+(provenance, checksum and layout, upgrade from `dedfbb6`, backup/restore,
+uninstall and the full CLI/Worker acceptance against the released binary).
+
+| Archive | SHA-256 |
+| --- | --- |
+| `gently-1.0.0-aarch64-apple-darwin.tar.gz` | `43f69e97902db745ebd2e568451dda2b069a9e544bccc0e9a4a99c029bccbfe4` |
+| `gently-1.0.0-x86_64-unknown-linux-gnu.tar.gz` | `93060e4a67cd6115ff86921609d4a312cc61103591912e6e59c7321c2376c34c` |
+
+Before publishing, the owner's machine re-checked the downloaded bundle:
+`shasum -a 256 -c SHA256SUMS` passed for both archives, `gh attestation verify`
+against `release.yml` and `refs/tags/v1.0.0` passed for both, and the Mac binary
+reported `gently 1.0.0`. Published as
+[Gently 1.0.0](https://github.com/JamieAP/gently/releases/tag/v1.0.0).
