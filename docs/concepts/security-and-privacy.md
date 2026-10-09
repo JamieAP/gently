@@ -132,9 +132,9 @@ is evicted automatically. Cloud quotas and deletion schedules are an explicit
 future deployment policy.
 
 There is no automatic ciphertext or collector retention policy. Turning off
-capture or sync stops new work; it does not erase existing data. The pre-public
-runtime accepts only the new encrypted schema. Stop Gently before explicitly
-resetting disposable old state, SQLite sidecars and debug files; no legacy
+capture or sync stops new work; it does not erase existing data. Gently accepts
+only its encrypted schema. To discard plaintext state from early development
+builds, stop Gently before explicitly resetting that disposable state, SQLite sidecars and debug files; no legacy
 reader, migration or alias is retained. Deletion cannot prove erasure from SSD
 snapshots or backups. Preserve the separately installed credential vault.
 

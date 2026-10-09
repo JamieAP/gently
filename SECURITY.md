@@ -18,8 +18,8 @@ reproductions and fixed diagnostics.
 
 A public issue with full details is appropriate only for non-sensitive bugs.
 
-Gently is currently pre-v1. Security fixes target current `main`; no older release
-maintenance promise exists yet. See
+Security fixes land on `main` and ship in the next release. Only the latest
+release receives security fixes. See
 [Security and privacy](docs/concepts/security-and-privacy.md) for the local
 storage, encrypted capture and same-user trust boundaries.
 

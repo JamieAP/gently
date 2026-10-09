@@ -129,8 +129,9 @@ On Unix, managed directories use `0700`, and files and SQLite sidecars use
 `0600`. Permissions supplement encryption and do not protect against a process
 already authorized to unlock a reader key.
 
-Gently is pre-public and requires a fresh encrypted-only development schema.
-An incompatible database is rejected. Stop hooks and exporters, then explicitly
+Gently accepts only its encrypted local schema. Supported encrypted state opens
+without a reset; an incompatible database, such as plaintext state from early
+development builds, is rejected. Stop hooks and exporters, then explicitly
 remove or relocate disposable application state and its SQLite sidecars before
 initializing fresh state. Review old debug files and backups separately. Gently
 does not migrate plaintext rows or accept old digest-based raw references.

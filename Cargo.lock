@@ -940,7 +940,7 @@ dependencies = [
 
 [[package]]
 name = "gently-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "age",
  "anyhow",
@@ -978,7 +978,7 @@ dependencies = [
 
 [[package]]
 name = "gently-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "hostname",
@@ -990,7 +990,7 @@ dependencies = [
 
 [[package]]
 name = "gently-export"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "gently-core",
  "gently-store",
@@ -1005,7 +1005,7 @@ dependencies = [
 
 [[package]]
 name = "gently-harness"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "gently-core",
  "gently-store",
@@ -1019,7 +1019,7 @@ dependencies = [
 
 [[package]]
 name = "gently-raw"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "age",
  "base64",
@@ -1038,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "gently-store"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "gently-raw",
  "libc",

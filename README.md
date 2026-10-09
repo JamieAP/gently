@@ -97,6 +97,10 @@ secret helper is an optional wrapper.
 
 ### 2. Install the hooks
 
+Install a [release build](docs/guides/installation-and-recovery.md#install-a-release-build)
+(macOS on Apple silicon or x86_64 Linux, checksummed with build provenance), or
+build from source:
+
 ```sh
 cargo install --path crates/gently-cli --locked
 gently init --claude
@@ -187,9 +191,11 @@ writer signatures or full replay/provenance protocol against a malicious cloud.
 There is no automatic retention. Read
 [security and privacy](docs/concepts/security-and-privacy.md) for those limits.
 
-Gently is pre-public: existing development state must be explicitly reset to
-use the fresh encrypted schema. No plaintext migration, digest alias or
-compatibility reader is retained; the separate credential vault is preserved.
+Gently 1.0 accepts only its encrypted local schema. Supported encrypted state
+opens without a reset, and future schema changes ship with reviewed migrations
+or an explicit version refusal. Plaintext state from early development builds is
+rejected, not migrated: reset it explicitly. The separate credential vault is
+preserved.
 
 ## Architecture and documentation
 

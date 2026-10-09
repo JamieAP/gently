@@ -193,9 +193,9 @@ adds them without touching stored rows.
 
 `raw_values` keys immutable envelopes by `(tenant_id, raw_ref)`, with capture
 device, key epoch and creation time. D1 stores bounded ciphertext directly;
-no R2 bucket or decryption broker is provisioned. The new schema is pre-public:
-initialize a fresh database after an explicit reset of disposable old state,
-rather than applying it as a migration. See [schema.sql](https://github.com/JamieAP/gently/blob/main/worker/schema.sql).
+no R2 bucket or decryption broker is provisioned. Databases from early development
+builds, before the tenant/encrypted schema, are not migrated: initialize a fresh
+database after an explicit reset of that disposable state. See [schema.sql](https://github.com/JamieAP/gently/blob/main/worker/schema.sql).
 
 ## Encrypted raw object contract
 

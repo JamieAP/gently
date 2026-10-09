@@ -1,9 +1,18 @@
 # Changelog
 
 Notable changes are recorded here using [Keep a Changelog](https://keepachangelog.com/).
-The project is pre-1.0; pending changes appear under Unreleased.
+Gently follows [Semantic Versioning](https://semver.org/) from 1.0.0; pending
+changes appear under Unreleased.
 
 ## [Unreleased]
+
+## [1.0.0] - 2026-10-09
+
+First release: local-first observational tracing for Claude Code and Codex in
+their CLI and desktop coding surfaces, with metadata-only capture by default,
+opt-in encrypted raw values and a self-hosted Cloudflare collector. Release
+archives cover macOS on Apple silicon and x86_64 Linux. See
+[release verification](docs/releases/1.0.0/verification.md) for the evidence.
 
 ### Security
 
@@ -17,6 +26,10 @@ The project is pre-1.0; pending changes appear under Unreleased.
 
 ### Added
 
+- Add `scripts/native-evidence.py`, which runs one real Claude Code or Codex session
+  (CLI or desktop) against isolated state, an enrolled reader and an ephemeral
+  local collector, and verifies native receipts, the agent's own MCP query,
+  encrypted export, reader decryption and canary absence for release evidence.
 - Add an owner-dispatched release workflow for `v*` tags. It builds locked macOS
   arm64 and Linux x86_64 binaries without local source paths, packages
   deterministic archives with `SHA256SUMS` and GitHub build provenance, then
