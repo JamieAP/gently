@@ -80,8 +80,11 @@ Document advisory reachability and fix or explicitly review every unresolved
 finding before a v1 tag. Do not run blanket force upgrades. CI audits the locked
 Worker and docs npm dependencies and fails on any advisory without a reviewed
 exception in that project's `audit-allowlist.json`; each exception records its
-reachability and expires within 90 days (see CONTRIBUTING). The locked Rust audit
-(`cargo audit` or `cargo deny`) is still an open release task.
+reachability and expires within 90 days (see CONTRIBUTING). CI also audits the
+locked Rust dependencies with a pinned cargo-audit (`scripts/rust-audit.py`) and
+fails on any RustSec vulnerability or warning without a reviewed exception in the
+root `audit-allowlist.json`, under the same expiry rules. Release evidence records
+the advisory database commit each audit ran against.
 
 Release artifacts need a version matching the tag, an exact reviewed source
 commit, supported OS/architecture labels, checksums, build provenance, recovery
