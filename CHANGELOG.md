@@ -17,6 +17,13 @@ The project is pre-1.0; pending changes appear under Unreleased.
 
 ### Added
 
+- Add an owner-dispatched release workflow for `v*` tags. It builds locked macOS
+  arm64 and Linux x86_64 binaries without local source paths, packages
+  deterministic archives with `SHA256SUMS` and GitHub build provenance, then
+  verifies provenance, checksum, layout, an in-place upgrade from the previous
+  version, backup/restore, uninstall and the full CLI/Worker acceptance against
+  the released binary. The readiness policy allows it only attestation writes, and
+  publication stays a manual owner step.
 - Add `gently export --discard-oldest`, the only way to trim queued history to
   `outbox_cap`; it drops the oldest envelopes before each drain, even if delivery fails.
 - Add `gently quarantine list`, which prints bounded, payload-free JSON summaries

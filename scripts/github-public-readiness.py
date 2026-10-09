@@ -19,7 +19,8 @@ REPO = "JamieAP/gently"
 BASE = f"repos/{REPO}"
 ACTIONS_APP_ID = 15368
 CONTEXTS = ["validate (macos-latest)", "validate (ubuntu-latest)"]
-FILES = (".github/workflows/ci.yml", ".github/workflows/docs.yml", ".github/CODEOWNERS")
+FILES = (".github/workflows/ci.yml", ".github/workflows/docs.yml", ".github/workflows/release.yml", ".github/CODEOWNERS")
+WORKFLOWS = FILES[:3]
 ACTIONS = {"allowed_actions": "selected", "sha_pinning_required": True}
 SELECTED = {"github_owned_allowed": True, "verified_allowed": False, "patterns_allowed": []}
 WORKFLOW = {"default_workflow_permissions": "read", "can_approve_pull_request_reviews": False}
@@ -28,14 +29,30 @@ ACTIVE_STATUSES = ("in_progress", "queued", "waiting", "requested", "pending")
 CI_CONDITION = "github.repository == 'JamieAP/gently' && github.actor == 'JamieAP' && github.triggering_actor == 'JamieAP' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login == 'JamieAP' && github.event.pull_request.base.ref == 'main'))"
 SECURITY_FEATURES = ("secret_scanning", "secret_scanning_push_protection")
 PAGES_CONDITION = "github.repository == 'JamieAP/gently' && github.ref == 'refs/heads/main' && github.actor == 'JamieAP' && github.triggering_actor == 'JamieAP'"
+RELEASE_CONDITION = "github.repository == 'JamieAP/gently' && startsWith(github.ref, 'refs/tags/v') && github.actor == 'JamieAP' && github.triggering_actor == 'JamieAP'"
 # Reviewed workflow shapes are allowlists: any other key, quoted key or
 # indentation fails closed rather than being interpreted.
 WORKFLOW_KEYS = {"name", "on", "permissions", "concurrency", "jobs"}
 JOB_KEYS = {
-    "validate": {"strategy", "runs-on", "timeout-minutes", "env", "steps"},
-    "build": {"if", "runs-on", "timeout-minutes", "steps"},
-    "deploy": {"if", "needs", "runs-on", "timeout-minutes", "permissions", "environment", "steps"},
+    "ci.yml": {"validate": {"strategy", "runs-on", "timeout-minutes", "env", "steps"}},
+    "docs.yml": {
+        "build": {"if", "runs-on", "timeout-minutes", "steps"},
+        "deploy": {"if", "needs", "runs-on", "timeout-minutes", "permissions", "environment", "steps"},
+    },
+    # Release jobs run only on the owner's manual dispatch of a v* tag. Only
+    # attest may write, and only its OIDC token and attestations; publishing a
+    # release (contents: write) stays a local owner step.
+    "release.yml": {
+        "build": {"if", "strategy", "runs-on", "timeout-minutes", "steps"},
+        "attest": {"if", "needs", "runs-on", "timeout-minutes", "permissions", "steps"},
+        "verify": {"if", "needs", "strategy", "runs-on", "timeout-minutes", "env", "steps"},
+    },
 }
+TRIGGERS = {"ci.yml": ["pull_request", "push", "workflow_dispatch"], "docs.yml": ["push", "workflow_dispatch"],
+            "release.yml": ["workflow_dispatch"]}
+JOB_CONDITIONS = {"docs.yml": PAGES_CONDITION, "release.yml": RELEASE_CONDITION}
+JOB_PERMISSIONS = {("docs.yml", "deploy"): ["pages: write", "id-token: write"],
+                   ("release.yml", "attest"): ["id-token: write", "attestations: write"]}
 # Later CI steps keep the default success() condition: no if/continue-on-error.
 STEP_KEYS = {"name", "id", "uses", "with", "run", "shell", "working-directory", "env", "timeout-minutes"}
 
@@ -200,7 +217,7 @@ class Guard:
         if reviewed_main_sha is not None and actual != reviewed_main_sha:
             raise GuardError("main changed since the owner's reviewed commit; review it again")
         remote_names = self.get(f"contents/.github/workflows?ref={actual}", jq="map(.name)")
-        if sorted(remote_names or []) != ["ci.yml", "docs.yml"]:
+        if sorted(remote_names or []) != sorted(Path(name).name for name in WORKFLOWS):
             raise GuardError("Unexpected workflow inventory on main")
         for name in FILES:
             remote = self.get(f"contents/{name}?ref={actual}")
@@ -218,8 +235,9 @@ class Guard:
                   if line.strip() and not line.lstrip().startswith("#")]
         if owners != ["* @JamieAP"]:
             raise GuardError("CODEOWNERS must assign every file to JamieAP")
-        for name in FILES[:2]:
+        for name in WORKFLOWS:
             text = self.files.get(name, "")
+            workflow = Path(name).name
             if not set(plain_mapping_keys(text, 0)) <= WORKFLOW_KEYS:
                 raise GuardError("Reviewed workflow has unexpected top-level keys")
             if re.search(r"\b(pull_request_target|workflow_run|issue_comment|issues|discussion_comment|repository_dispatch|self-hosted)\b", text):
@@ -229,17 +247,16 @@ class Guard:
             if block(text, "permissions", 0).strip() != "contents: read":
                 raise GuardError("Workflow default permissions must contain only contents: read")
             triggers = plain_mapping_keys(block(text, "on", 0), 2)
-            expected_triggers = ["pull_request", "push", "workflow_dispatch"] if name.endswith("ci.yml") else ["push", "workflow_dispatch"]
-            if sorted(triggers) != expected_triggers:
+            if sorted(triggers) != TRIGGERS[workflow]:
                 raise GuardError("Only guarded owner CI pull requests, main pushes and manual dispatch are permitted")
             jobs = block(text, "jobs", 0)
-            expected = ["validate"] if name.endswith("ci.yml") else ["build", "deploy"]
+            expected = list(JOB_KEYS[workflow])
             if plain_mapping_keys(jobs, 2) != expected:
                 raise GuardError("Reviewed workflow has an unexpected job inventory")
             for job in expected:
                 contents = block(jobs, job, 2)
                 conditions = re.findall(r"(?m)^    if: (.+)$", contents)
-                unexpected = set(plain_mapping_keys(contents, 4)) - JOB_KEYS[job]
+                unexpected = set(plain_mapping_keys(contents, 4)) - JOB_KEYS[workflow][job]
                 if job == "validate":
                     authorize = ["      - name: Authorize owner-operated validation",
                                  "        if: ${{ !(" + CI_CONDITION + ") }}", "        run: exit 1"]
@@ -252,12 +269,13 @@ class Guard:
                     for keys in step_blocks("\n".join(steps[boundary:])):
                         if not set(keys) <= STEP_KEYS:
                             raise GuardError("CI must fail its authorization step before checkout; later steps use only reviewed keys and no conditions")
-                elif unexpected or conditions != [PAGES_CONDITION]:
+                elif unexpected or conditions != [JOB_CONDITIONS[workflow]] or "continue-on-error" in contents:
                     raise GuardError("Every deployment workflow job must use the exact owner/repository/branch guard and reviewed keys")
-                if job == "deploy":
-                    if [line.strip() for line in block(contents, "permissions", 4).splitlines()] != ["pages: write", "id-token: write"]:
-                        raise GuardError("Only Pages deployment receives exactly Pages/OIDC write permissions")
-                    if block(contents, "environment", 4).splitlines()[0].strip() != "name: github-pages":
+                granted = JOB_PERMISSIONS.get((workflow, job))
+                if granted is not None:
+                    if [line.strip() for line in block(contents, "permissions", 4).splitlines()] != granted:
+                        raise GuardError("Only Pages deployment and release attestation receive exactly their OIDC write permissions")
+                    if job == "deploy" and block(contents, "environment", 4).splitlines()[0].strip() != "name: github-pages":
                         raise GuardError("Pages deployment must use the protected github-pages environment")
                 elif re.search(r"(?m)^    permissions:", contents):
                     raise GuardError("Build/test jobs may not override read-only workflow permissions")
@@ -268,8 +286,10 @@ class Guard:
                 raise GuardError("Actions must be GitHub-owned and pinned to full commit SHAs")
             if "persist-credentials: false" not in text or "persist-credentials: true" in text:
                 raise GuardError("Checkout must not persist repository credentials")
-            if name.endswith("ci.yml") and re.search(r":\s*write\b", text):
+            if workflow == "ci.yml" and re.search(r":\s*write\b", text):
                 raise GuardError("CI must have no write permissions")
+            if workflow == "release.yml" and len(re.findall(r":\s*write\b", text)) != 2:
+                raise GuardError("Release workflow may write only attestations and its OIDC token")
 
     def policy_issues(self, user, expect_enabled=True, check_actions=True):
         issues = [f"{control[0].upper()}{control[1:]} must be enabled and confirmed by readback"
@@ -493,6 +513,7 @@ def main():
     if args.plan:
         print("Target: JamieAP/gently, main. No visibility or credential changes.")
         print("Apply disables Actions first, verifies owner-only access and reviewed main workflows, sets secret scanning/push protection and private vulnerability reporting, read-only tokens and owner approval gates, verifies owner approval and deployment gates before enabling, then reads back Actions policies.")
+        print("Reviewed workflows: ci.yml (owner CI, read-only), docs.yml (Pages on main), release.yml (owner-dispatched v* tags; only attestation writes, and no job publishes releases).")
         print("Manual prerequisites: review all installed GitHub Apps; disable github-pages administrator bypass; merge and review workflow hardening on main.")
         return 0
     root = Path(__file__).resolve().parent.parent
