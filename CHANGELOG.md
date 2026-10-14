@@ -6,6 +6,12 @@ changes appear under Unreleased.
 
 ## [Unreleased]
 
+### Fixed
+
+- `scripts/collector-local` reapplies the idempotent `worker/schema.sql` before
+  starting the local Worker. Local D1 created before paged trace reads lacked
+  `trace_generations`, so every trace read returned HTTP 500.
+
 ## [1.0.0] - 2026-10-09
 
 First release: local-first observational tracing for Claude Code and Codex in

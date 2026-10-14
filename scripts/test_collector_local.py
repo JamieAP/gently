@@ -74,6 +74,17 @@ class LauncherTests(unittest.TestCase):
                 '    assert "GENTLY_TOKEN" not in os.environ\n'
                 '    __import__("pathlib").Path(os.environ["FIXTURE_DIR"],"checked").touch()\n'
                 '    raise SystemExit(1 if os.environ.get("FIXTURE_CHECK_INVALID") else 0)\n') + source
+        if name == "node":
+            source = ('import os,sys\nfrom pathlib import Path\n'
+                'if sys.argv[1].endswith("/wrangler/bin/wrangler.js"):\n'
+                '    assert sys.argv[2:] == ["d1", "execute", "gently", "--local", "--config", "wrangler.local.toml",\n'
+                '        "--persist-to", ".wrangler/state", "--file", "schema.sql"]\n'
+                '    assert Path.cwd().resolve() == Path(sys.argv[1]).parents[3].resolve()\n'
+                '    assert "GENTLY_TOKEN" not in os.environ and "GENTLY_HOSTS" not in os.environ\n'
+                '    assert os.environ["WRANGLER_LOG"] == "none"\n'
+                '    assert not Path(os.environ["FIXTURE_DIR"], "watch.pid").exists()\n'
+                '    Path(os.environ["FIXTURE_DIR"], "schema").touch()\n'
+                '    raise SystemExit(1 if os.environ.get("FIXTURE_SCHEMA_INVALID") else 0)\n') + source
         path.write_text(f"#!{sys.executable}\n{source}")
         path.chmod(0o755)
         return path
@@ -106,8 +117,16 @@ class LauncherTests(unittest.TestCase):
     def test_direct_launch_supervises_both_children(self):
         result = self.launch(self.repo / "scripts/collector-local")
         self.assertIn("collector exited with status 0", result.stderr)
+        self.assertTrue((self.root / "schema").exists())
         self.assert_stopped("watch.pid")
         self.assert_stopped("collector.pid")
+
+    def test_schema_failure_starts_no_services(self):
+        self.env["FIXTURE_SCHEMA_INVALID"] = "1"
+        result = self.launch(self.repo / "scripts/collector-local", 1)
+        self.assertIn("Cannot apply worker/schema.sql to local D1", result.stderr)
+        self.assertFalse((self.root / "watch.pid").exists())
+        self.assertFalse((self.root / "collector.pid").exists())
 
     def test_relative_symlink_chain_resolves_repository(self):
         first = self.bin / "gently-collector"
@@ -155,6 +174,7 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.root / "watch.pid").exists())
         self.assertFalse((self.root / "collector.pid").exists())
+        self.assertFalse((self.root / "schema").exists())
         self.assertTrue((self.root / "checked").exists())
 
     def test_attach_launcher_runs_only_exporter(self):

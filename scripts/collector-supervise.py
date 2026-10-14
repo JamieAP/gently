@@ -70,6 +70,30 @@ def public_setup(gently, check=False):
         raise RuntimeError("Cannot validate Gently setup; run gently config --json and gently config --check for details.") from None
 
 
+def apply_schema(node, repo, environment):
+    """Reapply the idempotent D1 schema so state from an earlier release gains
+    the tables, indexes and triggers the current Worker queries."""
+    schema_env = dict(environment)
+    schema_env.pop("GENTLY_TOKEN", None)
+    schema_env.pop("GENTLY_RAW_IDENTITY", None)
+    worker = repo / "worker"
+    child = subprocess.Popen([
+        node, str(worker / "node_modules/wrangler/bin/wrangler.js"), "d1", "execute", "gently",
+        "--local", "--config", "wrangler.local.toml", "--persist-to", ".wrangler/state", "--file", "schema.sql",
+    ], cwd=worker, env=schema_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        code = child.wait(timeout=120)
+    except subprocess.TimeoutExpired:
+        code = None
+    finally:
+        # The local runtime must release the database before the Worker opens it.
+        stop_children([child])
+    if code != 0:
+        raise RuntimeError("Cannot apply worker/schema.sql to local D1; in worker, run "
+            "npx wrangler d1 execute gently --local --config wrangler.local.toml --file schema.sql for details.")
+
+
 def local_environment(setup):
     environment = dict(os.environ)
     for field in ["tenant_id", "device_id", "state_dir"]:
@@ -126,6 +150,7 @@ def main():
     repo = Path(repo)
     private_collector_state(repo)
     environment = local_environment(public_setup(gently))
+    apply_schema(node, repo, environment)
     children = []
     stopping = False
 
