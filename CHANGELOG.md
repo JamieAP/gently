@@ -13,6 +13,12 @@ changes appear under Unreleased.
   secrets in `Debug` output) and quinn-proto to 0.11.19 (RUSTSEC-2026-0338 to
   0342). quinn-proto now uses rand 0.10.
 
+### Fixed
+
+- `scripts/collector-local` reapplies the idempotent `worker/schema.sql` before
+  starting the local Worker. Local D1 created before paged trace reads lacked
+  `trace_generations`, so every trace read returned HTTP 500.
+
 ## [1.0.0] - 2026-10-09
 
 First release: local-first observational tracing for Claude Code and Codex in

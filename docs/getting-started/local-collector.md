@@ -30,9 +30,11 @@ cd ..
 ```
 
 The schema command initializes local D1. The local Wrangler configuration does
-not need a cloud database ID. State from early development builds,
-before the tenant/encrypted schema, must be explicitly reset; there is no
-migration from it.
+not need a cloud database ID. `./scripts/collector-local` reapplies the schema
+before each start: every statement is idempotent, so local D1 from an earlier
+release gains new tables, indexes and triggers without touching stored rows.
+State from early development builds, before the tenant/encrypted schema, must
+be explicitly reset; there is no migration from it.
 
 ## 2. Configure capture
 
