@@ -124,12 +124,12 @@ Runtime state, logs and locks are isolated under
 `<state_dir>/tenants/<tenant_id>/devices/<device_id>/`; public config remains at
 the state-directory root. No unscoped state fallback is read.
 
-Each tenant/device state database admits at most 64 MiB of encoded ciphertext
-envelopes; SQLite pages and WAL overhead are additional. At capacity, capture
-skips new raw data while retaining metadata, and a reader can decrypt a fetched
-object in memory without adding it to the cache. No existing or pending object
-is evicted automatically. Cloud quotas and deletion schedules are an explicit
-future deployment policy.
+Ciphertext retention has no fixed total byte limit. Capture continues while
+the local filesystem can accept writes; existing and pending objects are never
+evicted automatically. Monitor disk space and `gently status` for storage
+failures. Per-object validation, reader-resolution limits and signed recipient
+policy still apply. Cloud quotas and deletion schedules are a separate
+deployment policy.
 
 There is no automatic ciphertext or collector retention policy. Turning off
 capture or sync stops new work; it does not erase existing data. Gently accepts

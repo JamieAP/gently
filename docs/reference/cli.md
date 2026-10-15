@@ -161,7 +161,7 @@ lifetime counts for each fixed outcome category:
 - `policy_unavailable`, `policy_expired`, `oversized`, `raw_capacity`,
   `seal_failed`, `raw_store_failed`: the metadata event was kept, but its
   ciphertext was not, because of missing or expired recipient policy, content
-  over the size limit, a full raw byte budget, an encryption error, or a local
+  over the size limit, a legacy raw byte budget, an encryption error, or a local
   storage error while writing the ciphertext.
 - `invalid_hook`, `capture_failed`: the event was lost, because the hook payload
   could not be parsed or the event could not be stored.
@@ -174,9 +174,11 @@ reader.
 `--json` prints one object with `capture`, `policy`, `export` and `raw` sections,
 without raw payloads or exporter error strings. `raw` contains `objects`,
 `bytes`, `pending`, `pending_bytes`, `quarantined`, `quarantined_bytes`,
-`last_rejection_status` (HTTP status or `null`) and `budget_bytes`. The budget
-caps all ciphertext retained in the state database, so with a single tenant the
-remaining headroom is `budget_bytes - bytes`.
+`last_rejection_status` (HTTP status or `null`) and `budget_bytes` (`null`,
+meaning no fixed total limit). Text output reports `raw_budget_bytes` as
+`unlimited`. Existing ciphertext is retained, and capture continues while disk
+space is available. Historical `raw_capacity` counts remain visible after an
+upgrade; the fixed 64 MiB admission limit is no longer enforced.
 
 The capture-health table is an additive encrypted-schema-2 extension and
 preserves existing queued state. Failures before the state database can be opened

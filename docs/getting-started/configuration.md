@@ -73,10 +73,10 @@ device_id = "mac-main"
 
 One hook event queues one envelope, possibly containing several spans. Queue
 caps and batches count envelopes; a tokenless queue can exceed the cap until an
-exporter drains it. Ciphertext retention is separate from this cap: each
-tenant/device database admits at most 64 MiB of encoded ciphertext envelopes,
-excluding SQLite page/WAL overhead. Full storage skips new raw capture or
-caching without evicting existing objects. Metadata capture continues.
+exporter drains it. Ciphertext retention has no fixed total byte limit and
+never evicts existing objects automatically. Capture continues while local disk
+space is available; inspect `gently status` for storage failures. Per-object
+and reader-resolution limits still apply.
 Rejected raw objects remain encrypted in quarantine and do not block metadata;
 inspect `gently status` and explicitly retry with
 `gently export --retry-raw-quarantine` after correcting the collector issue.

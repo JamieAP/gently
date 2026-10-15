@@ -21,6 +21,10 @@ changes appear under Unreleased.
 
 ### Fixed
 
+- Remove the fixed 64 MiB local ciphertext admission limit, which stopped raw
+  capture even after successful synchronization. Retain existing and pending
+  objects; capture continues while disk space is available. Status reports an
+  unlimited total budget. Encryption and per-object/query limits are unchanged.
 - `scripts/collector-local` reapplies the idempotent `worker/schema.sql` before
   starting the local Worker. Local D1 created before paged trace reads lacked
   `trace_generations`, so every trace read returned HTTP 500.

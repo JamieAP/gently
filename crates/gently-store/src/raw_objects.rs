@@ -51,15 +51,6 @@ impl Store {
     }
 
     fn insert_raw_object(&self, object: &RawObject, synced: bool) -> Result<()> {
-        self.insert_raw_object_with_budget(object, synced, crate::RAW_OBJECT_CAP_BYTES)
-    }
-
-    fn insert_raw_object_with_budget(
-        &self,
-        object: &RawObject,
-        synced: bool,
-        budget: usize,
-    ) -> Result<()> {
         object
             .validate()
             .map_err(|_| StoreError::InvalidRawObject)?;
@@ -73,20 +64,17 @@ impl Store {
                 Err(StoreError::RawObjectConflict)
             };
         }
-        // Admission and insertion share one SQLite write statement so concurrent
-        // hooks cannot each spend the same remaining capacity.
+        // Preserve every object until explicit deletion. A fixed total-store
+        // budget would silently stop capture even after successful uploads.
         let inserted = self.conn.execute(
             "INSERT INTO raw_objects (tenant_id, raw_ref, object_json, created_unix_nano, synced)
-             SELECT ?1, ?2, ?3, strftime('%s','now') * 1000000000, ?4
-             WHERE (SELECT COALESCE(SUM(length(CAST(object_json AS BLOB))), 0) FROM raw_objects) + ?5 <= ?6
+             VALUES (?1, ?2, ?3, strftime('%s','now') * 1000000000, ?4)
              ON CONFLICT(tenant_id, raw_ref) DO NOTHING",
             rusqlite::params![
                 object.context.tenant_id,
                 object.context.raw_ref,
                 json,
-                synced,
-                json.len() as i64,
-                budget as i64
+                synced
             ],
         )?;
         if inserted == 1 {
@@ -94,8 +82,7 @@ impl Store {
         }
         match self.raw_object_get(&object.context.tenant_id, &object.context.raw_ref)? {
             Some(existing) if existing == *object => Ok(()),
-            Some(_) => Err(StoreError::RawObjectConflict),
-            None => Err(StoreError::RawCapacity),
+            _ => Err(StoreError::RawObjectConflict),
         }
     }
 
@@ -358,7 +345,49 @@ mod tests {
     }
 
     #[test]
-    fn byte_budget_refuses_new_objects_without_evicting_or_overwriting_existing_ciphertext() {
+    fn capture_continues_past_the_old_total_byte_limit_without_evicting_ciphertext() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).unwrap();
+        let first = object(
+            "personal",
+            "00000000000000000000000000000001",
+            "retained fixture",
+        );
+        // JSON whitespace preserves a valid, decryptable object while filling
+        // the old total-store budget without generating hundreds of keys.
+        let mut json = serde_json::to_string(&first).unwrap();
+        json.extend(std::iter::repeat_n(' ', 64 * 1024 * 1024));
+        store.conn.execute(
+            "INSERT INTO raw_objects (tenant_id, raw_ref, object_json, created_unix_nano, synced) VALUES (?1, ?2, ?3, '1', 0)",
+            rusqlite::params![first.context.tenant_id, first.context.raw_ref, json],
+        ).unwrap();
+        drop(json);
+        let second = object(
+            "personal",
+            "00000000000000000000000000000002",
+            "new fixture",
+        );
+        store.raw_object_put(&second).unwrap();
+        assert_eq!(
+            store
+                .raw_object_get("personal", &first.context.raw_ref)
+                .unwrap(),
+            Some(first)
+        );
+        assert_eq!(
+            store
+                .raw_object_get("personal", &second.context.raw_ref)
+                .unwrap(),
+            Some(second)
+        );
+        let stats = store.raw_objects_stats("personal").unwrap();
+        assert_eq!(stats.objects, 2);
+        assert_eq!(stats.pending_objects, 2);
+        assert!(stats.bytes > 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn acknowledged_ciphertext_is_retained_and_stats_track_pending_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("state.db")).unwrap();
         let first = object(
@@ -366,28 +395,9 @@ mod tests {
             "00000000000000000000000000000001",
             "first fixture",
         );
-        let second = object(
-            "personal",
-            "00000000000000000000000000000002",
-            "second fixture",
-        );
         let bytes = serde_json::to_vec(&first).unwrap().len();
-        assert!(store
-            .insert_raw_object_with_budget(&first, false, bytes - 1)
-            .is_err());
-        assert_eq!(store.raw_objects_len().unwrap(), 0);
-        store
-            .insert_raw_object_with_budget(&first, false, bytes)
-            .unwrap();
-        store
-            .insert_raw_object_with_budget(&first, false, bytes)
-            .unwrap();
-        assert!(store
-            .insert_raw_object_with_budget(&second, false, bytes)
-            .is_err());
-        assert!(store
-            .insert_raw_object_with_budget(&second, true, bytes)
-            .is_err());
+        store.raw_object_put(&first).unwrap();
+        store.raw_object_put(&first).unwrap();
         assert_eq!(
             store
                 .raw_object_get("personal", &first.context.raw_ref)

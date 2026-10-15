@@ -188,12 +188,10 @@ passphrases through environment variables or command arguments.
 
 Objects support up to 256 KiB of serialized plaintext and 512 KiB of age
 ciphertext. The collector bounds each JSON request to 1 MiB. Oversized raw
-content is not retained; metadata byte lengths remain visible. Each tenant/device
-state database admits up to 64 MiB of encoded ciphertext envelopes, excluding
-SQLite page and WAL overhead. At capacity, new raw capture is skipped while
-metadata continues; readers can still decrypt fetched objects in memory without
-caching them. Existing objects, including pending uploads, are never evicted
-automatically. Inspect `gently status` for retained and pending object byte
+content is not retained; metadata byte lengths remain visible. Ciphertext
+retention has no fixed total byte limit, so capture continues while disk space
+is available. Existing objects, including pending uploads, are never evicted
+automatically. Inspect `gently status` for storage failures and retained and pending object byte
 counts, including retained quarantine. Cloud quotas and retention schedules
 require a separate deployment policy.
 Reader resolution also bounds aggregate encoded cached ciphertext and expanded

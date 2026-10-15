@@ -602,11 +602,7 @@ impl QueryClient {
                         account_raw_query_bytes(&mut bytes, object.ciphertext_b64.len())?;
                         let payload = CachedRawPayload(decrypt(&object)?);
                         hydrate_cached_payload(&self.tenant_id, row, &payload.0, &mut bytes)?;
-                        match store.raw_object_cache(&object) {
-                            Ok(()) => {},
-                            Err(gently_store::StoreError::RawCapacity) => tracing::warn!("encrypted raw cache byte budget reached; returning verified in-memory result"),
-                            Err(error) => return Err(error.into()),
-                        }
+                        store.raw_object_cache(&object)?;
                         payloads.insert(reference, Some(payload));
                     } else {
                         payloads.insert(reference, None);

@@ -654,10 +654,7 @@ fn capture_health_json_is_keyless_and_contains_no_payloads() {
     assert_eq!(health["raw"]["pending_bytes"], 0);
     assert_eq!(health["raw"]["quarantined_bytes"], 0);
     assert!(health["raw"]["last_rejection_status"].is_null());
-    assert_eq!(
-        health["raw"]["budget_bytes"],
-        gently_store::RAW_OBJECT_CAP_BYTES as u64
-    );
+    assert!(health["raw"]["budget_bytes"].is_null());
     assert!(health["capture"]["last_capture_unix_nano"]
         .as_u64()
         .is_some());
