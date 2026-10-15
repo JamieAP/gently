@@ -19,9 +19,17 @@ device_id = "local"
 
 For Cloudflare, use the deployed HTTPS URL. The CLI adds endpoint paths and the
 `tenant_id` query parameter. Supply `GENTLY_TOKEN` through your secret provider
-to export and query processes. Tokens are environment-only: a `token` setting
+to export processes and a separately scoped `GENTLY_READ_TOKEN` to readers or
+the persistent query broker. Query commands without a read token prefer an
+available owner-only broker; legacy combined-token setups remain supported.
+Detached hook exporters do not inherit the read token. Tokens are environment-only: a `token` setting
 in the config is rejected. Keep credentials out of `.env`, `.dev.vars`,
 repository files, command arguments and shell history.
+
+An exporter with `--serve-queries` needs both scoped credentials. Read-only CLI/MCP
+commands can use `GENTLY_READ_TOKEN` without an ingest token, or delegate through
+the owner-only broker without inheriting either credential. Scope reader secrets
+to the projects/processes that need queries rather than exposing them globally.
 
 | Process or command | Collector token required? |
 | --- | --- |
@@ -73,10 +81,10 @@ device_id = "mac-main"
 
 One hook event queues one envelope, possibly containing several spans. Queue
 caps and batches count envelopes; a tokenless queue can exceed the cap until an
-exporter drains it. Ciphertext retention is separate from this cap: each
-tenant/device database admits at most 64 MiB of encoded ciphertext envelopes,
-excluding SQLite page/WAL overhead. Full storage skips new raw capture or
-caching without evicting existing objects. Metadata capture continues.
+exporter drains it. Ciphertext retention has no fixed total byte limit and
+never evicts existing objects automatically. Capture continues while local disk
+space is available; inspect `gently status` for storage failures. Per-object
+and reader-resolution limits still apply.
 Rejected raw objects remain encrypted in quarantine and do not block metadata;
 inspect `gently status` and explicitly retry with
 `gently export --retry-raw-quarantine` after correcting the collector issue.

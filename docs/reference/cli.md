@@ -19,6 +19,68 @@ or queries. Installing hooks does not supply a token to agent processes.
 See [configuration](../getting-started/configuration.md) and
 [local setup](../getting-started/local-collector.md) for the collector and credential setup.
 
+## `gently service` (macOS login service)
+
+```sh
+gently service install
+gently service start
+# With distinct GENTLY_TOKEN and GENTLY_READ_TOKEN supplied by your provider:
+gently service unlock
+gently service status
+gently service lock
+gently service stop
+```
+
+Your credential provider must preserve the configured collector and namespace.
+The service rejects mismatches rather than silently redirecting credentials.
+
+The login controller starts **locked** and never stores credentials in its
+LaunchAgent configuration. Unlock hands credentials over an owner-only Unix
+socket, bound to the configured collector, tenant and device. The controller
+keeps them in memory to restart separate children: export receives only the
+ingest credential; the read-only query broker receives only the read credential.
+Other same-user processes remain within this trust boundary.
+
+Queries and MCP can use the private broker without inheriting either token.
+For a visible login reminder with **Unlock Gently** and **Later** buttons:
+
+```sh
+gently service install-reminder --project-dir /path/to/your/project \
+  --unlock-command /path/to/your/unlock-wrapper
+```
+
+The executable unlock wrapper takes no arguments: it obtains credentials using
+your chosen provider and invokes `gently service unlock` as a child with distinct
+`GENTLY_TOKEN` and `GENTLY_READ_TOKEN`. Gently supplies the configured public
+collector, namespace and state-directory environment and uses the selected
+project directory. The wrapper must preserve those settings, including after
+provider injection. Never put credential values in the wrapper or command arguments.
+
+By default macOS opens the generated `.command` file with its associated terminal.
+To choose another terminal, add `--terminal-command /path/to/terminal-wrapper`;
+that executable receives the generated script path as its single argument and
+must run it in a foreground terminal. No particular terminal, vault helper or
+Secure Enclave is required. Only executable paths and public settings are saved.
+Commands run only after clicking unlock. While locked, the reminder repeats
+hourly. You can also open
+**Unlock Gently** from your personal Applications folder at any time. The
+reminder is silent while the service is unlocked. Uninstalling the service
+removes the reminder registration but retains that clickable application.
+
+Reader decryption remains a separate client-side opt-in. Child failures retry
+with a bounded 1–30 second backoff; status reports child PIDs and restart counts.
+Credentials are forgotten when locked, stopped, logged out, or the controller
+restarts. Unlock again after login or a controller restart. Capture continues
+queuing locally while locked; this service never discards queued history.
+
+`stop` unloads the current job; it starts locked again at the next login.
+`uninstall` stops it and removes only its managed login registration, not data.
+Installation pins this executable's absolute path and the public namespace;
+reinstall and stop/start after moving the binary or changing that configuration.
+Do not run a separate legacy `export --watch --serve-queries` alongside it.
+`service run` is an internal foreground controller useful for Unix diagnostics;
+automatic login installation and process-group cleanup are supported on macOS.
+
 ## `gently init --claude` / `gently init --codex`
 
 Install the hooks and stdio MCP registration for one harness:
@@ -161,7 +223,7 @@ lifetime counts for each fixed outcome category:
 - `policy_unavailable`, `policy_expired`, `oversized`, `raw_capacity`,
   `seal_failed`, `raw_store_failed`: the metadata event was kept, but its
   ciphertext was not, because of missing or expired recipient policy, content
-  over the size limit, a full raw byte budget, an encryption error, or a local
+  over the size limit, a legacy raw byte budget, an encryption error, or a local
   storage error while writing the ciphertext.
 - `invalid_hook`, `capture_failed`: the event was lost, because the hook payload
   could not be parsed or the event could not be stored.
@@ -174,9 +236,11 @@ reader.
 `--json` prints one object with `capture`, `policy`, `export` and `raw` sections,
 without raw payloads or exporter error strings. `raw` contains `objects`,
 `bytes`, `pending`, `pending_bytes`, `quarantined`, `quarantined_bytes`,
-`last_rejection_status` (HTTP status or `null`) and `budget_bytes`. The budget
-caps all ciphertext retained in the state database, so with a single tenant the
-remaining headroom is `budget_bytes - bytes`.
+`last_rejection_status` (HTTP status or `null`) and `budget_bytes` (`null`,
+meaning no fixed total limit). Text output reports `raw_budget_bytes` as
+`unlimited`. Existing ciphertext is retained, and capture continues while disk
+space is available. Historical `raw_capacity` counts remain visible after an
+upgrade; the fixed 64 MiB admission limit is no longer enforced.
 
 The capture-health table is an additive encrypted-schema-2 extension and
 preserves existing queued state. Failures before the state database can be opened

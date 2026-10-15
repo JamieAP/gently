@@ -11,6 +11,7 @@ export function jsonResponse(data: unknown, status = 200): Response {
       "Content-Type": "application/json",
       "Cache-Control": "no-store",
       "X-Content-Type-Options": "nosniff",
+      "Strict-Transport-Security": "max-age=31536000",
     },
   });
 }

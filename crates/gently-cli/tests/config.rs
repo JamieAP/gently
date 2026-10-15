@@ -95,6 +95,7 @@ fn public_config_resolves_file_namespace_and_environment_overrides_without_crede
     let output = command(dir.path())
         .args(["config", "--json"])
         .env("GENTLY_TOKEN", "synthetic-config-token-canary")
+        .env("GENTLY_READ_TOKEN", "synthetic-config-read-token-canary")
         .env(
             "GENTLY_RAW_IDENTITY",
             dir.path().join("identity-private-path-canary"),
@@ -106,6 +107,7 @@ fn public_config_resolves_file_namespace_and_environment_overrides_without_crede
         .clone();
     let text = String::from_utf8(output).unwrap();
     assert!(!text.contains("synthetic-config-token-canary"));
+    assert!(!text.contains("synthetic-config-read-token-canary"));
     assert!(!text.contains("identity-private-path-canary"));
     let config: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(config.as_object().unwrap().len(), 4);

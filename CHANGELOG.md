@@ -6,6 +6,26 @@ changes appear under Unreleased.
 
 ## [Unreleased]
 
+### Added
+
+- Add an optional macOS login service with explicit in-memory unlock, separately
+  supervised export and read-only broker processes, and an opt-in login reminder
+  opening a user-configured unlock command and terminal. Login starts locked; captures
+  queue locally until unlocked. No credentials are saved in login files.
+- Add a separate scheduled D1-to-private-R2 SQL backup Workflow template with
+  verified upload completion markers. It requires operator provisioning and
+  restore validation; it does not prune D1 or provide online archived queries.
+
+### Security
+
+- Support a separately scoped read credential, reject non-loopback plaintext
+  HTTP, and add opt-in mandatory credential expiry and fail-closed Cloudflare
+  rate-limit bindings. Local legacy credential setups remain supported.
+- Update rustls to 0.23.46 (RUSTSEC-2026-0346 to 0349, including an
+  unauthenticated ServerHello downgrade to classical key exchange and TLS
+  secrets in `Debug` output) and quinn-proto to 0.11.19 (RUSTSEC-2026-0338 to
+  0342). quinn-proto now uses rand 0.10.
+
 ### Changed
 
 - Store each span resource once per tenant and capture device, referenced from
@@ -19,15 +39,12 @@ changes appear under Unreleased.
 - Drop `idx_spans_trace`, `idx_spans_session` and `idx_spans_tool`. Each is a
   leading prefix of a `*_start` index that serves the same lookups.
 
-### Security
-
-- Update rustls to 0.23.46 (RUSTSEC-2026-0346 to 0349, including an
-  unauthenticated ServerHello downgrade to classical key exchange and TLS
-  secrets in `Debug` output) and quinn-proto to 0.11.19 (RUSTSEC-2026-0338 to
-  0342). quinn-proto now uses rand 0.10.
-
 ### Fixed
 
+- Remove the fixed 64 MiB local ciphertext admission limit, which stopped raw
+  capture even after successful synchronization. Retain existing and pending
+  objects; capture continues while disk space is available. Status reports an
+  unlimited total budget. Encryption and per-object/query limits are unchanged.
 - `scripts/collector-local` reapplies the idempotent `worker/schema.sql` before
   starting the local Worker. Local D1 created before paged trace reads lacked
   `trace_generations`, so every trace read returned HTTP 500.

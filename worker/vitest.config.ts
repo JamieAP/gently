@@ -7,6 +7,7 @@ export default defineConfig({
     miniflare: {
       compatibilityDate: "2025-01-01",
       d1Databases: ["DB"],
+      r2Buckets: ["BACKUP_TEST_BUCKET"],
       bindings: { GENTLY_HOSTS: JSON.stringify([
         { token: "test-token-secret", tenant_id: "personal", device_id: "mac-main", capabilities: ["ingest", "read"] },
         { token: "other-tenant-token", tenant_id: "other", device_id: "linux-other", capabilities: ["ingest", "read"] },

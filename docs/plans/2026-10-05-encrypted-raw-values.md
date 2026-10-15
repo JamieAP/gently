@@ -1,7 +1,5 @@
 # Encrypted raw values implementation plan
 
-> **For Codex:** Execute this plan in the current isolated worktree using the executing-plans, test-driven-development, verification-before-completion and requesting-code-review skills. The user has authorized execution and preparation of a review PR.
-
 **Goal:** Remove Gently's dependence on a macOS secret helper and provide encrypted local/cloud raw capture that enrolled Macs and Linux readers decrypt, with tenant isolation from the first schema.
 
 **Architecture:** Launchers consume an inherited credential; an external secret provider owns credential acquisition. Hooks use a locally pinned, owner-signed, expiring recipient manifest to encrypt contextual field maps with age before persistence. A ciphertext-only local queue and tenant-authorized Worker transport objects without decryption keys; explicitly enabled CLI/MCP readers decrypt locally and verify field/span bindings.

@@ -319,6 +319,7 @@ fn spawn_detached_export() {
     // reinstall can repoint at an older version before the child starts, and
     // those versions trim queued history unless this flag is passed.
     cmd.arg("export")
+        .env_remove("GENTLY_READ_TOKEN")
         .arg("--preserve-backlog")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

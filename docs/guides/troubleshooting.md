@@ -26,7 +26,7 @@ authentication.
 | `last_error` | The latest recorded exporter failure. |
 | `consecutive_failures` | Repeated failures require checking the error and collector configuration. |
 | `quarantined` | Envelopes rejected or malformed during export; they are no longer in the active queue. |
-| `raw_bytes`, `raw_budget_bytes` | Encoded ciphertext storage use and its 64 MiB admission budget; SQLite overhead is additional. Full storage skips new raw capture or caching. |
+| `raw_bytes`, `raw_budget_bytes` | Encoded ciphertext storage use and `unlimited` total retention (`budget_bytes: null` in JSON); SQLite overhead is additional. Check available disk space if writes fail. |
 | `raw_pending`, `raw_pending_bytes` | Ciphertext objects and bytes not yet acknowledged by the collector. |
 
 Counts refer to envelopes, not spans. A zero pending count alone does not prove
@@ -44,7 +44,7 @@ appears in the collector.
 | `token is not configured` | Export needs a token supplied through your secret manager. Unix CLI/MCP queries can use an unlocked watcher with `--serve-queries`, provided the state directory and collector URL match. |
 | Export or query returns `401`/`403` | Confirm the process and collector use the same token without displaying it. Export stops on rejection and retains the queue; correct the token and restart the watcher. |
 | Local connection refused | Start `./scripts/collector-local` and leave its terminal open. Check that the configured URL is `http://127.0.0.1:8787`. |
-| Raw retention is missing | Check `recipient_policy` and `last_capture_outcome` in `gently status`. `unavailable` or `policy_unavailable` means verify capture opt-in, signed manifest, owner pin, minimum epoch and exact policy digest; `expired` or `policy_expired` means enroll a refreshed policy. `raw_capacity` means the raw byte budget is full, `oversized` means the content is over the size limit and `raw_store_failed` points at local storage. Metadata continues in each case. |
+| Raw retention is missing | Check `recipient_policy` and `last_capture_outcome` in `gently status`. `unavailable` or `policy_unavailable` means verify capture opt-in, signed manifest, owner pin, minimum epoch and exact policy digest; `expired` or `policy_expired` means enroll a refreshed policy. `raw_capacity` is historical from releases with the 64 MiB total limit; upgrade the CLI. `oversized` means the content is over the per-object limit and `raw_store_failed` points at local storage. Metadata continues in each case. |
 | Raw resolution fails | Check the enrolled reader identity, tenant read credential and object availability. Software unlocking requires an attached private terminal; reject wrong-key or binding errors. |
 | Span ownership conflict (`409`) | A different device or trace owns that span ID. Use fresh capture IDs for a new device/trace; do not spoof its owner. |
 | Incompatible development state | Stop Gently and explicitly reset disposable old application state and sidecars; preserve the credential vault. |

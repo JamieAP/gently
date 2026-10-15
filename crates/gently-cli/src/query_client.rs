@@ -318,7 +318,11 @@ impl QueryClient {
     pub fn new(cfg: &Config) -> Result<Self> {
         cfg.require_collector_url()?;
         #[cfg(unix)]
-        let query_socket = if cfg.token.is_empty() {
+        let query_socket = if cfg.read_token.is_empty()
+            && crate::query_broker::validate_socket(&cfg.runtime_dir().join("query.sock")).is_ok()
+        {
+            Some(cfg.runtime_dir().join("query.sock"))
+        } else if cfg.query_token().is_empty() {
             let path = cfg.runtime_dir().join("query.sock");
             crate::query_broker::validate_socket(&path).context(
                 "token is not configured; start an unlocked gently export --watch --serve-queries or inherit GENTLY_TOKEN"
@@ -328,9 +332,9 @@ impl QueryClient {
             None
         };
         #[cfg(not(unix))]
-        cfg.require_collector()?;
-        if !cfg.token.is_empty() {
-            cfg.require_collector()?;
+        cfg.require_reader()?;
+        if !cfg.query_token().is_empty() {
+            cfg.require_reader()?;
         }
         let local_raw_store = if cfg.resolve_raw_values {
             cfg.ensure_state_dir()?;
@@ -341,7 +345,7 @@ impl QueryClient {
         Ok(Self {
             collector: crate::collector::CollectorClient::new(
                 &cfg.collector_url,
-                &cfg.token,
+                cfg.query_token(),
                 &cfg.tenant_id,
                 cfg.query_timeout_secs,
             )?,
@@ -602,11 +606,7 @@ impl QueryClient {
                         account_raw_query_bytes(&mut bytes, object.ciphertext_b64.len())?;
                         let payload = CachedRawPayload(decrypt(&object)?);
                         hydrate_cached_payload(&self.tenant_id, row, &payload.0, &mut bytes)?;
-                        match store.raw_object_cache(&object) {
-                            Ok(()) => {},
-                            Err(gently_store::StoreError::RawCapacity) => tracing::warn!("encrypted raw cache byte budget reached; returning verified in-memory result"),
-                            Err(error) => return Err(error.into()),
-                        }
+                        store.raw_object_cache(&object)?;
                         payloads.insert(reference, Some(payload));
                     } else {
                         payloads.insert(reference, None);

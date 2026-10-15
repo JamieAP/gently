@@ -7,13 +7,36 @@ import { insertRawObject, rawObject, validateRawObject } from "./raw-values.js";
 
 export type { Env };
 
+async function limited(binding: RateLimit | undefined, key: string): Promise<Response | null> {
+  if (!binding) return null;
+  try {
+    if ((await binding.limit({ key })).success) return null;
+    const response = jsonResponse({ error: "Rate limit exceeded; retry later" }, 429);
+    response.headers.set("Retry-After", "60");
+    return response;
+  } catch { return jsonResponse({ error: "Admission service unavailable" }, 503); }
+}
+
+function secureTransport(url: URL): boolean {
+  return url.protocol === "https:" || (url.protocol === "http:" &&
+    ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname));
+}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     try {
-      const principal = authenticate(req, env.GENTLY_HOSTS);
-      if (!principal) return jsonResponse({ error: "Unauthorized" }, 401);
-
       const url = new URL(req.url);
+      // Do not authenticate, read a body, or redirect bearer credentials on HTTP.
+      if (!secureTransport(url)) return jsonResponse({ error: "HTTPS is required" }, 403);
+      if (env.REQUIRE_RATE_LIMITS === "true" && (!env.AUTH_RATE_LIMITER || !env.INGEST_RATE_LIMITER || !env.READ_RATE_LIMITER))
+        return jsonResponse({ error: "Admission service unavailable" }, 503);
+      const principal = authenticate(req, env.GENTLY_HOSTS, env.REQUIRE_CREDENTIAL_EXPIRY === "true");
+      if (!principal) {
+        // Invalid credentials share an IP bucket; valid traffic bypasses this
+        // bucket so an attacker behind the same NAT cannot block authentication.
+        const denied = await limited(env.AUTH_RATE_LIMITER, `invalid:${req.headers.get("CF-Connecting-IP") ?? "unknown"}`);
+        return denied ?? jsonResponse({ error: "Unauthorized" }, 401);
+      }
       const pathname = url.pathname;
       const requestedTenant = url.searchParams.get("tenant_id");
       if (!requestedTenant || !ID_PATTERN.test(requestedTenant) || url.searchParams.getAll("tenant_id").length !== 1) {
@@ -24,6 +47,15 @@ export default {
       const requireCapability = (capability: "ingest" | "read") => {
         if (!principal.capabilities.includes(capability)) throw new ClientError(403, "Forbidden");
       };
+      const ingestRoute = req.method === "POST" && ["/v1/traces", "/v1/raw-values"].includes(pathname);
+      const readRoute = req.method === "GET" && (pathname === "/v1/query" || pathname.startsWith("/v1/raw-values/"));
+      if (ingestRoute) requireCapability("ingest");
+      if (readRoute) requireCapability("read");
+      // A writer must not exhaust a reader's bucket with forbidden read probes,
+      // nor a reader exhaust ingestion by submitting forbidden writes.
+      const admission = await limited(ingestRoute || !principal.capabilities.includes("read") ? env.INGEST_RATE_LIMITER : env.READ_RATE_LIMITER,
+        `${principal.tenant_id}:${principal.device_id}`);
+      if (admission) return admission;
 
       if (req.method === "POST" && pathname === "/v1/raw-values") {
         requireCapability("ingest");

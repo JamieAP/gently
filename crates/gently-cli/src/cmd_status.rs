@@ -59,7 +59,7 @@ pub fn run(json: bool) -> Result<()> {
                     "quarantined": raw.quarantined_objects,
                     "quarantined_bytes": raw.quarantined_bytes,
                     "last_rejection_status": raw.last_rejection_status,
-                    "budget_bytes": gently_store::RAW_OBJECT_CAP_BYTES}
+                    "budget_bytes": null}
             })
         );
         return Ok(());
@@ -122,10 +122,7 @@ pub fn run(json: bool) -> Result<()> {
                 .unwrap_or_else(|| "-".into()),
         ),
     ]);
-    t.add_row(vec![
-        Cell::new("raw_budget_bytes"),
-        Cell::new(gently_store::RAW_OBJECT_CAP_BYTES),
-    ]);
+    t.add_row(vec![Cell::new("raw_budget_bytes"), Cell::new("unlimited")]);
     t.add_row(vec![
         Cell::new("consecutive_failures"),
         Cell::new(h.consecutive_failures),

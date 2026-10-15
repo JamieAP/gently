@@ -29,8 +29,6 @@ use std::path::Path;
 
 /// Default opt-in trim threshold; normal export preserves the entire backlog.
 pub const OUTBOX_CAP: usize = 10_000;
-/// Encrypted object JSON budget per tenant/device database. Never evicts rows.
-pub const RAW_OBJECT_CAP_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {

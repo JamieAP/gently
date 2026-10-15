@@ -59,9 +59,10 @@ pub struct QueryBroker {
 }
 
 impl QueryBroker {
-    /// Caller holds the exporter lock, serializing stale-socket recovery.
+    /// Caller serializes stale-socket recovery: the exporter lock for legacy
+    /// combined watchers, or the query lock for the standalone service broker.
     pub fn bind(cfg: &Config) -> Result<Self> {
-        cfg.require_collector()?;
+        cfg.require_reader()?;
         cfg.ensure_state_dir()?;
         let path = cfg.runtime_dir().join("query.sock");
         match std::fs::symlink_metadata(&path) {
@@ -98,7 +99,7 @@ impl QueryBroker {
         let timeout = Duration::from_secs(cfg.query_timeout_secs.max(1));
         let client = std::sync::Arc::new(crate::collector::CollectorClient::new(
             &cfg.collector_url,
-            &cfg.token,
+            cfg.query_token(),
             &cfg.tenant_id,
             cfg.query_timeout_secs.max(1),
         )?);

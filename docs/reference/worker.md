@@ -8,7 +8,7 @@ this collector, rather than the local outbox.
 
 Every route requires `Authorization: Bearer <token>` and exactly one
 `tenant_id` query parameter. The Worker's `GENTLY_HOSTS` secret is a JSON array
-of `{token, tenant_id, device_id, capabilities}` records; no shared
+of `{token, tenant_id, device_id, capabilities, expires_unix_secs?}` records; no shared
 `GENTLY_TOKEN` server fallback is supported. A missing, invalid or ambiguous
 credential/configuration returns `401`; a missing/invalid tenant returns `400`;
 a different tenant or missing capability returns `403`.
@@ -19,8 +19,27 @@ D1 operation is tenant scoped. Capture device claims are authenticated as
 well: missing resource namespace/device attributes are injected from the
 principal; conflicting or duplicate resource/span claims are rejected.
 
-Responses use `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
-There is no automatic credential expiry, account provisioning or retention.
+Responses use `Cache-Control: no-store`, `X-Content-Type-Options: nosniff` and
+`Strict-Transport-Security`. Non-loopback HTTP is rejected before authentication,
+without redirecting credentials. Clients must still use HTTPS: rejecting a request
+cannot undo a credential already sent over plaintext HTTP.
+
+Cloud host records should include `expires_unix_secs` (Unix seconds); expired
+credentials are rejected. Set `REQUIRE_CREDENTIAL_EXPIRY=true` to require expiry
+on every matched credential. Legacy records without expiry remain available for
+local development when that flag is absent. Provision separate `ingest` and `read`
+credentials and rotate before expiry. Expiry does not erase queued captures.
+
+Configure `AUTH_RATE_LIMITER`, `INGEST_RATE_LIMITER` and `READ_RATE_LIMITER` bindings,
+then set `REQUIRE_RATE_LIMITS=true` for fail-closed cloud admission. The deployment
+examples use 30 invalid-auth requests, 600 ingest requests and 120 reads per minute.
+Invalid authentication is bucketed by Cloudflare's connecting IP; authenticated
+traffic is bucketed by tenant/device and is independent of the invalid-auth bucket.
+Keys never contain credentials. Throttled requests return 429 with Retry-After;
+the exporter retains their queued data and retries. Limiter errors return 503.
+These are approximate per-location application limits, not a pre-Worker quota
+shield or a replacement for a separately configured Access/WAF perimeter.
+There is no automatic account provisioning or retention.
 See [security and privacy](../concepts/security-and-privacy.md).
 
 ## Endpoints
@@ -278,10 +297,54 @@ npm test
 npm run typecheck
 ```
 
-There is no built-in deletion, retention scheduler, token provisioning endpoint,
-or pagination for trace lists and span searches. Database maintenance and
+There is no token provisioning endpoint or pagination for hot trace lists and
+span searches. Database maintenance and
 credential rotation are operator responsibilities. The [configuration guide](../getting-started/configuration.md)
 describes exporter limits independently of database retention.
+
+### Optional scheduled D1 backups
+
+Use the separate `worker/wrangler.backup.toml` deployment for full SQL snapshots
+in private R2. This follows [Cloudflare's D1 backup Workflow example](https://developers.cloudflare.com/workflows/examples/backup-d1/).
+The collector itself keeps its existing D1 schema, ingest, raw-value storage and
+query behavior. There is no trace archive journal, transparent restore path or
+automatic row deletion.
+
+Copy the backup deployment template to an ignored operator configuration, fill
+in the account/database identifiers and private bucket name, and provision
+`D1_REST_API_TOKEN` as a Worker secret through your approved secret provider.
+Use the narrowest Cloudflare API permission and account scope that supports D1
+export; do not reuse collector host credentials or an interactive OAuth token.
+The backup Worker has no D1 SQL binding, public route, workers.dev endpoint or
+preview URL. Do not enable public bucket access or diagnostic body/header logging.
+
+The template schedules one Workflow daily at **03:00 UTC**. Each run starts a
+full D1 export, checkpoints its bookmark, then polls until the SQL dump is ready
+and streams it to R2. Workflows retries failed steps; the download URL and API
+credential are never returned as step outputs or included in error messages.
+An upload is checked against its R2 metadata and Content-Length when supplied.
+A separate `.complete.json` marker records the object key, bytes and ETag only
+after that check succeeds. A partial object without a completion marker is not
+a confirmed backup. This transport check is not a restore test.
+
+Backups contain plaintext trace metadata and opaque encrypted raw envelopes,
+just like D1; the SQL dump is not separately end-to-end encrypted. Keep the bucket
+private. No backup expiration is configured. Whole-database snapshots overlap and
+consume storage, and exports may affect database availability: check Cloudflare's
+[export limitations](https://developers.cloudflare.com/d1/best-practices/import-export-data/).
+Monitor failed/missed Workflow runs, completed backup age, R2 usage and D1 quotas.
+
+Before relying on backups, download a completed snapshot into protected local
+storage, import it into a **disposable** database and verify integrity, schema,
+representative row counts and ciphertext retrieval. Do not import into the live
+collector database as a test. Recovery is an operator-run database restore, not
+an online query over old trace objects.
+
+**Backups do not free D1 storage.** The earlier 30-day searchable-history target
+is not enforced by this backup-only deployment. Any future pruning needs a
+separately reviewed, verified-backup-covered retention procedure; no existing
+records are deleted by this change. Local capture routing and limits are unchanged.
+R2 account activation and the export credential are required before rollout.
 
 ## Source
 
