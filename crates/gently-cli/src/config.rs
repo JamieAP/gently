@@ -108,6 +108,8 @@ pub struct Config {
     pub collector_url: String,
     /// Inherited per-host bearer token for the collector.
     pub token: String,
+    /// Optional separately scoped read credential; never persisted to config.
+    pub read_token: String,
     /// Local state directory (outbox db, logs, raw captures).
     pub state_dir: PathBuf,
     /// Prefer HTTP/3 (QUIC) for export, falling back to HTTP/2.
@@ -187,6 +189,7 @@ impl Config {
         let cfg = Self {
             collector_url: env_or("GENTLY_COLLECTOR_URL", file.collector_url),
             token: std::env::var("GENTLY_TOKEN").unwrap_or_default(),
+            read_token: std::env::var("GENTLY_READ_TOKEN").unwrap_or_default(),
             state_dir,
             capture_raw_values,
             tenant_id: env_or(
@@ -302,6 +305,20 @@ impl Config {
             !self.token.is_empty(),
             "token is not configured (supply GENTLY_TOKEN through your secret provider)"
         );
+        self.validate()
+    }
+
+    pub fn query_token(&self) -> &str {
+        if self.read_token.is_empty() {
+            &self.token
+        } else {
+            &self.read_token
+        }
+    }
+
+    pub fn require_reader(&self) -> Result<()> {
+        self.require_collector_url()?;
+        anyhow::ensure!(!self.query_token().is_empty(), "read credential is not configured; inherit GENTLY_READ_TOKEN or use the private query broker");
         self.validate()
     }
 }

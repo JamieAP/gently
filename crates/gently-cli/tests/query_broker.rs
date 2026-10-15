@@ -22,6 +22,7 @@ fn start(state: &std::path::Path, url: &str) -> Watcher {
             .env("GENTLY_TENANT_ID", "personal")
             .env("GENTLY_DEVICE_ID", "capture-host")
             .env("GENTLY_TOKEN", "synthetic-broker-token")
+            .env_remove("GENTLY_READ_TOKEN")
             .env("GENTLY_COLLECTOR_URL", url)
             .stdout(Stdio::null())
             .stderr(Stdio::null())

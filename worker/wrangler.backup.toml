@@ -1,0 +1,24 @@
+name = "gently-d1-backup"
+main = "src/backup.ts"
+compatibility_date = "2026-10-15"
+workers_dev = false
+preview_urls = false
+
+[observability]
+enabled = false
+
+[vars]
+ACCOUNT_ID = "REPLACE_WITH_ACCOUNT_ID"
+DATABASE_ID = "REPLACE_WITH_DATABASE_ID"
+# D1_REST_API_TOKEN is a separately provisioned Worker secret, never a config var.
+
+[[r2_buckets]]
+binding = "BACKUP_BUCKET"
+bucket_name = "replace-with-private-backup-bucket"
+jurisdiction = "eu"
+
+[[workflows]]
+name = "gently-d1-backup"
+binding = "D1_BACKUP"
+class_name = "D1Backup"
+schedules = ["0 3 * * *"]

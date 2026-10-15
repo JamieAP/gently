@@ -7,3 +7,21 @@ binding = "DB"
 database_name = "gently"
 # database_id is filled by: wrangler d1 create gently
 database_id = "REPLACE_AFTER_CREATE"
+
+# For cloud deployments, configure all three bindings and enable both flags.
+# Use account-unique namespace IDs; the values below are examples only.
+# [vars]
+# REQUIRE_RATE_LIMITS = "true"
+# REQUIRE_CREDENTIAL_EXPIRY = "true"
+# [[ratelimits]]
+# name = "AUTH_RATE_LIMITER"
+# namespace_id = "1001"
+# simple = { limit = 30, period = 60 }
+# [[ratelimits]]
+# name = "INGEST_RATE_LIMITER"
+# namespace_id = "1002"
+# simple = { limit = 600, period = 60 }
+# [[ratelimits]]
+# name = "READ_RATE_LIMITER"
+# namespace_id = "1003"
+# simple = { limit = 120, period = 60 }

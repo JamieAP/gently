@@ -49,6 +49,7 @@ def public_setup(gently, check=False):
     """Resolve public CLI configuration without supplying the credential."""
     config_env = dict(os.environ)
     config_env.pop("GENTLY_TOKEN", None)
+    config_env.pop("GENTLY_READ_TOKEN", None)
     try:
         result = subprocess.run([gently, "config", "--json"], env=config_env,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=10)
@@ -92,6 +93,7 @@ def apply_schema(node, repo, environment):
     recorded, so state from an earlier release matches the current Worker."""
     schema_env = dict(environment)
     schema_env.pop("GENTLY_TOKEN", None)
+    schema_env.pop("GENTLY_READ_TOKEN", None)
     schema_env.pop("GENTLY_RAW_IDENTITY", None)
     worker = repo / "worker"
     if local_d1(node, worker, schema_env, ["execute"], "--file", "schema.sql") != 0:
@@ -104,6 +106,8 @@ def apply_schema(node, repo, environment):
 
 def local_environment(setup):
     environment = dict(os.environ)
+    # The local Worker enrolls the local token, not a cloud reader credential.
+    environment.pop("GENTLY_READ_TOKEN", None)
     for field in ["tenant_id", "device_id", "state_dir"]:
         environment["GENTLY_" + field.upper()] = setup[field]
     environment["GENTLY_COLLECTOR_URL"] = "http://127.0.0.1:8787"

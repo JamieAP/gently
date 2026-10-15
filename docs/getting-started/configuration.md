@@ -19,9 +19,17 @@ device_id = "local"
 
 For Cloudflare, use the deployed HTTPS URL. The CLI adds endpoint paths and the
 `tenant_id` query parameter. Supply `GENTLY_TOKEN` through your secret provider
-to export and query processes. Tokens are environment-only: a `token` setting
+to export processes and a separately scoped `GENTLY_READ_TOKEN` to readers or
+the persistent query broker. Query commands without a read token prefer an
+available owner-only broker; legacy combined-token setups remain supported.
+Detached hook exporters do not inherit the read token. Tokens are environment-only: a `token` setting
 in the config is rejected. Keep credentials out of `.env`, `.dev.vars`,
 repository files, command arguments and shell history.
+
+An exporter with `--serve-queries` needs both scoped credentials. Read-only CLI/MCP
+commands can use `GENTLY_READ_TOKEN` without an ingest token, or delegate through
+the owner-only broker without inheriting either credential. Scope reader secrets
+to the projects/processes that need queries rather than exposing them globally.
 
 | Process or command | Collector token required? |
 | --- | --- |

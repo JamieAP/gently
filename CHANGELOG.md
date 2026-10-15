@@ -6,6 +6,22 @@ changes appear under Unreleased.
 
 ## [Unreleased]
 
+### Added
+
+- Add an optional macOS login service with explicit in-memory unlock, separately
+  supervised export and read-only broker processes, and an opt-in login reminder
+  opening the scoped secret provider in Ghostty. Login starts locked; captures
+  queue locally until unlocked. No credentials are saved in login files.
+- Add a separate scheduled D1-to-private-R2 SQL backup Workflow template with
+  verified upload completion markers. It requires operator provisioning and
+  restore validation; it does not prune D1 or provide online archived queries.
+
+### Security
+
+- Support a separately scoped read credential, reject non-loopback plaintext
+  HTTP, and add opt-in mandatory credential expiry and fail-closed Cloudflare
+  rate-limit bindings. Local legacy credential setups remain supported.
+
 ### Changed
 
 - Store each span resource once per tenant and capture device, referenced from

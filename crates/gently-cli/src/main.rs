@@ -8,6 +8,8 @@ mod cmd_mcp;
 mod cmd_quarantine;
 mod cmd_query;
 mod cmd_raw;
+#[cfg(unix)]
+mod cmd_service;
 mod cmd_state;
 mod cmd_status;
 mod collector;
@@ -19,6 +21,8 @@ mod mcp_jq;
 #[cfg(unix)]
 mod query_broker;
 mod query_client;
+#[cfg(unix)]
+mod service_reminder;
 mod waterfall;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -43,6 +47,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Manage the locked-at-login exporter and read-only broker.
+    #[cfg(unix)]
+    Service {
+        #[command(subcommand)]
+        command: cmd_service::ServiceCommand,
+    },
     /// Back up or restore encrypted local state without unlocking a reader.
     State {
         #[command(subcommand)]
@@ -213,6 +223,8 @@ fn main() {
 
 fn dispatch(command: Command) -> anyhow::Result<()> {
     match command {
+        #[cfg(unix)]
+        Command::Service { command } => cmd_service::run(command),
         Command::State { command } => cmd_state::run(command),
         Command::Uninstall { claude: true, .. } => cmd_init::run_uninstall(Harness::Claude),
         Command::Uninstall { codex: true, .. } => cmd_init::run_uninstall(Harness::Codex),

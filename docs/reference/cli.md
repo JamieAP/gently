@@ -19,6 +19,63 @@ or queries. Installing hooks does not supply a token to agent processes.
 See [configuration](../getting-started/configuration.md) and
 [local setup](../getting-started/local-collector.md) for the collector and credential setup.
 
+## `gently service` (macOS login service)
+
+```sh
+gently service install
+gently service start
+# Supply distinct GENTLY_TOKEN and GENTLY_READ_TOKEN through your secret provider:
+agent-secrets run auto -- gently service unlock
+gently service status
+gently service lock
+gently service stop
+```
+
+If your secret provider pins routing to localhost, explicitly select the public
+cloud endpoint **inside** the provider's child command (replace the example):
+
+```sh
+agent-secrets run auto -- env GENTLY_COLLECTOR_URL=https://collector.example gently service unlock
+```
+
+The service rejects endpoint or namespace mismatches rather than silently
+redirecting credentials. This override changes neither vault scope nor defaults.
+
+The login controller starts **locked** and never stores credentials in its
+LaunchAgent configuration. Unlock hands credentials over an owner-only Unix
+socket, bound to the configured collector, tenant and device. The controller
+keeps them in memory to restart separate children: export receives only the
+ingest credential; the read-only query broker receives only the read credential.
+Other same-user processes remain within this trust boundary.
+
+Queries and MCP can use the private broker without inheriting either token.
+For a visible login reminder with **Unlock Gently** and **Later** buttons:
+
+```sh
+gently service install-reminder --project-dir /path/to/your/project
+```
+
+This requires Ghostty and `~/.local/bin/agent-secrets`. It opens the scoped vault
+flow in a foreground terminal only after clicking unlock, and never saves
+credentials. While locked, the reminder repeats hourly. You can also open
+**Unlock Gently** from your personal Applications folder at any time. The
+reminder is silent while the service is unlocked. Uninstalling the service
+removes the reminder registration but retains that clickable application.
+
+Reader decryption remains a separate client-side opt-in. Child failures retry
+with a bounded 1–30 second backoff; status reports child PIDs and restart counts.
+Credentials are forgotten when locked, stopped, logged out, or the controller
+restarts. Unlock again after login or a controller restart. Capture continues
+queuing locally while locked; this service never discards queued history.
+
+`stop` unloads the current job; it starts locked again at the next login.
+`uninstall` stops it and removes only its managed login registration, not data.
+Installation pins this executable's absolute path and the public namespace;
+reinstall and stop/start after moving the binary or changing that configuration.
+Do not run a separate legacy `export --watch --serve-queries` alongside it.
+`service run` is an internal foreground controller useful for Unix diagnostics;
+automatic login installation and process-group cleanup are supported on macOS.
+
 ## `gently init --claude` / `gently init --codex`
 
 Install the hooks and stdio MCP registration for one harness:

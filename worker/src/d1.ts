@@ -4,6 +4,11 @@ import { ClientError } from "./http.js";
 export interface Env {
   DB: D1Database;
   GENTLY_HOSTS: string;
+  REQUIRE_CREDENTIAL_EXPIRY?: string;
+  REQUIRE_RATE_LIMITS?: string;
+  AUTH_RATE_LIMITER?: RateLimit;
+  INGEST_RATE_LIMITER?: RateLimit;
+  READ_RATE_LIMITER?: RateLimit;
 }
 
 // Deliberately project the public metadata fields. New storage columns must not
