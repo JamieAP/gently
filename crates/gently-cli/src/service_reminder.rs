@@ -1,4 +1,4 @@
-//! Login UI has no credentials. Only a deliberate click opens the vault in a tty.
+//! Login UI has no credentials. A deliberate click opens a configured unlock flow.
 use crate::{cmd_service, config::Config};
 use anyhow::{ensure, Context, Result};
 use fs4::fs_std::FileExt;
@@ -37,12 +37,33 @@ fn executable(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
-fn unlock_script(cfg: &Config, project: &Path, provider: &Path, gently: &Path) -> String {
+fn unlock_script(cfg: &Config, project: &Path, unlock: &Path, gently: &Path) -> String {
     let q = |p: &Path| quote(&p.to_string_lossy());
-    format!("#!/bin/zsh\n{MARKER}\nunset GENTLY_TOKEN GENTLY_READ_TOKEN\ncd -- {} || exit 1\n{} service start || exit 1\n{} run auto -- /usr/bin/env GENTLY_STATE_DIR={} GENTLY_COLLECTOR_URL={} GENTLY_TENANT_ID={} GENTLY_DEVICE_ID={} {} service unlock\nresult=$?\nif [ $result -ne 0 ]; then\n  printf '%s\\n' 'Gently is still locked. Close this window and try Unlock Gently again.'\n  read -r '?Press Return to close.'\nfi\nexit $result\n", q(project), q(gently), q(provider), q(&cfg.state_dir), quote(&cfg.collector_url), quote(&cfg.tenant_id), quote(&cfg.device_id), q(gently))
+    format!("#!/bin/sh\n{MARKER}\nunset GENTLY_TOKEN GENTLY_READ_TOKEN\ncd -- {} || exit 1\n{} service start || exit 1\nexport GENTLY_STATE_DIR={} GENTLY_COLLECTOR_URL={} GENTLY_TENANT_ID={} GENTLY_DEVICE_ID={}\n{}\nresult=$?\nif [ $result -ne 0 ]; then\n  printf '%s\\n' 'Gently is still locked. Close this window and try Unlock Gently again.' 'Press Return to close.'\n  read -r reply\nfi\nexit $result\n", q(project), q(gently), q(&cfg.state_dir), quote(&cfg.collector_url), quote(&cfg.tenant_id), quote(&cfg.device_id), q(unlock))
 }
 
-pub fn install(project: &Path) -> Result<()> {
+fn command_path(path: &Path) -> Result<PathBuf> {
+    let path = path
+        .canonicalize()
+        .context("configured executable unavailable")?;
+    let metadata = std::fs::metadata(&path)?;
+    ensure!(
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+        "configured command must be an executable file"
+    );
+    Ok(path)
+}
+
+fn app_script(script: &Path, terminal: Option<&Path>) -> String {
+    let program = terminal.unwrap_or(Path::new("/usr/bin/open"));
+    format!(
+        "#!/bin/sh\n{MARKER}\nunset GENTLY_TOKEN GENTLY_READ_TOKEN\nexec {} {}\n",
+        quote(&program.to_string_lossy()),
+        quote(&script.to_string_lossy())
+    )
+}
+
+pub fn install(project: &Path, unlock: &Path, terminal: Option<&Path>) -> Result<()> {
     ensure!(cfg!(target_os = "macos"), "login reminders require macOS");
     let project = project
         .canonicalize()
@@ -51,18 +72,11 @@ pub fn install(project: &Path) -> Result<()> {
     let cfg = Config::load()?;
     cfg.require_collector_url()?;
     cfg.ensure_state_dir()?;
-    let provider = home()?.join(".local/bin/agent-secrets");
-    ensure!(
-        provider.is_file(),
-        "install agent-secrets before adding the unlock reminder"
-    );
-    ensure!(
-        Path::new("/Applications/Ghostty.app").is_dir(),
-        "install Ghostty before adding the unlock reminder"
-    );
+    let unlock = command_path(unlock)?;
+    let terminal = terminal.map(command_path).transpose()?;
     let gently = std::env::current_exe()?;
     let script = cfg.runtime_dir().join("unlock-service.command");
-    executable(&script, &unlock_script(&cfg, &project, &provider, &gently))?;
+    executable(&script, &unlock_script(&cfg, &project, &unlock, &gently))?;
     let app = app_path()?;
     let launcher = app.join("Contents/MacOS/unlock-gently");
     if app.exists() {
@@ -78,8 +92,7 @@ pub fn install(project: &Path) -> Result<()> {
     ] {
         private_fs::ensure_private_dir(&dir)?;
     }
-    let app_script = format!("#!/bin/sh\n{MARKER}\nunset GENTLY_TOKEN GENTLY_READ_TOKEN\nexec /usr/bin/open -na /Applications/Ghostty.app --args --title='Unlock Gently' -e /bin/zsh -f {}\n", quote(&script.to_string_lossy()));
-    executable(&launcher, &app_script)?;
+    executable(&launcher, &app_script(&script, terminal.as_deref()))?;
     private_fs::write_private_file(
         &app.join("Contents/Info.plist"),
         r#"<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>dev.gently.unlock</string><key>CFBundleName</key><string>Unlock Gently</string><key>CFBundleExecutable</key><string>unlock-gently</string><key>CFBundlePackageType</key><string>APPL</string><key>LSUIElement</key><true/></dict></plist>"#,
@@ -205,14 +218,19 @@ mod tests {
         let script = unlock_script(
             &cfg,
             Path::new("/tmp/a project's directory"),
-            Path::new("/tmp/vault helper"),
+            Path::new("/tmp/custom unlock helper"),
             Path::new("/tmp/gently"),
         );
         assert!(!script.contains(&cfg.token));
         assert!(!script.contains(&cfg.read_token));
-        assert!(script.contains("run auto -- /usr/bin/env GENTLY_STATE_DIR="));
+        assert!(script.contains("export GENTLY_STATE_DIR="));
         assert!(script.contains("GENTLY_COLLECTOR_URL='https://collector.example'"));
-        assert!(script.find("unset GENTLY_TOKEN").unwrap() < script.find("run auto").unwrap());
+        assert!(
+            script.find("unset GENTLY_TOKEN").unwrap()
+                < script.find("'/tmp/custom unlock helper'").unwrap()
+        );
+        assert!(!script.contains("agent-secrets"));
+        assert!(!script.contains("Ghostty"));
         let job = cmd_service::job_plist(Path::new("/tmp/gently"), &cfg, LABEL, "remind", false);
         assert!(job.contains("<key>StartInterval</key><integer>3600</integer>"));
         assert!(!job.contains("KeepAlive"));
@@ -221,8 +239,8 @@ mod tests {
         #[cfg(target_os = "macos")]
         {
             use std::io::Write;
-            let mut check = Command::new("/bin/zsh")
-                .args(["-f", "-n"])
+            let mut check = Command::new("/bin/sh")
+                .args(["-n"])
                 .stdin(Stdio::piped())
                 .spawn()
                 .unwrap();
@@ -238,5 +256,24 @@ mod tests {
     #[test]
     fn shell_arguments_are_single_words() {
         assert_eq!(quote("a'b;$HOME"), "'a'\"'\"'b;$HOME'");
+    }
+    #[test]
+    fn terminal_is_configurable_and_receives_one_quoted_script_path() {
+        let script = Path::new("/tmp/a user's script.command");
+        let default = app_script(script, None);
+        assert!(default.contains("exec '/usr/bin/open' "));
+        let custom = app_script(script, Some(Path::new("/tmp/my terminal")));
+        assert!(custom.contains("exec '/tmp/my terminal' '/tmp/a user'\"'\"'s script.command'"));
+        assert!(!custom.contains("/usr/bin/open"));
+    }
+    #[test]
+    fn rejects_missing_or_nonexecutable_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(command_path(&dir.path().join("missing")).is_err());
+        let path = dir.path().join("helper");
+        private_fs::write_private_file(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        assert!(command_path(&path).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(command_path(&path).is_ok());
     }
 }

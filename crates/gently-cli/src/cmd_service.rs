@@ -23,9 +23,16 @@ pub enum ServiceCommand {
     Install,
     /// Add a macOS login reminder and an Unlock Gently application.
     InstallReminder {
-        /// Project directory used to select the scoped agent-secrets profile.
+        /// Working directory for the configured unlock command.
         #[arg(long)]
         project_dir: PathBuf,
+        /// Executable wrapper that obtains credentials and runs service unlock.
+        #[arg(long)]
+        unlock_command: PathBuf,
+        /// Optional executable accepting the generated script path as one argument.
+        /// Otherwise macOS opens the .command file with its associated terminal.
+        #[arg(long)]
+        terminal_command: Option<PathBuf>,
     },
     #[command(hide = true)]
     Remind,
@@ -70,9 +77,15 @@ pub fn run(command: ServiceCommand) -> Result<()> {
     disable_core_dumps()?;
     match command {
         ServiceCommand::Install => install(),
-        ServiceCommand::InstallReminder { project_dir } => {
-            crate::service_reminder::install(&project_dir)
-        }
+        ServiceCommand::InstallReminder {
+            project_dir,
+            unlock_command,
+            terminal_command,
+        } => crate::service_reminder::install(
+            &project_dir,
+            &unlock_command,
+            terminal_command.as_deref(),
+        ),
         ServiceCommand::Remind => crate::service_reminder::remind(),
         ServiceCommand::Start => launch("start"),
         ServiceCommand::Stop => launch("stop"),

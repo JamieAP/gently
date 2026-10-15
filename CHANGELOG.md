@@ -10,7 +10,7 @@ changes appear under Unreleased.
 
 - Add an optional macOS login service with explicit in-memory unlock, separately
   supervised export and read-only broker processes, and an opt-in login reminder
-  opening the scoped secret provider in Ghostty. Login starts locked; captures
+  opening a user-configured unlock command and terminal. Login starts locked; captures
   queue locally until unlocked. No credentials are saved in login files.
 - Add a separate scheduled D1-to-private-R2 SQL backup Workflow template with
   verified upload completion markers. It requires operator provisioning and

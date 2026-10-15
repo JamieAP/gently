@@ -24,22 +24,15 @@ See [configuration](../getting-started/configuration.md) and
 ```sh
 gently service install
 gently service start
-# Supply distinct GENTLY_TOKEN and GENTLY_READ_TOKEN through your secret provider:
-agent-secrets run auto -- gently service unlock
+# With distinct GENTLY_TOKEN and GENTLY_READ_TOKEN supplied by your provider:
+gently service unlock
 gently service status
 gently service lock
 gently service stop
 ```
 
-If your secret provider pins routing to localhost, explicitly select the public
-cloud endpoint **inside** the provider's child command (replace the example):
-
-```sh
-agent-secrets run auto -- env GENTLY_COLLECTOR_URL=https://collector.example gently service unlock
-```
-
-The service rejects endpoint or namespace mismatches rather than silently
-redirecting credentials. This override changes neither vault scope nor defaults.
+Your credential provider must preserve the configured collector and namespace.
+The service rejects mismatches rather than silently redirecting credentials.
 
 The login controller starts **locked** and never stores credentials in its
 LaunchAgent configuration. Unlock hands credentials over an owner-only Unix
@@ -52,12 +45,24 @@ Queries and MCP can use the private broker without inheriting either token.
 For a visible login reminder with **Unlock Gently** and **Later** buttons:
 
 ```sh
-gently service install-reminder --project-dir /path/to/your/project
+gently service install-reminder --project-dir /path/to/your/project \
+  --unlock-command /path/to/your/unlock-wrapper
 ```
 
-This requires Ghostty and `~/.local/bin/agent-secrets`. It opens the scoped vault
-flow in a foreground terminal only after clicking unlock, and never saves
-credentials. While locked, the reminder repeats hourly. You can also open
+The executable unlock wrapper takes no arguments: it obtains credentials using
+your chosen provider and invokes `gently service unlock` as a child with distinct
+`GENTLY_TOKEN` and `GENTLY_READ_TOKEN`. Gently supplies the configured public
+collector, namespace and state-directory environment and uses the selected
+project directory. The wrapper must preserve those settings, including after
+provider injection. Never put credential values in the wrapper or command arguments.
+
+By default macOS opens the generated `.command` file with its associated terminal.
+To choose another terminal, add `--terminal-command /path/to/terminal-wrapper`;
+that executable receives the generated script path as its single argument and
+must run it in a foreground terminal. No particular terminal, vault helper or
+Secure Enclave is required. Only executable paths and public settings are saved.
+Commands run only after clicking unlock. While locked, the reminder repeats
+hourly. You can also open
 **Unlock Gently** from your personal Applications folder at any time. The
 reminder is silent while the service is unlocked. Uninstalling the service
 removes the reminder registration but retains that clickable application.
