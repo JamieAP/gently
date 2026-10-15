@@ -21,6 +21,10 @@ changes appear under Unreleased.
 - Support a separately scoped read credential, reject non-loopback plaintext
   HTTP, and add opt-in mandatory credential expiry and fail-closed Cloudflare
   rate-limit bindings. Local legacy credential setups remain supported.
+- Update rustls to 0.23.46 (RUSTSEC-2026-0346 to 0349, including an
+  unauthenticated ServerHello downgrade to classical key exchange and TLS
+  secrets in `Debug` output) and quinn-proto to 0.11.19 (RUSTSEC-2026-0338 to
+  0342). quinn-proto now uses rand 0.10.
 
 ### Changed
 
@@ -34,13 +38,6 @@ changes appear under Unreleased.
 
 - Drop `idx_spans_trace`, `idx_spans_session` and `idx_spans_tool`. Each is a
   leading prefix of a `*_start` index that serves the same lookups.
-
-### Security
-
-- Update rustls to 0.23.46 (RUSTSEC-2026-0346 to 0349, including an
-  unauthenticated ServerHello downgrade to classical key exchange and TLS
-  secrets in `Debug` output) and quinn-proto to 0.11.19 (RUSTSEC-2026-0338 to
-  0342). quinn-proto now uses rand 0.10.
 
 ### Fixed
 
