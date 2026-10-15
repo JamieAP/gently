@@ -175,6 +175,8 @@ def main():
         d1_args = [*wrangler_args, "d1", "execute", "gently", "--local", "--config",
                    REPO / "worker/wrangler.local.toml", "--persist-to", root / "d1"]
         command([*d1_args, "--file", REPO / "worker/schema.sql"], worker_env, REPO / "worker")
+        command([*wrangler_args, "d1", "migrations", "apply", "gently", "--local", "--config",
+                 REPO / "worker/wrangler.local.toml", "--persist-to", root / "d1"], worker_env, REPO / "worker")
         phase("fresh actual Wrangler/D1 schema and synthetic per-host credentials")
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))

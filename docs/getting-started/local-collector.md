@@ -26,13 +26,16 @@ cargo install --path crates/gently-cli --locked
 cd worker
 npm ci --ignore-scripts
 npx wrangler d1 execute gently --local --config wrangler.local.toml --file schema.sql
+npx wrangler d1 migrations apply gently --local --config wrangler.local.toml
 cd ..
 ```
 
-The schema command initializes local D1. The local Wrangler configuration does
-not need a cloud database ID. `./scripts/collector-local` reapplies the schema
-before each start: every statement is idempotent, so local D1 from an earlier
-release gains new tables, indexes and triggers without touching stored rows.
+These commands initialize local D1. The local Wrangler configuration does not
+need a cloud database ID. `./scripts/collector-local` repeats both before each
+start: the schema is idempotent and each migration runs once, so local D1 from
+an earlier release matches the current Worker without losing stored rows. The
+launcher serves the Worker code it started with; restart it after updating
+the checkout.
 State from early development builds, before the tenant/encrypted schema, must
 be explicitly reset; there is no migration from it.
 

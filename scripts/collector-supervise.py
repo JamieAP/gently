@@ -70,28 +70,36 @@ def public_setup(gently, check=False):
         raise RuntimeError("Cannot validate Gently setup; run gently config --json and gently config --check for details.") from None
 
 
+def local_d1(node, worker, environment, command, *options):
+    """Run one local Wrangler D1 command to completion. Returns its exit code,
+    or None when it does not finish in time."""
+    child = subprocess.Popen([
+        node, str(worker / "node_modules/wrangler/bin/wrangler.js"), "d1", *command, "gently",
+        "--local", "--config", "wrangler.local.toml", "--persist-to", ".wrangler/state", *options,
+    ], cwd=worker, env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        return child.wait(timeout=120)
+    except subprocess.TimeoutExpired:
+        return None
+    finally:
+        # The local runtime must release the database before the Worker opens it.
+        stop_children([child])
+
+
 def apply_schema(node, repo, environment):
-    """Reapply the idempotent D1 schema so state from an earlier release gains
-    the tables, indexes and triggers the current Worker queries."""
+    """Reapply the idempotent D1 schema, then apply any migration not yet
+    recorded, so state from an earlier release matches the current Worker."""
     schema_env = dict(environment)
     schema_env.pop("GENTLY_TOKEN", None)
     schema_env.pop("GENTLY_RAW_IDENTITY", None)
     worker = repo / "worker"
-    child = subprocess.Popen([
-        node, str(worker / "node_modules/wrangler/bin/wrangler.js"), "d1", "execute", "gently",
-        "--local", "--config", "wrangler.local.toml", "--persist-to", ".wrangler/state", "--file", "schema.sql",
-    ], cwd=worker, env=schema_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL, start_new_session=True)
-    try:
-        code = child.wait(timeout=120)
-    except subprocess.TimeoutExpired:
-        code = None
-    finally:
-        # The local runtime must release the database before the Worker opens it.
-        stop_children([child])
-    if code != 0:
+    if local_d1(node, worker, schema_env, ["execute"], "--file", "schema.sql") != 0:
         raise RuntimeError("Cannot apply worker/schema.sql to local D1; in worker, run "
             "npx wrangler d1 execute gently --local --config wrangler.local.toml --file schema.sql for details.")
+    if local_d1(node, worker, schema_env, ["migrations", "apply"]) != 0:
+        raise RuntimeError("Cannot apply worker/migrations to local D1; in worker, run "
+            "npx wrangler d1 migrations apply gently --local --config wrangler.local.toml for details.")
 
 
 def local_environment(setup):
