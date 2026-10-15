@@ -202,6 +202,7 @@ class Cloud:
         self.discover_created_database()
         self.call(["d1", "execute", "DB", "--remote", "--file", REPO / "worker/schema.sql", "--yes"],
                   "Remote schema initialization")
+        self.call(["d1", "migrations", "apply", "DB", "--remote"], "Remote schema migrations")
         self.worker_attempted = True
         self.report["worker_creation"] = "attempted"
         self.checkpoint()

@@ -1,11 +1,12 @@
-import { applySchema } from "./schema";
+import { applyMigrations, applySchema } from "./schema";
 
 // Vitest 4 isolates storage per test file, not per test. Drop every table that
 // exists rather than a hand-maintained list, so a table added to schema.sql (or
 // created by a test) cannot carry rows into the next test, then reapply the
 // schema. Dropping a table drops its indexes and triggers with it. SQLite and D1
-// internal tables are left alone.
-export async function resetDatabase(db: D1Database): Promise<void> {
+// internal tables are left alone. `migrated: false` leaves the database as an
+// earlier release created it, before any migration.
+export async function resetDatabase(db: D1Database, { migrated = true } = {}): Promise<void> {
   const { results } = await db.prepare(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\'",
   ).all<{ name: string }>();
@@ -15,4 +16,5 @@ export async function resetDatabase(db: D1Database): Promise<void> {
   // schema.sql's CREATE TRIGGER bodies contain semicolons; applySchema keeps
   // each trigger whole.
   await applySchema(db);
+  if (migrated) await applyMigrations(db);
 }

@@ -18,10 +18,13 @@ CREATE TABLE IF NOT EXISTS spans (
   ingested_unix_nano TEXT NOT NULL,
   PRIMARY KEY (tenant_id, span_id)
 );
-CREATE INDEX IF NOT EXISTS idx_spans_trace ON spans(tenant_id, trace_id);
-CREATE INDEX IF NOT EXISTS idx_spans_session ON spans(tenant_id, session_id);
+-- Leading prefixes of the trace, session and tool *_start indexes below, which
+-- serve every lookup these did. Dropping them here also removes them from
+-- databases created by earlier releases.
+DROP INDEX IF EXISTS idx_spans_trace;
+DROP INDEX IF EXISTS idx_spans_session;
+DROP INDEX IF EXISTS idx_spans_tool;
 CREATE INDEX IF NOT EXISTS idx_spans_start ON spans(tenant_id, start_unix_nano);
-CREATE INDEX IF NOT EXISTS idx_spans_tool ON spans(tenant_id, tool_name);
 CREATE INDEX IF NOT EXISTS idx_spans_trace_start ON spans(tenant_id, trace_id, start_unix_nano);
 CREATE INDEX IF NOT EXISTS idx_spans_session_start ON spans(tenant_id, session_id, start_unix_nano);
 CREATE INDEX IF NOT EXISTS idx_spans_harness_start ON spans(tenant_id, harness, start_unix_nano);
@@ -29,6 +32,19 @@ CREATE INDEX IF NOT EXISTS idx_spans_tool_start ON spans(tenant_id, tool_name, s
 CREATE INDEX IF NOT EXISTS idx_spans_name_start ON spans(tenant_id, name, start_unix_nano);
 CREATE INDEX IF NOT EXISTS idx_spans_status_start ON spans(tenant_id, status, start_unix_nano);
 CREATE INDEX IF NOT EXISTS idx_spans_kind_start ON spans(tenant_id, kind, start_unix_nano);
+
+-- Each distinct resource is stored once per tenant and capture device, and
+-- spans reference it through spans.resource_id (migrations/0001). Scoping by
+-- device keeps one device's writes independent of what any other device has
+-- stored. Readers resolve the reference within the span's own tenant and
+-- device; rows written before it keep an inline spans.resource_json.
+CREATE TABLE IF NOT EXISTS span_resources (
+  id INTEGER PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  resource_json TEXT NOT NULL,
+  UNIQUE (tenant_id, device_id, resource_json)
+);
 
 CREATE TABLE IF NOT EXISTS raw_values (
   tenant_id TEXT NOT NULL,

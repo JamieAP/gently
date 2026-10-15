@@ -91,6 +91,8 @@ def main():
         d1 = [node, wrangler, "d1", "execute", "gently", "--local", "--config",
               REPO / "worker/wrangler.local.toml", "--persist-to", root / "d1"]
         command([*d1, "--file", REPO / "worker/schema.sql"], worker_env, REPO / "worker")
+        command([node, wrangler, "d1", "migrations", "apply", "gently", "--local", "--config",
+                 REPO / "worker/wrangler.local.toml", "--persist-to", root / "d1"], worker_env, REPO / "worker")
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]

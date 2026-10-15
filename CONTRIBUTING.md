@@ -69,7 +69,8 @@ cd ..
 
 The Worker test suite uses the Cloudflare Vitest plugin and Vitest 4. Storage
 is isolated per test file, not per test, so each test calls
-`worker/test/reset.ts` to drop every table and reapply `schema.sql`.
+`worker/test/reset.ts` to drop every table, reapply `schema.sql` and apply
+`worker/migrations` in order.
 `npm ci --ignore-scripts` installs exactly what the lockfile records without
 running dependency install scripts; the Worker, tests and local collector do
 not need them.

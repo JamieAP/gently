@@ -2,9 +2,10 @@ import { env, SELF } from "cloudflare:test";
 import { describe, it, expect, beforeEach } from "vitest";
 import worker from "../src/index";
 import type { Env } from "../src/d1";
+import type { Principal } from "../src/auth";
 import { insertSpans, tracePage, tracePageSql } from "../src/d1";
 import { flatten } from "../src/otlp";
-import { applySchema } from "./schema";
+import { applyMigrations, applySchema } from "./schema";
 import { resetDatabase } from "./reset";
 
 const BEARER = "Bearer test-token-secret";
@@ -1117,5 +1118,111 @@ describe("trace continuation compatibility", () => {
       found.push(page.rows[0].span_id); cursor=page.next_cursor;
     }
     expect(found).toEqual(ids); expect(cursor).toBeNull();
+  });
+});
+
+describe("span resources", () => {
+  const MAC: Principal = {tenant_id: "personal", device_id: "mac-main", capabilities: ["ingest", "read"]};
+  const query = async (params: string, token = BEARER) => (await SELF.fetch(
+    `https://x/v1/query?tenant_id=personal&${params}`, {headers: {Authorization: token}})).json();
+  const resourceRows = () => env.DB.prepare(
+    "SELECT id, tenant_id, device_id, resource_json FROM span_resources ORDER BY id",
+  ).all<{id: number; tenant_id: string; device_id: string; resource_json: string}>();
+  function fixture(traceId: string, spanIds: string[], resource: Array<{key: string; value: {stringValue: string}}>) {
+    return {resourceSpans: [{resource: {attributes: resource}, scopeSpans: [{spans: spanIds.map((spanId, i) => ({
+      traceId, spanId, name: `turn:${i}`, kind: 1, status: {code: 0},
+      startTimeUnixNano: String(1700000000000000000n + BigInt(i)), endTimeUnixNano: String(1700000000000000500n + BigInt(i)),
+      attributes: [],
+    }))}]}]};
+  }
+  const post = (body: unknown, token = BEARER, tenant = "personal") => SELF.fetch(
+    `https://x/v1/traces?tenant_id=${tenant}`,
+    {method: "POST", headers: {Authorization: token, "Content-Type": "application/json"}, body: JSON.stringify(body)});
+
+  it("stores each resource once and returns it unchanged on every read path", async () => {
+    const expected = flatten(makeOtlpFixture(), MAC)[0].resource_json;
+    expect((await post(makeOtlpFixture())).status).toBe(200);
+    const {results} = await resourceRows();
+    expect(results).toEqual([{id: results[0].id, tenant_id: "personal", device_id: "mac-main", resource_json: expected}]);
+    const stored = await env.DB.prepare("SELECT resource_json, resource_id FROM spans WHERE trace_id = ?")
+      .bind(TRACE_ID).all<{resource_json: string | null; resource_id: number}>();
+    expect(stored.results).toEqual([
+      {resource_json: null, resource_id: results[0].id}, {resource_json: null, resource_id: results[0].id},
+    ]);
+    const spans = await query(`op=spans&trace_id=${TRACE_ID}`) as Array<{resource_json: string}>;
+    const legacy = await query(`op=trace&trace_id=${TRACE_ID}`) as Array<{resource_json: string}>;
+    const page = await query(`op=trace&trace_id=${TRACE_ID}&page=1`) as {rows: Array<{resource_json: string}>};
+    for (const rows of [spans, legacy, page.rows]) {
+      expect(rows.map(row => row.resource_json)).toEqual([expected, expected]);
+    }
+  });
+
+  it("keeps resources apart per capture device and tenant", async () => {
+    const resource = [{key: "service.name", value: {stringValue: "gently"}}];
+    expect((await post(fixture("c1".repeat(16), ["c1".repeat(8)], resource), "Bearer ingest-only-token")).status).toBe(200);
+    expect((await post(fixture("d1".repeat(16), ["d1".repeat(8)], resource), "Bearer other-tenant-token", "other")).status).toBe(200);
+    const {results} = await resourceRows();
+    expect(results.map(row => [row.tenant_id, row.device_id])).toEqual([
+      ["personal", "mac-main"], ["personal", "linux-capture"], ["other", "linux-other"],
+    ]);
+    const capture = await query(`op=spans&trace_id=${"c1".repeat(16)}`) as Array<{resource_json: string}>;
+    expect(capture[0].resource_json).toContain("linux-capture");
+    expect(capture[0].resource_json).not.toContain("mac-main");
+    // A reference to another tenant's or device's resource resolves to nothing.
+    for (const foreign of results.filter(row => row.device_id !== "mac-main")) {
+      await env.DB.prepare("UPDATE spans SET resource_id = ? WHERE span_id = ?").bind(foreign.id, SPAN_ID_1).run();
+      const rows = await query(`op=spans&trace_id=${TRACE_ID}`) as Array<{span_id: string; resource_json: string | null}>;
+      expect(rows.find(row => row.span_id === SPAN_ID_1)?.resource_json).toBeNull();
+      expect(JSON.stringify(rows)).not.toContain(foreign.device_id);
+    }
+  });
+
+  it("migrates inline resources from an earlier release to references", async () => {
+    await resetDatabase(env.DB, {migrated: false});
+    const insert = env.DB.prepare(`INSERT INTO spans (tenant_id, span_id, source_device_id, trace_id, name, kind,
+      start_unix_nano, status, attrs_json, resource_json, ingested_unix_nano)
+      VALUES (?, ?, ?, 'e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1', 'synthetic', 1, ?, 0, '[]', ?, '1')`);
+    const earlier = [
+      ["personal", "e1".repeat(8), "mac-main", "1", '[{"key":"r","value":{"stringValue":"a"}}]'],
+      ["personal", "e2".repeat(8), "mac-main", "2", '[{"key":"r","value":{"stringValue":"a"}}]'],
+      ["personal", "e3".repeat(8), "mac-main", "3", '[{"key":"r","value":{"stringValue":"b"}}]'],
+      ["other", "e4".repeat(8), "linux-other", "4", '[{"key":"r","value":{"stringValue":"a"}}]'],
+    ];
+    await env.DB.batch(earlier.map(row => insert.bind(...row)));
+    await applyMigrations(env.DB);
+    const migrated = (await resourceRows()).results.map(row => [row.tenant_id, row.device_id, row.resource_json]);
+    expect(migrated).toHaveLength(3);
+    expect(migrated).toEqual(expect.arrayContaining([
+      ["personal", "mac-main", earlier[0][4]], ["personal", "mac-main", earlier[2][4]], ["other", "linux-other", earlier[3][4]],
+    ]));
+    const inline = await env.DB.prepare("SELECT COUNT(*) AS n FROM spans WHERE resource_json IS NOT NULL OR resource_id IS NULL")
+      .first<{n: number}>();
+    expect(inline?.n).toBe(0);
+    const rows = await query("op=spans&order=start_asc") as Array<{span_id: string; resource_json: string}>;
+    expect(rows.map(row => [row.span_id, row.resource_json])).toEqual(earlier.slice(0, 3).map(row => [row[1], row[4]]));
+  });
+
+  it("replaces an inline resource when a newer report of the span arrives", async () => {
+    await env.DB.prepare("UPDATE spans SET resource_json = '[]', resource_id = NULL, end_unix_nano = start_unix_nano WHERE span_id = ?")
+      .bind(SPAN_ID_2).run();
+    expect((await post(makeOtlpFixture())).status).toBe(200);
+    const row = await env.DB.prepare("SELECT resource_json, resource_id FROM spans WHERE span_id = ?")
+      .bind(SPAN_ID_2).first<{resource_json: string | null; resource_id: number | null}>();
+    expect(row).toEqual({resource_json: null, resource_id: (await resourceRows()).results[0].id});
+  });
+
+  it("stays within the Free-plan query budget when every span has its own resource", async () => {
+    let statements = 0;
+    const db = new Proxy(env.DB, {get(target, prop) {
+      if (prop === "batch") return (batch: D1PreparedStatement[]) => { statements += batch.length; return target.batch(batch); };
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    }});
+    const body = {resourceSpans: Array.from({length: 32}, (_, i) =>
+      fixture("f1".repeat(16), [`f1f1f1f1f1f1${String(i).padStart(4, "0")}`], [{key: "service.name", value: {stringValue: `s${i}`}}])
+        .resourceSpans[0])};
+    await insertSpans({...env, DB: db}, "personal", "mac-main", flatten(body, MAC));
+    expect(statements).toBeLessThanOrEqual(50);
+    expect((await resourceRows()).results).toHaveLength(33);
   });
 });

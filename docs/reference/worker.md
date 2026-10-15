@@ -191,6 +191,28 @@ advance (see [bounded full-trace queries](#bounded-full-trace-queries)). These
 statements are idempotent, so reapplying `schema.sql` to an existing database
 adds them without touching stored rows.
 
+Each distinct resource is stored once in `span_resources`, keyed by tenant and
+capture device, and spans reference it through `resource_id`. Query responses
+still return the full `resource_json`. A span resolves its reference only
+within its own tenant and device, so a reference can never return another
+tenant's or device's resource, and no device's writes depend on what another
+has stored. Rows written by an earlier Worker keep an inline copy and read the
+same. SQLite cannot add a column idempotently, so `resource_id` comes from
+`worker/migrations/0001_span_resources.sql`, which Wrangler applies once and
+records in `d1_migrations`. Apply migrations after `schema.sql`:
+
+```sh
+npx wrangler d1 execute gently --remote --file schema.sql
+npx wrangler d1 migrations apply gently --remote
+```
+
+The migration moves existing inline resources to references. Run it and deploy
+the Worker back to back: this release's Worker cannot write to a database
+without the migration, and an earlier Worker returns a null `resource_json`
+for moved rows. `schema.sql` also drops `idx_spans_trace`, `idx_spans_session`
+and `idx_spans_tool`; the `*_start` indexes that begin with the same columns
+serve those lookups.
+
 `raw_values` keys immutable envelopes by `(tenant_id, raw_ref)`, with capture
 device, key epoch and creation time. D1 stores bounded ciphertext directly;
 no R2 bucket or decryption broker is provisioned. Databases from early development

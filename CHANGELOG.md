@@ -6,6 +6,19 @@ changes appear under Unreleased.
 
 ## [Unreleased]
 
+### Changed
+
+- Store each span resource once per tenant and capture device, referenced from
+  its spans, instead of repeating it on every span, where it was the largest
+  share of D1 storage. Responses are unchanged. Apply `worker/migrations` after
+  `schema.sql` and deploy the Worker straight after; see the
+  [Worker reference](docs/reference/worker.md#d1-schema-workerschemasql).
+
+### Removed
+
+- Drop `idx_spans_trace`, `idx_spans_session` and `idx_spans_tool`. Each is a
+  leading prefix of a `*_start` index that serves the same lookups.
+
 ### Security
 
 - Update rustls to 0.23.46 (RUSTSEC-2026-0346 to 0349, including an
@@ -18,6 +31,9 @@ changes appear under Unreleased.
 - `scripts/collector-local` reapplies the idempotent `worker/schema.sql` before
   starting the local Worker. Local D1 created before paged trace reads lacked
   `trace_generations`, so every trace read returned HTTP 500.
+- `scripts/collector-local` applies pending D1 migrations before starting, and
+  serves the Worker code it started with instead of reloading it when the
+  checkout changes.
 
 ## [1.0.0] - 2026-10-09
 

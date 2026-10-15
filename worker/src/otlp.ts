@@ -80,7 +80,8 @@ const RAW_FIELDS = new Set([
 ]);
 
 const SAFE_REASONS = new Set(["clear", "logout", "prompt_input_exit", "bypass_permissions_disabled", "other", "exit", "shutdown"]);
-// At most 32 upserts plus ownership reads fit the Free plan's 50-query budget.
+// At most 32 upserts, one resource insert and two ownership reads fit the Free
+// plan's 50-query budget.
 const MAX_INGEST_SPANS = 32;
 
 function forbiddenRawKey(key: string): boolean {

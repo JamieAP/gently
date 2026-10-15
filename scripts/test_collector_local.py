@@ -77,14 +77,16 @@ class LauncherTests(unittest.TestCase):
         if name == "node":
             source = ('import os,sys\nfrom pathlib import Path\n'
                 'if sys.argv[1].endswith("/wrangler/bin/wrangler.js"):\n'
-                '    assert sys.argv[2:] == ["d1", "execute", "gently", "--local", "--config", "wrangler.local.toml",\n'
-                '        "--persist-to", ".wrangler/state", "--file", "schema.sql"]\n'
+                '    local = ["gently", "--local", "--config", "wrangler.local.toml", "--persist-to", ".wrangler/state"]\n'
+                '    step = {("d1", "execute", *local, "--file", "schema.sql"): "schema",\n'
+                '        ("d1", "migrations", "apply", *local): "migrations"}[tuple(sys.argv[2:])]\n'
                 '    assert Path.cwd().resolve() == Path(sys.argv[1]).parents[3].resolve()\n'
                 '    assert "GENTLY_TOKEN" not in os.environ and "GENTLY_HOSTS" not in os.environ\n'
                 '    assert os.environ["WRANGLER_LOG"] == "none"\n'
                 '    assert not Path(os.environ["FIXTURE_DIR"], "watch.pid").exists()\n'
-                '    Path(os.environ["FIXTURE_DIR"], "schema").touch()\n'
-                '    raise SystemExit(1 if os.environ.get("FIXTURE_SCHEMA_INVALID") else 0)\n') + source
+                '    assert step == "schema" or Path(os.environ["FIXTURE_DIR"], "schema").exists()\n'
+                '    Path(os.environ["FIXTURE_DIR"], step).touch()\n'
+                '    raise SystemExit(1 if os.environ.get(f"FIXTURE_{step.upper()}_INVALID") else 0)\n') + source
         path.write_text(f"#!{sys.executable}\n{source}")
         path.chmod(0o755)
         return path
@@ -118,6 +120,7 @@ class LauncherTests(unittest.TestCase):
         result = self.launch(self.repo / "scripts/collector-local")
         self.assertIn("collector exited with status 0", result.stderr)
         self.assertTrue((self.root / "schema").exists())
+        self.assertTrue((self.root / "migrations").exists())
         self.assert_stopped("watch.pid")
         self.assert_stopped("collector.pid")
 
@@ -125,6 +128,14 @@ class LauncherTests(unittest.TestCase):
         self.env["FIXTURE_SCHEMA_INVALID"] = "1"
         result = self.launch(self.repo / "scripts/collector-local", 1)
         self.assertIn("Cannot apply worker/schema.sql to local D1", result.stderr)
+        self.assertFalse((self.root / "watch.pid").exists())
+        self.assertFalse((self.root / "collector.pid").exists())
+        self.assertFalse((self.root / "migrations").exists())
+
+    def test_migration_failure_starts_no_services(self):
+        self.env["FIXTURE_MIGRATIONS_INVALID"] = "1"
+        result = self.launch(self.repo / "scripts/collector-local", 1)
+        self.assertIn("Cannot apply worker/migrations to local D1", result.stderr)
         self.assertFalse((self.root / "watch.pid").exists())
         self.assertFalse((self.root / "collector.pid").exists())
 
@@ -175,6 +186,7 @@ class LauncherTests(unittest.TestCase):
         self.assertFalse((self.root / "watch.pid").exists())
         self.assertFalse((self.root / "collector.pid").exists())
         self.assertFalse((self.root / "schema").exists())
+        self.assertFalse((self.root / "migrations").exists())
         self.assertTrue((self.root / "checked").exists())
 
     def test_attach_launcher_runs_only_exporter(self):

@@ -50,6 +50,7 @@ set the host authorization JSON through a private secret-provider workflow, and 
 
 ```sh
 npx wrangler d1 execute gently --remote --file schema.sql
+npx wrangler d1 migrations apply gently --remote
 npx wrangler secret put GENTLY_HOSTS
 npx wrangler deploy
 cd ..

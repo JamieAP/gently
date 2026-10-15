@@ -27,6 +27,9 @@ try {
       server: { hostname: "127.0.0.1", port: 8787 },
       persist: fileURLToPath(new URL("../.wrangler/state", import.meta.url)),
       liveReload: false,
+      // Serve the code this process started with: a checkout or edit must not
+      // swap the Worker under a database migrated for different code.
+      watch: false,
       enableContainers: false,
       generateTypes: false,
       logLevel: "none",

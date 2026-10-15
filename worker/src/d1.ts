@@ -13,6 +13,16 @@ const SPAN_COLUMNS = [
   "status", "session_id", "harness", "tool_name", "tool_use_id", "attrs_json", "resource_json", "ingested_unix_nano",
 ];
 
+// A span's resource JSON: its inline copy (rows written before references), or
+// the referenced span_resources row. The lookup is bound to the span's own
+// tenant and capture device, so no reference can reach another's resource.
+const resource = (span: string) => `COALESCE(${span}.resource_json, (SELECT r.resource_json FROM span_resources r
+  WHERE r.id = ${span}.resource_id AND r.tenant_id = ${span}.tenant_id AND r.device_id = ${span}.source_device_id))`;
+const spanColumn = (span: string, column: string) =>
+  column === "resource_json" ? resource(span) : `${span}.${column}`;
+const projection = (span: string) =>
+  SPAN_COLUMNS.map(column => `${spanColumn(span, column)} AS ${column}`).join(", ");
+
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 1000;
 const START_ASC = "start_asc";
@@ -130,8 +140,9 @@ export async function insertSpans(env: Env, tenantId: string, deviceId: string, 
         (tenant_id, span_id, source_device_id, trace_id, parent_span_id, name, kind,
          start_unix_nano, end_unix_nano, status,
          session_id, harness, tool_name, tool_use_id,
-         attrs_json, resource_json, ingested_unix_nano)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+         attrs_json, resource_json, resource_id, ingested_unix_nano)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, NULL,
+         (SELECT id FROM span_resources WHERE tenant_id = ?1 AND device_id = ?3 AND resource_json = ?16), ?17)
        ON CONFLICT(tenant_id, span_id) DO UPDATE SET
          start_unix_nano = CASE
            WHEN ${incomingQuality} = 2 OR ${storedQuality} = 2
@@ -154,6 +165,7 @@ export async function insertSpans(env: Env, tenantId: string, deviceId: string, 
          ${pick("tool_use_id")},
          ${pick("attrs_json")},
          ${pick("resource_json")},
+         ${pick("resource_id")},
          ${pick("ingested_unix_nano")}
          WHERE source_device_id = excluded.source_device_id AND trace_id = excluded.trace_id`;
   const stmts = rows.map((r) =>
@@ -179,7 +191,17 @@ export async function insertSpans(env: Env, tenantId: string, deviceId: string, 
     ),
   );
 
-  await env.DB.batch(stmts);
+  // One statement stores every distinct resource in the request, ahead of the
+  // upserts in the same transaction, so a request stays within D1's Free-plan
+  // query budget however its spans divide between resources.
+  const resources = [...new Set(rows.map(r => r.resource_json))];
+  const storeResources = env.DB.prepare(
+    `INSERT INTO span_resources (tenant_id, device_id, resource_json)
+     VALUES ${resources.map((_, i) => `(?1, ?2, ?${i + 3})`).join(", ")}
+     ON CONFLICT (tenant_id, device_id, resource_json) DO NOTHING`,
+  ).bind(tenantId, deviceId, ...resources);
+
+  await env.DB.batch([storeResources, ...stmts]);
   // A competing device may claim an absent ID after preflight. The guarded
   // upsert cannot overwrite it, and verification reports the conflict safely.
   const storedOwners = await env.DB.batch<Owner>(ownershipStatements());
@@ -326,7 +348,8 @@ const END = "COALESCE(end_unix_nano, start_unix_nano)";
 const END_POSITION = `(printf('%09d', length(${END})) || ':' || ${END})`;
 // Stored bytes never exceed a row's JSON size, so admitting rows by stored bytes
 // cannot exclude a row that fits; the exact JSON size is checked afterwards.
-const STORED_BYTES = SPAN_COLUMNS.map(column => `length(CAST(COALESCE(${column}, '') AS BLOB))`).join(" + ");
+const STORED_BYTES = SPAN_COLUMNS
+  .map(column => `length(CAST(COALESCE(${spanColumn("spans", column)}, '') AS BLOB))`).join(" + ");
 
 // Derived display bounds: parentless records use the trace's first start and
 // last end in position order (exact for canonical u64 text); other records use
@@ -362,7 +385,7 @@ export function tracePageSql(afterCursor: boolean): string {
        WHERE tenant_id = ?1 AND trace_id = ?2 AND parent_span_id IN (SELECT span_id FROM page)
        GROUP BY parent_span_id
      )
-     SELECT ${SPAN_COLUMNS.map(column => `s.${column}`).join(", ")},
+     SELECT ${projection("s")},
             CAST(CASE
               WHEN s.parent_span_id IS NULL THEN agg.trace_min
               ELSE MIN(CAST(s.start_unix_nano AS INTEGER),
@@ -538,7 +561,7 @@ export async function spans(
   const direction = startOrder(params.order, START_DESC);
 
   const result = await env.DB.prepare(
-    `SELECT ${SPAN_COLUMNS.join(", ")} FROM spans ${where} ORDER BY start_unix_nano ${direction} LIMIT ?`,
+    `SELECT ${projection("spans")} FROM spans ${where} ORDER BY start_unix_nano ${direction} LIMIT ?`,
   )
     .bind(...bindings, limit)
     .all<SpanRow>();
