@@ -35,7 +35,7 @@ async startWorker(options) {
   assert.deepEqual(options.dev, {
     remote: false, inspector: false,
     server: { hostname: "127.0.0.1", port: 8787 },
-    persist: resolve(".wrangler/state"), liveReload: false,
+    persist: resolve(".wrangler/state"), liveReload: false, watch: false,
     enableContainers: false, generateTypes: false, logLevel: "none",
   });
   if (process.env.FIXTURE_FAILURE === "startup") throw new Error("synthetic-private-value");
