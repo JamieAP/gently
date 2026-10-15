@@ -62,7 +62,13 @@ fn raw_request(state: &Path, bytes: &[u8]) -> Value {
     let _ = s.write_all(bytes);
     let _ = s.shutdown(std::net::Shutdown::Write);
     let mut response = Vec::new();
-    s.read_to_end(&mut response).unwrap();
+    if let Err(error) = s.read_to_end(&mut response) {
+        // Linux can reset a socket closed with unread excess input. For an
+        // oversized frame, transport rejection is as valid as a JSON error;
+        // ordinary requests must still receive a complete, clean response.
+        assert!(bytes.len() > 16 * 1024 && error.kind() == std::io::ErrorKind::ConnectionReset);
+        return json!({"ok": false});
+    }
     serde_json::from_slice(&response).unwrap()
 }
 fn temp() -> tempfile::TempDir {
@@ -109,6 +115,7 @@ fn locked_start_strict_protocol_and_namespace_binding() {
         assert!(!result.to_string().contains("synthetic"));
     }
     assert_eq!(raw_request(dir.path(), &vec![b'x'; 17000])["ok"], false);
+    assert_eq!(request(dir.path(), "status")["locked"], true);
     assert!(!command(dir.path())
         .args(["service", "run"])
         .status()
