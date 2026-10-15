@@ -6,6 +6,13 @@ changes appear under Unreleased.
 
 ## [Unreleased]
 
+### Security
+
+- Update rustls to 0.23.46 (RUSTSEC-2026-0346 to 0349, including an
+  unauthenticated ServerHello downgrade to classical key exchange and TLS
+  secrets in `Debug` output) and quinn-proto to 0.11.19 (RUSTSEC-2026-0338 to
+  0342). quinn-proto now uses rand 0.10.
+
 ### Fixed
 
 - `scripts/collector-local` reapplies the idempotent `worker/schema.sql` before
